@@ -163,6 +163,23 @@ impl Readable for UserChannelId {
 	}
 }
 
+/// The type of a channel, as negotiated during channel opening.
+///
+/// See [`BOLT 2`] for more information.
+///
+/// [`BOLT 2`]: https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#defined-channel-types
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelType {
+	/// A channel of type `option_static_remotekey`.
+	StaticRemoteKey,
+	/// A channel of type `option_static_remotekey` that requires 0conf support.
+	StaticRemoteKey0conf,
+	/// A channel of type `option_anchors_zero_fee_htlc_tx`.
+	Anchors,
+	/// A channel of type `option_anchors_zero_fee_htlc_tx` that requires 0conf support.
+	Anchors0conf,
+}
+
 /// Details of a channel as returned by [`Node::list_channels`].
 ///
 /// [`Node::list_channels`]: crate::Node::list_channels
@@ -180,6 +197,10 @@ pub struct ChannelDetails {
 	/// The channel's funding transaction output, if we've negotiated the funding transaction with
 	/// our counterparty already.
 	pub funding_txo: Option<OutPoint>,
+	/// The channel type as negotiated during channel opening.
+	///
+	/// Will be `None` until the channel negotiation has been completed.
+	pub channel_type: Option<ChannelType>,
 	/// The value, in satoshis, of this channel as it appears in the funding output.
 	pub channel_value_sats: u64,
 	/// The value, in satoshis, that must always be held as a reserve in the channel for us. This
@@ -287,10 +308,27 @@ pub struct ChannelDetails {
 
 impl From<LdkChannelDetails> for ChannelDetails {
 	fn from(value: LdkChannelDetails) -> Self {
+		let channel_type = value.channel_type.map(|t| {
+			if t.requires_anchors_zero_fee_htlc_tx() {
+				if t.requires_zero_conf() {
+					ChannelType::Anchors0conf
+				} else {
+					ChannelType::Anchors
+				}
+			} else {
+				if t.requires_zero_conf() {
+					ChannelType::StaticRemoteKey0conf
+				} else {
+					ChannelType::StaticRemoteKey
+				}
+			}
+		});
+
 		ChannelDetails {
 			channel_id: value.channel_id,
 			counterparty_node_id: value.counterparty.node_id,
 			funding_txo: value.funding_txo.and_then(|o| Some(o.into_bitcoin_outpoint())),
+			channel_type,
 			channel_value_sats: value.channel_value_satoshis,
 			unspendable_punishment_reserve: value.unspendable_punishment_reserve,
 			user_channel_id: UserChannelId(value.user_channel_id),
