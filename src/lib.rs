@@ -140,7 +140,9 @@ use logger::{log_error, log_info, log_trace, FilesystemLogger, Logger};
 
 use lightning::chain::Confirm;
 use lightning::events::bump_transaction::Wallet as LdkWallet;
-use lightning::ln::channelmanager::{self, PaymentId, RecipientOnionFields, Retry};
+use lightning::ln::channelmanager::{
+	self, ChannelShutdownState, PaymentId, RecipientOnionFields, Retry,
+};
 use lightning::ln::msgs::SocketAddress;
 use lightning::ln::{PaymentHash, PaymentPreimage};
 
@@ -773,6 +775,9 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 	}
 
 	/// Send an on-chain payment to the given address.
+	///
+	/// This will respect any on-chain reserve we need to keep, i.e., won't allow to cut into
+	/// [`BalanceDetails::total_anchor_channels_reserve_sats`].
 	pub fn send_to_onchain_address(
 		&self, address: &bitcoin::Address, amount_sats: u64,
 	) -> Result<Txid, Error> {
@@ -781,15 +786,29 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 			return Err(Error::NotRunning);
 		}
 
-		let cur_balance = self.wallet.get_balance()?;
-		if cur_balance.get_spendable() < amount_sats {
-			log_error!(self.logger, "Unable to send payment due to insufficient funds.");
+		let cur_anchor_reserve_sats =
+			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		let spendable_amount_sats =
+			self.wallet.get_balances(cur_anchor_reserve_sats).map(|(_, s)| s).unwrap_or(0);
+
+		if spendable_amount_sats < amount_sats {
+			log_error!(self.logger,
+				"Unable to send payment due to insufficient funds. Available: {}sats, Required: {}sats",
+				spendable_amount_sats, amount_sats
+			);
 			return Err(Error::InsufficientFunds);
 		}
 		self.wallet.send_to_address(address, Some(amount_sats))
 	}
 
 	/// Send an on-chain payment to the given address, draining all the available funds.
+	///
+	/// This is useful if you have closed all channels and want to migrate funds to another
+	/// on-chain wallet.
+	///
+	/// Please note that this will **not** retain any on-chain reserves, which might be potentially
+	/// dangerous if you have open Anchor channels for which you can't trust the counterparty to
+	/// spend the Anchor output after channel closure.
 	pub fn send_all_to_onchain_address(&self, address: &bitcoin::Address) -> Result<Txid, Error> {
 		let rt_lock = self.runtime.read().unwrap();
 		if rt_lock.is_none() {
@@ -871,6 +890,10 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 	/// channel counterparty on channel open. This can be useful to start out with the balance not
 	/// entirely shifted to one side, therefore allowing to receive payments from the getgo.
 	///
+	/// If Anchor channels are enabled, this will ensure the configured
+	/// [`AnchorChannelsConfig::per_channel_reserve_sats`] is available and will be retained before
+	/// opening the channel.
+	///
 	/// Returns a [`UserChannelId`] allowing to locally keep track of the channel.
 	pub fn connect_open_channel(
 		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
@@ -883,9 +906,25 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 		}
 		let runtime = rt_lock.as_ref().unwrap();
 
-		let cur_balance = self.wallet.get_balance()?;
-		if cur_balance.get_spendable() < channel_amount_sats {
-			log_error!(self.logger, "Unable to create channel due to insufficient funds.");
+		let required_funds_sats = channel_amount_sats
+			+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
+				if c.trusted_peers_no_reserve.contains(&node_id) {
+					0
+				} else {
+					c.per_channel_reserve_sats
+				}
+			});
+
+		let cur_anchor_reserve_sats =
+			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		let spendable_amount_sats =
+			self.wallet.get_balances(cur_anchor_reserve_sats).map(|(_, s)| s).unwrap_or(0);
+
+		if spendable_amount_sats < required_funds_sats {
+			log_error!(self.logger,
+				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
+				spendable_amount_sats, required_funds_sats
+			);
 			return Err(Error::InsufficientFunds);
 		}
 
@@ -909,6 +948,7 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 			channel_handshake_limits: Default::default(),
 			channel_handshake_config: ChannelHandshakeConfig {
 				announced_channel: announce_channel,
+				negotiate_anchors_zero_fee_htlc_tx: self.config.anchor_channels_config.is_some(),
 				..Default::default()
 			},
 			channel_config,
@@ -1628,11 +1668,13 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 
 	/// Retrieves an overview of all known balances.
 	pub fn list_balances(&self) -> BalanceDetails {
-		let (total_onchain_balance_sats, spendable_onchain_balance_sats) = self
-			.wallet
-			.get_balance()
-			.map(|bal| (bal.get_total(), bal.get_spendable()))
-			.unwrap_or((0, 0));
+		let cur_anchor_reserve_sats =
+			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		let (total_onchain_balance_sats, spendable_onchain_balance_sats) =
+			self.wallet.get_balances(cur_anchor_reserve_sats).unwrap_or((0, 0));
+
+		let total_anchor_channels_reserve_sats =
+			std::cmp::min(cur_anchor_reserve_sats, total_onchain_balance_sats);
 
 		let mut total_lightning_balance_sats = 0;
 		let mut lightning_balances = Vec::new();
@@ -1665,6 +1707,7 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 		BalanceDetails {
 			total_onchain_balance_sats,
 			spendable_onchain_balance_sats,
+			total_anchor_channels_reserve_sats,
 			total_lightning_balance_sats,
 			lightning_balances,
 			pending_balances_from_channel_closures,
@@ -1811,4 +1854,24 @@ async fn do_connect_peer<K: KVStore + Sync + Send + 'static>(
 			Err(Error::ConnectionFailed)
 		},
 	}
+}
+
+pub(crate) fn total_anchor_channels_reserve_sats<K: KVStore + Sync + Send + 'static>(
+	channel_manager: &ChannelManager<K>, config: &Config,
+) -> u64 {
+	config.anchor_channels_config.as_ref().map_or(0, |anchor_channels_config| {
+		channel_manager
+			.list_channels()
+			.into_iter()
+			.filter(|c| {
+				!anchor_channels_config.trusted_peers_no_reserve.contains(&c.counterparty.node_id)
+					&& c.channel_shutdown_state
+						.map_or(true, |s| s != ChannelShutdownState::ShutdownComplete)
+					&& c.channel_type
+						.as_ref()
+						.map_or(false, |t| t.requires_anchors_zero_fee_htlc_tx())
+			})
+			.count() as u64
+			* anchor_channels_config.per_channel_reserve_sats
+	})
 }
