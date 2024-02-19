@@ -15,21 +15,28 @@ use std::sync::Arc;
 #[test]
 fn channel_full_cycle() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
-	let (node_a, node_b) = setup_two_nodes(&electrsd, false);
-	do_channel_full_cycle(node_a, node_b, &bitcoind.client, &electrsd.client, false);
+	let (node_a, node_b) = setup_two_nodes(&electrsd, false, true);
+	do_channel_full_cycle(node_a, node_b, &bitcoind.client, &electrsd.client, false, true);
 }
 
 #[test]
 fn channel_full_cycle_0conf() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
-	let (node_a, node_b) = setup_two_nodes(&electrsd, true);
-	do_channel_full_cycle(node_a, node_b, &bitcoind.client, &electrsd.client, true)
+	let (node_a, node_b) = setup_two_nodes(&electrsd, true, true);
+	do_channel_full_cycle(node_a, node_b, &bitcoind.client, &electrsd.client, true, true)
+}
+
+#[test]
+fn channel_full_cycle_legacy_staticremotekey() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let (node_a, node_b) = setup_two_nodes(&electrsd, false, false);
+	do_channel_full_cycle(node_a, node_b, &bitcoind.client, &electrsd.client, false, false);
 }
 
 #[test]
 fn channel_open_fails_when_funds_insufficient() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
-	let (node_a, node_b) = setup_two_nodes(&electrsd, false);
+	let (node_a, node_b) = setup_two_nodes(&electrsd, false, true);
 
 	let addr_a = node_a.new_onchain_address().unwrap();
 	let addr_b = node_b.new_onchain_address().unwrap();
@@ -69,7 +76,7 @@ fn multi_hop_sending() {
 	// Setup and fund 5 nodes
 	let mut nodes = Vec::new();
 	for _ in 0..5 {
-		let config = random_config();
+		let config = random_config(true);
 		setup_builder!(builder, config);
 		builder.set_esplora_server(esplora_url.clone());
 		let node = builder.build().unwrap();
@@ -139,7 +146,7 @@ fn multi_hop_sending() {
 
 #[test]
 fn connect_to_public_testnet_esplora() {
-	let mut config = random_config();
+	let mut config = random_config(true);
 	config.network = Network::Testnet;
 	setup_builder!(builder, config);
 	builder.set_esplora_server("https://blockstream.info/testnet/api".to_string());
@@ -151,7 +158,7 @@ fn connect_to_public_testnet_esplora() {
 #[test]
 fn start_stop_reinit() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
-	let config = random_config();
+	let config = random_config(true);
 
 	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
 
@@ -218,7 +225,7 @@ fn start_stop_reinit() {
 #[test]
 fn onchain_spend_receive() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
-	let (node_a, node_b) = setup_two_nodes(&electrsd, false);
+	let (node_a, node_b) = setup_two_nodes(&electrsd, false, true);
 
 	let addr_a = node_a.new_onchain_address().unwrap();
 	let addr_b = node_b.new_onchain_address().unwrap();
@@ -263,7 +270,7 @@ fn onchain_spend_receive() {
 #[test]
 fn sign_verify_msg() {
 	let (_bitcoind, electrsd) = setup_bitcoind_and_electrsd();
-	let config = random_config();
+	let config = random_config(true);
 	let node = setup_node(&electrsd, config);
 
 	// Tests arbitrary message signing and later verification
