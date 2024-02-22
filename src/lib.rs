@@ -906,34 +906,26 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 		}
 		let runtime = rt_lock.as_ref().unwrap();
 
-		let required_funds_sats = channel_amount_sats
-			+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
-				if c.trusted_peers_no_reserve.contains(&node_id) {
-					0
-				} else {
-					c.per_channel_reserve_sats
-				}
-			});
-
-		let cur_anchor_reserve_sats =
-			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
-		let spendable_amount_sats =
-			self.wallet.get_balances(cur_anchor_reserve_sats).map(|(_, s)| s).unwrap_or(0);
-
-		if spendable_amount_sats < required_funds_sats {
-			log_error!(self.logger,
-				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
-				spendable_amount_sats, required_funds_sats
-			);
-			return Err(Error::InsufficientFunds);
-		}
-
 		let peer_info = PeerInfo { node_id, address };
 
 		let con_node_id = peer_info.node_id;
 		let con_addr = peer_info.address.clone();
 		let con_logger = Arc::clone(&self.logger);
 		let con_pm = Arc::clone(&self.peer_manager);
+
+		let cur_anchor_reserve_sats =
+			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		let spendable_amount_sats =
+			self.wallet.get_balances(cur_anchor_reserve_sats).map(|(_, s)| s).unwrap_or(0);
+
+		// Fail early if we have less than the channel value available.
+		if spendable_amount_sats < channel_amount_sats {
+			log_error!(self.logger,
+				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
+				spendable_amount_sats, channel_amount_sats
+			);
+			return Err(Error::InsufficientFunds);
+		}
 
 		// We need to use our main runtime here as a local runtime might not be around to poll
 		// connection futures going forward.
@@ -942,6 +934,31 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 				connect_peer_if_necessary(con_node_id, con_addr, con_pm, con_logger).await
 			})
 		})?;
+
+		// Fail if we have less than the channel value + anchor reserve available (if applicable).
+		let init_features = self
+			.peer_manager
+			.peer_by_node_id(&node_id)
+			.ok_or(Error::ConnectionFailed)?
+			.init_features;
+		let required_funds_sats = channel_amount_sats
+			+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
+				if init_features.requires_anchors_zero_fee_htlc_tx()
+					&& !c.trusted_peers_no_reserve.contains(&node_id)
+				{
+					c.per_channel_reserve_sats
+				} else {
+					0
+				}
+			});
+
+		if spendable_amount_sats < required_funds_sats {
+			log_error!(self.logger,
+				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
+				spendable_amount_sats, required_funds_sats
+			);
+			return Err(Error::InsufficientFunds);
+		}
 
 		let channel_config = (*(channel_config.unwrap_or_default())).clone().into();
 		let user_config = UserConfig {
