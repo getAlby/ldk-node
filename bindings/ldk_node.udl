@@ -228,9 +228,7 @@ dictionary OutPoint {
 
 enum ChannelType {
 	"StaticRemoteKey",
-	"StaticRemoteKey0conf",
 	"Anchors",
-	"Anchors0conf",
 };
 
 dictionary ChannelDetails {
