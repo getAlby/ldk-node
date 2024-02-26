@@ -529,7 +529,7 @@ pub(crate) fn do_channel_full_cycle<K: KVStore + Sync + Send, E: ElectrumApi>(
 	);
 
 	println!("\nB close_channel");
-	node_b.close_channel(&user_channel_id, node_a.node_id()).unwrap();
+	node_b.close_channel(&user_channel_id, node_a.node_id(), false).unwrap();
 	expect_event!(node_a, ChannelClosed);
 	expect_event!(node_b, ChannelClosed);
 
