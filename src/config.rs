@@ -172,21 +172,24 @@ impl Default for Config {
 /// [BOLT 3]: https://github.com/lightning/bolts/blob/master/03-transactions.md#htlc-timeout-and-htlc-success-transactions
 #[derive(Debug, Clone)]
 pub struct AnchorChannelsConfig {
-	/// A list of peers which we trust to spend the anchor output *for us* on channel closing.
+	/// A list of peers which we trust to get the required channel closing transactions confirmed
+	/// on-chain.
 	///
 	/// Channels with these peers won't count towards the retained on-chain reserve and we won't
-	/// take any action to get the Anchor spending transactions confirmed.
+	/// take any action to get the required transactions confirmed ourselves.
 	///
-	/// **Note:** Trusting the channel counterparty to spend the anchor output is potentially
-	/// insecure as the channel may not be closed if they refuse to do so, potentially leaving the
-	/// user funds stuck.
+	/// **Note:** Trusting the channel counterparty to take the necessary actions to get the
+	/// required Anchor spending and HTLC transactions confirmed on-chain is potentially insecure
+	/// as the channel may not be closed if they refuse to do so, potentially leaving the user
+	/// funds stuck.
 	pub trusted_peers_no_reserve: Vec<PublicKey>,
 	/// The amount of satoshis we keep as an emergency reserve in our on-chain wallet in order to
-	/// be able to spend the Anchor output on channel close.
+	/// be able to get the required Anchor output spending and HTLC transactions confirmed when the
+	/// channel is closed.
 	///
 	/// **Note:** Depending on the fee market at the time of closure, this reserve amount might or
-	/// might not suffice to successfully spend the Anchor output, i.e., you may want to adjust
-	/// this value accordingly.
+	/// might not suffice to successfully spend the Anchor output and have the HTLC transactions
+	/// confirmed on-chain, i.e., you may want to adjust this value accordingly.
 	pub per_channel_reserve_sats: u64,
 }
 
