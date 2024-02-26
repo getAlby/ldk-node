@@ -156,7 +156,7 @@ impl Default for Config {
 /// fee rate *at the time of channel closure*, making them much more robust in the face of fee
 /// spikes. In turn, they require to maintain a reserve of on-chain funds to be able to get the
 /// channel closure transactions confirmed on-chain, at least if the channel counterparty can't
-/// be trusted to this for us.
+/// be trusted to do this for us.
 ///
 /// See [BOLT 3] for more technical details on Anchor channels.
 ///
