@@ -172,12 +172,8 @@ impl Readable for UserChannelId {
 pub enum ChannelType {
 	/// A channel of type `option_static_remotekey`.
 	StaticRemoteKey,
-	/// A channel of type `option_static_remotekey` that requires 0conf support.
-	StaticRemoteKey0conf,
 	/// A channel of type `option_anchors_zero_fee_htlc_tx`.
 	Anchors,
-	/// A channel of type `option_anchors_zero_fee_htlc_tx` that requires 0conf support.
-	Anchors0conf,
 }
 
 /// Details of a channel as returned by [`Node::list_channels`].
@@ -310,17 +306,9 @@ impl From<LdkChannelDetails> for ChannelDetails {
 	fn from(value: LdkChannelDetails) -> Self {
 		let channel_type = value.channel_type.map(|t| {
 			if t.requires_anchors_zero_fee_htlc_tx() {
-				if t.requires_zero_conf() {
-					ChannelType::Anchors0conf
-				} else {
-					ChannelType::Anchors
-				}
+				ChannelType::Anchors
 			} else {
-				if t.requires_zero_conf() {
-					ChannelType::StaticRemoteKey0conf
-				} else {
-					ChannelType::StaticRemoteKey
-				}
+				ChannelType::StaticRemoteKey
 			}
 		});
 
