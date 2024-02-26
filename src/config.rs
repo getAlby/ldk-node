@@ -181,7 +181,8 @@ pub struct AnchorChannelsConfig {
 	/// **Note:** Trusting the channel counterparty to take the necessary actions to get the
 	/// required Anchor spending and HTLC transactions confirmed on-chain is potentially insecure
 	/// as the channel may not be closed if they refuse to do so, potentially leaving the user
-	/// funds stuck.
+	/// funds stuck *or* even allow the counterparty to steal any in-flight funds after the
+	/// corresponding HTLCs time out.
 	pub trusted_peers_no_reserve: Vec<PublicKey>,
 	/// The amount of satoshis we keep as an emergency reserve in our on-chain wallet in order to
 	/// be able to get the required Anchor output spending and HTLC transactions confirmed when the
