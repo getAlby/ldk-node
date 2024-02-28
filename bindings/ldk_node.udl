@@ -15,6 +15,12 @@ dictionary Config {
 	sequence<PublicKey> trusted_peers_0conf;
 	u64 probing_liquidity_limit_multiplier;
 	LogLevel log_level;
+	AnchorChannelsConfig? anchor_channels_config;
+};
+
+dictionary AnchorChannelsConfig {
+	sequence<PublicKey> trusted_peers_no_reserve;
+	u64 per_channel_reserve_sats;
 };
 
 interface Builder {
@@ -62,7 +68,7 @@ interface LDKNode {
 	[Throws=NodeError]
 	UserChannelId connect_open_channel(PublicKey node_id, SocketAddress address, u64 channel_amount_sats, u64? push_to_counterparty_msat, ChannelConfig? channel_config, boolean announce_channel);
 	[Throws=NodeError]
-	void close_channel([ByRef]UserChannelId user_channel_id, PublicKey counterparty_node_id);
+	void close_channel([ByRef]UserChannelId user_channel_id, PublicKey counterparty_node_id, boolean force);
 	[Throws=NodeError]
 	void update_channel_config([ByRef]UserChannelId user_channel_id, PublicKey counterparty_node_id, ChannelConfig channel_config);
 	[Throws=NodeError]
@@ -173,16 +179,18 @@ enum PaymentFailureReason {
 
 [Enum]
 interface ClosureReason {
-	CounterpartyForceClosed ( UntrustedString peer_msg );
-	HolderForceClosed ();
-	CooperativeClosure ();
-	CommitmentTxConfirmed ();
-	FundingTimedOut ();
-	ProcessingError ( string err );
-	DisconnectedPeer ();
-	OutdatedChannelManager ();
-	CounterpartyCoopClosedUnfundedChannel ();
-	FundingBatchClosure ();
+	CounterpartyForceClosed(UntrustedString peer_msg);
+	HolderForceClosed();
+	LegacyCooperativeClosure();
+	CounterpartyInitiatedCooperativeClosure();
+	LocallyInitiatedCooperativeClosure();
+	CommitmentTxConfirmed();
+	FundingTimedOut();
+	ProcessingError(string err);
+	DisconnectedPeer();
+	OutdatedChannelManager();
+	CounterpartyCoopClosedUnfundedChannel();
+	FundingBatchClosure();
 };
 
 enum PaymentDirection {
@@ -227,10 +235,16 @@ dictionary OutPoint {
 	u32 vout;
 };
 
+enum ChannelType {
+	"StaticRemoteKey",
+	"Anchors",
+};
+
 dictionary ChannelDetails {
 	ChannelId channel_id;
 	PublicKey counterparty_node_id;
 	OutPoint? funding_txo;
+	ChannelType? channel_type;
 	u64 channel_value_sats;
 	u64? unspendable_punishment_reserve;
 	UserChannelId user_channel_id;
@@ -285,6 +299,7 @@ interface PendingSweepBalance {
 dictionary BalanceDetails {
 	u64 total_onchain_balance_sats;
 	u64 spendable_onchain_balance_sats;
+	u64 total_anchor_channels_reserve_sats;
 	u64 total_lightning_balance_sats;
 	sequence<LightningBalance> lightning_balances;
 	sequence<PendingSweepBalance> pending_balances_from_channel_closures;

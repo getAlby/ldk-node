@@ -102,7 +102,7 @@ pub use lightning;
 pub use lightning_invoice;
 
 pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
-pub use config::{default_config, Config};
+pub use config::{default_config, AnchorChannelsConfig, Config};
 pub use error::Error as NodeError;
 use error::Error;
 
@@ -131,15 +131,18 @@ use payment_store::PaymentStore;
 pub use payment_store::{LSPFeeLimits, PaymentDetails, PaymentDirection, PaymentStatus};
 use peer_store::{PeerInfo, PeerStore};
 use types::{
-	Broadcaster, ChainMonitor, ChannelManager, FeeEstimator, KeysManager, NetworkGraph,
-	PeerManager, Router, Scorer, Sweeper, Wallet,
+	Broadcaster, BumpTransactionEventHandler, ChainMonitor, ChannelManager, FeeEstimator,
+	KeysManager, NetworkGraph, PeerManager, Router, Scorer, Sweeper, Wallet,
 };
-pub use types::{ChannelDetails, PeerDetails, UserChannelId};
+pub use types::{ChannelDetails, ChannelType, PeerDetails, UserChannelId};
 
 use logger::{log_error, log_info, log_trace, FilesystemLogger, Logger};
 
 use lightning::chain::Confirm;
-use lightning::ln::channelmanager::{self, PaymentId, RecipientOnionFields, Retry};
+use lightning::events::bump_transaction::Wallet as LdkWallet;
+use lightning::ln::channelmanager::{
+	self, ChannelShutdownState, PaymentId, RecipientOnionFields, Retry,
+};
 use lightning::ln::msgs::SocketAddress;
 use lightning::ln::{PaymentHash, PaymentPreimage};
 
@@ -478,9 +481,9 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 						}
 						_ = interval.tick() => {
 							let pm_peers = connect_pm
-								.get_peer_node_ids()
+								.list_peers()
 								.iter()
-								.map(|(peer, _addr)| *peer)
+								.map(|peer| peer.counterparty_node_id)
 								.collect::<Vec<_>>();
 							for node_id in connect_cm
 								.list_channels()
@@ -547,7 +550,7 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 								continue;
 							}
 
-							if bcast_pm.get_peer_node_ids().is_empty() {
+							if bcast_pm.list_peers().is_empty() {
 								// Skip if we don't have any connected peers to gossip to.
 								continue;
 							}
@@ -590,11 +593,19 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 			}
 		});
 
+		let bump_tx_event_handler = Arc::new(BumpTransactionEventHandler::new(
+			Arc::clone(&self.tx_broadcaster),
+			Arc::new(LdkWallet::new(Arc::clone(&self.wallet), Arc::clone(&self.logger))),
+			Arc::clone(&self.keys_manager),
+			Arc::clone(&self.logger),
+		));
+
 		let event_handler = Arc::new(EventHandler::new(
 			Arc::clone(&self.event_queue),
 			Arc::clone(&self.wallet),
 			Arc::clone(&self.channel_manager),
 			Arc::clone(&self.output_sweeper),
+			bump_tx_event_handler,
 			Arc::clone(&self.network_graph),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
@@ -764,6 +775,9 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 	}
 
 	/// Send an on-chain payment to the given address.
+	///
+	/// This will respect any on-chain reserve we need to keep, i.e., won't allow to cut into
+	/// [`BalanceDetails::total_anchor_channels_reserve_sats`].
 	pub fn send_to_onchain_address(
 		&self, address: &bitcoin::Address, amount_sats: u64,
 	) -> Result<Txid, Error> {
@@ -772,15 +786,29 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 			return Err(Error::NotRunning);
 		}
 
-		let cur_balance = self.wallet.get_balance()?;
-		if cur_balance.get_spendable() < amount_sats {
-			log_error!(self.logger, "Unable to send payment due to insufficient funds.");
+		let cur_anchor_reserve_sats =
+			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		let spendable_amount_sats =
+			self.wallet.get_balances(cur_anchor_reserve_sats).map(|(_, s)| s).unwrap_or(0);
+
+		if spendable_amount_sats < amount_sats {
+			log_error!(self.logger,
+				"Unable to send payment due to insufficient funds. Available: {}sats, Required: {}sats",
+				spendable_amount_sats, amount_sats
+			);
 			return Err(Error::InsufficientFunds);
 		}
 		self.wallet.send_to_address(address, Some(amount_sats))
 	}
 
 	/// Send an on-chain payment to the given address, draining all the available funds.
+	///
+	/// This is useful if you have closed all channels and want to migrate funds to another
+	/// on-chain wallet.
+	///
+	/// Please note that this will **not** retain any on-chain reserves, which might be potentially
+	/// dangerous if you have open Anchor channels for which you can't trust the counterparty to
+	/// spend the Anchor output after channel closure.
 	pub fn send_all_to_onchain_address(&self, address: &bitcoin::Address) -> Result<Txid, Error> {
 		let rt_lock = self.runtime.read().unwrap();
 		if rt_lock.is_none() {
@@ -862,6 +890,10 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 	/// channel counterparty on channel open. This can be useful to start out with the balance not
 	/// entirely shifted to one side, therefore allowing to receive payments from the getgo.
 	///
+	/// If Anchor channels are enabled, this will ensure the configured
+	/// [`AnchorChannelsConfig::per_channel_reserve_sats`] is available and will be retained before
+	/// opening the channel.
+	///
 	/// Returns a [`UserChannelId`] allowing to locally keep track of the channel.
 	pub fn connect_open_channel(
 		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
@@ -874,18 +906,26 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 		}
 		let runtime = rt_lock.as_ref().unwrap();
 
-		let cur_balance = self.wallet.get_balance()?;
-		if cur_balance.get_spendable() < channel_amount_sats {
-			log_error!(self.logger, "Unable to create channel due to insufficient funds.");
-			return Err(Error::InsufficientFunds);
-		}
-
 		let peer_info = PeerInfo { node_id, address };
 
 		let con_node_id = peer_info.node_id;
 		let con_addr = peer_info.address.clone();
 		let con_logger = Arc::clone(&self.logger);
 		let con_pm = Arc::clone(&self.peer_manager);
+
+		let cur_anchor_reserve_sats =
+			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		let spendable_amount_sats =
+			self.wallet.get_balances(cur_anchor_reserve_sats).map(|(_, s)| s).unwrap_or(0);
+
+		// Fail early if we have less than the channel value available.
+		if spendable_amount_sats < channel_amount_sats {
+			log_error!(self.logger,
+				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
+				spendable_amount_sats, channel_amount_sats
+			);
+			return Err(Error::InsufficientFunds);
+		}
 
 		// We need to use our main runtime here as a local runtime might not be around to poll
 		// connection futures going forward.
@@ -895,11 +935,37 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 			})
 		})?;
 
+		// Fail if we have less than the channel value + anchor reserve available (if applicable).
+		let init_features = self
+			.peer_manager
+			.peer_by_node_id(&node_id)
+			.ok_or(Error::ConnectionFailed)?
+			.init_features;
+		let required_funds_sats = channel_amount_sats
+			+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
+				if init_features.requires_anchors_zero_fee_htlc_tx()
+					&& !c.trusted_peers_no_reserve.contains(&node_id)
+				{
+					c.per_channel_reserve_sats
+				} else {
+					0
+				}
+			});
+
+		if spendable_amount_sats < required_funds_sats {
+			log_error!(self.logger,
+				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
+				spendable_amount_sats, required_funds_sats
+			);
+			return Err(Error::InsufficientFunds);
+		}
+
 		let channel_config = (*(channel_config.unwrap_or_default())).clone().into();
 		let user_config = UserConfig {
 			channel_handshake_limits: Default::default(),
 			channel_handshake_config: ChannelHandshakeConfig {
 				announced_channel: announce_channel,
+				negotiate_anchors_zero_fee_htlc_tx: self.config.anchor_channels_config.is_some(),
 				..Default::default()
 			},
 			channel_config,
@@ -996,27 +1062,66 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 	}
 
 	/// Close a previously opened channel.
+	///
+	/// If `force` is set to `true`, we will force-close the channel, potentially broadcasting our
+	/// latest state. Note that in contrast to cooperative closure, force-closing will have the
+	/// channel funds time-locked, i.e., they will only be available after the counterparty had
+	/// time to contest our claim. Force-closing channels also more costly in terms of on-chain
+	/// fees. So cooperative closure should always be preferred (and tried first).
+	///
+	/// Broadcasting the closing transactions will be omitted for Anchor channels if we trust the
+	/// counterparty to broadcast for us (see [`AnchorChannelsConfig::trusted_peers_no_reserve`]
+	/// for more information).
 	pub fn close_channel(
-		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
+		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey, force: bool,
 	) -> Result<(), Error> {
 		let open_channels =
 			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
 		if let Some(channel_details) =
 			open_channels.iter().find(|c| c.user_channel_id == user_channel_id.0)
 		{
-			match self
-				.channel_manager
-				.close_channel(&channel_details.channel_id, &counterparty_node_id)
-			{
-				Ok(_) => {
-					// Check if this was the last open channel, if so, forget the peer.
-					if open_channels.len() == 1 {
-						self.peer_store.remove_peer(&counterparty_node_id)?;
-					}
-					Ok(())
-				},
-				Err(_) => Err(Error::ChannelClosingFailed),
+			if force {
+				if self.config.anchor_channels_config.as_ref().map_or(false, |acc| {
+					acc.trusted_peers_no_reserve.contains(&counterparty_node_id)
+				}) {
+					self.channel_manager
+						.force_close_without_broadcasting_txn(
+							&channel_details.channel_id,
+							&counterparty_node_id,
+						)
+						.map_err(|e| {
+							log_error!(
+								self.logger,
+								"Failed to force-close channel to trusted peer: {:?}",
+								e
+							);
+							Error::ChannelClosingFailed
+						})?;
+				} else {
+					self.channel_manager
+						.force_close_broadcasting_latest_txn(
+							&channel_details.channel_id,
+							&counterparty_node_id,
+						)
+						.map_err(|e| {
+							log_error!(self.logger, "Failed to force-close channel: {:?}", e);
+							Error::ChannelClosingFailed
+						})?;
+				}
+			} else {
+				self.channel_manager
+					.close_channel(&channel_details.channel_id, &counterparty_node_id)
+					.map_err(|e| {
+						log_error!(self.logger, "Failed to close channel: {:?}", e);
+						Error::ChannelClosingFailed
+					})?;
 			}
+
+			// Check if this was the last open channel, if so, forget the peer.
+			if open_channels.len() == 1 {
+				self.peer_store.remove_peer(&counterparty_node_id)?;
+			}
+			Ok(())
 		} else {
 			Ok(())
 		}
@@ -1619,21 +1724,19 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 
 	/// Retrieves an overview of all known balances.
 	pub fn list_balances(&self) -> BalanceDetails {
-		let (total_onchain_balance_sats, spendable_onchain_balance_sats) = self
-			.wallet
-			.get_balance()
-			.map(|bal| (bal.get_total(), bal.get_spendable()))
-			.unwrap_or((0, 0));
+		let cur_anchor_reserve_sats =
+			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		let (total_onchain_balance_sats, spendable_onchain_balance_sats) =
+			self.wallet.get_balances(cur_anchor_reserve_sats).unwrap_or((0, 0));
+
+		let total_anchor_channels_reserve_sats =
+			std::cmp::min(cur_anchor_reserve_sats, total_onchain_balance_sats);
 
 		let mut total_lightning_balance_sats = 0;
 		let mut lightning_balances = Vec::new();
-		for funding_txo in self.chain_monitor.list_monitors() {
+		for (funding_txo, channel_id) in self.chain_monitor.list_monitors() {
 			match self.chain_monitor.get_monitor(funding_txo) {
 				Ok(monitor) => {
-					// TODO: Switch to `channel_id` with LDK 0.0.122: let channel_id = monitor.channel_id();
-					let channel_id = funding_txo.to_channel_id();
-					// unwrap safety: `get_counterparty_node_id` will always be `Some` after 0.0.110 and
-					// LDK Node 0.1 depended on 0.0.115 already.
 					let counterparty_node_id = monitor.get_counterparty_node_id().unwrap();
 					for ldk_balance in monitor.get_claimable_balances() {
 						total_lightning_balance_sats += ldk_balance.claimable_amount_satoshis();
@@ -1660,6 +1763,7 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 		BalanceDetails {
 			total_onchain_balance_sats,
 			spendable_onchain_balance_sats,
+			total_anchor_channels_reserve_sats,
 			total_lightning_balance_sats,
 			lightning_balances,
 			pending_balances_from_channel_closures,
@@ -1695,12 +1799,13 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 		let mut peers = Vec::new();
 
 		// First add all connected peers, preferring to list the connected address if available.
-		let connected_peers = self.peer_manager.get_peer_node_ids();
+		let connected_peers = self.peer_manager.list_peers();
 		let connected_peers_len = connected_peers.len();
-		for (node_id, con_addr_opt) in connected_peers {
+		for connected_peer in connected_peers {
+			let node_id = connected_peer.counterparty_node_id;
 			let stored_peer = self.peer_store.get_peer(&node_id);
 			let stored_addr_opt = stored_peer.as_ref().map(|p| p.address.clone());
-			let address = match (con_addr_opt, stored_addr_opt) {
+			let address = match (connected_peer.socket_address, stored_addr_opt) {
 				(Some(con_addr), _) => con_addr,
 				(None, Some(stored_addr)) => stored_addr,
 				(None, None) => continue,
@@ -1758,10 +1863,8 @@ async fn connect_peer_if_necessary<K: KVStore + Sync + Send + 'static>(
 	node_id: PublicKey, addr: SocketAddress, peer_manager: Arc<PeerManager<K>>,
 	logger: Arc<FilesystemLogger>,
 ) -> Result<(), Error> {
-	for (pman_node_id, _pman_addr) in peer_manager.get_peer_node_ids() {
-		if node_id == pman_node_id {
-			return Ok(());
-		}
+	if peer_manager.peer_by_node_id(&node_id).is_some() {
+		return Ok(());
 	}
 
 	do_connect_peer(node_id, addr, peer_manager, logger).await
@@ -1796,7 +1899,7 @@ async fn do_connect_peer<K: KVStore + Sync + Send + 'static>(
 					std::task::Poll::Pending => {},
 				}
 				// Avoid blocking the tokio context by sleeping a bit
-				match peer_manager.get_peer_node_ids().iter().find(|(id, _addr)| *id == node_id) {
+				match peer_manager.peer_by_node_id(&node_id) {
 					Some(_) => return Ok(()),
 					None => tokio::time::sleep(Duration::from_millis(10)).await,
 				}
@@ -1807,4 +1910,24 @@ async fn do_connect_peer<K: KVStore + Sync + Send + 'static>(
 			Err(Error::ConnectionFailed)
 		},
 	}
+}
+
+pub(crate) fn total_anchor_channels_reserve_sats<K: KVStore + Sync + Send + 'static>(
+	channel_manager: &ChannelManager<K>, config: &Config,
+) -> u64 {
+	config.anchor_channels_config.as_ref().map_or(0, |anchor_channels_config| {
+		channel_manager
+			.list_channels()
+			.into_iter()
+			.filter(|c| {
+				!anchor_channels_config.trusted_peers_no_reserve.contains(&c.counterparty.node_id)
+					&& c.channel_shutdown_state
+						.map_or(true, |s| s != ChannelShutdownState::ShutdownComplete)
+					&& c.channel_type
+						.as_ref()
+						.map_or(false, |t| t.requires_anchors_zero_fee_htlc_tx())
+			})
+			.count() as u64
+			* anchor_channels_config.per_channel_reserve_sats
+	})
 }

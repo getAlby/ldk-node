@@ -5,7 +5,7 @@ mod common;
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::Amount;
 use ldk_node::lightning::ln::msgs::SocketAddress;
-use ldk_node::{Builder, Event};
+use ldk_node::{Builder, ChannelType, Event};
 
 use clightningrpc::lightningrpc::LightningRPC;
 use clightningrpc::responses::NetworkAddress;
@@ -36,7 +36,7 @@ fn test_cln() {
 	common::generate_blocks_and_wait(&bitcoind_client, &electrs_client, 1);
 
 	// Setup LDK Node
-	let config = common::random_config();
+	let config = common::random_config(true);
 	let mut builder = Builder::from_config(config);
 	builder.set_esplora_server("http://127.0.0.1:3002".to_string());
 
@@ -89,6 +89,7 @@ fn test_cln() {
 	common::wait_for_tx(&electrs_client, funding_txo.txid);
 	common::generate_blocks_and_wait(&bitcoind_client, &electrs_client, 6);
 	let user_channel_id = common::expect_channel_ready_event!(node, cln_node_id);
+	assert_eq!(node.list_channels().first().unwrap().channel_type, Some(ChannelType::Anchors));
 
 	// Send a payment to CLN
 	let mut rng = thread_rng();
@@ -110,7 +111,7 @@ fn test_cln() {
 	cln_client.pay(&ldk_invoice.to_string(), Default::default()).unwrap();
 	common::expect_event!(node, PaymentReceived);
 
-	node.close_channel(&user_channel_id, cln_node_id).unwrap();
+	node.close_channel(&user_channel_id, cln_node_id, false).unwrap();
 	common::expect_event!(node, ChannelClosed);
 	node.stop().unwrap();
 }

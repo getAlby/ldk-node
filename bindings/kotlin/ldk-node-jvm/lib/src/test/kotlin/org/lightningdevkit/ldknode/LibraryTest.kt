@@ -203,9 +203,9 @@ class LibraryTest {
         val spendableBalance2AfterOpen = node2.listBalances().spendableOnchainBalanceSats
         println("Spendable balance 1 after open: $spendableBalance1AfterOpen")
         println("Spendable balance 2 after open: $spendableBalance2AfterOpen")
-        assert(spendableBalance1AfterOpen > 49000u)
-        assert(spendableBalance1AfterOpen < 50000u)
-        assertEquals(100000uL, spendableBalance2AfterOpen)
+        assert(spendableBalance1AfterOpen > 24000u)
+        assert(spendableBalance1AfterOpen < 25000u)
+        assertEquals(75000uL, spendableBalance2AfterOpen)
 
         val channelReadyEvent1 = node1.waitNextEvent()
         println("Got event: $channelReadyEvent1")
@@ -239,7 +239,7 @@ class LibraryTest {
         assert(node1.listPayments().size == 1)
         assert(node2.listPayments().size == 1)
 
-        node2.closeChannel(userChannelId, nodeId1)
+        node2.closeChannel(userChannelId, nodeId1, false)
 
         val channelClosedEvent1 = node1.waitNextEvent()
         println("Got event: $channelClosedEvent1")
