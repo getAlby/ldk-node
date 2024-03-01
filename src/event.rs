@@ -691,7 +691,17 @@ where
 							.get_balances(cur_anchor_reserve_sats)
 							.map(|(_, s)| s)
 							.unwrap_or(0);
-						if spendable_amount_sats < anchor_channels_config.per_channel_reserve_sats {
+
+						let required_amount_sats = if anchor_channels_config
+							.trusted_peers_no_reserve
+							.contains(&counterparty_node_id)
+						{
+							0
+						} else {
+							anchor_channels_config.per_channel_reserve_sats
+						};
+
+						if spendable_amount_sats < required_amount_sats {
 							log_error!(
 							self.logger,
 							"Rejecting inbound Anchor channel from peer {} due to insufficient available on-chain reserves.",
