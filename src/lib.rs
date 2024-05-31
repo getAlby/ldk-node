@@ -219,7 +219,11 @@ impl Node {
 
 		log_info!(self.logger, "Starting up LDK Node on network: {}", self.config.network);
 
-		let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(8)
+			.enable_all()
+			.build()
+			.unwrap();
 
 		// Block to ensure we update our fee rate cache once on startup
 		let fee_estimator = Arc::clone(&self.fee_estimator);
@@ -1233,8 +1237,12 @@ impl Node {
 		];
 
 		tokio::task::block_in_place(move || {
-			tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap().block_on(
-				async move {
+			tokio::runtime::Builder::new_multi_thread()
+				.worker_threads(8)
+				.enable_all()
+				.build()
+				.unwrap()
+				.block_on(async move {
 					let now = Instant::now();
 					let fee_estimator = Arc::clone(&self.fee_estimator);
 					let fee_update_timestamp =
@@ -1303,8 +1311,7 @@ impl Node {
 							Err(e.into())
 						},
 					}
-				},
-			)
+				})
 		})
 	}
 
