@@ -1,3 +1,10 @@
+// This file is Copyright its original authors, visible in version control history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
+// accordance with one or both of these licenses.
+
 use crate::hex_utils;
 use crate::io::{
 	PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
@@ -11,6 +18,7 @@ use lightning::ln::msgs::DecodeError;
 use lightning::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning::offers::offer::OfferId;
 use lightning::util::ser::{Readable, Writeable};
+use lightning::util::string::UntrustedString;
 use lightning::{
 	_init_and_read_len_prefixed_tlv_fields, impl_writeable_tlv_based,
 	impl_writeable_tlv_based_enum, write_tlv_fields,
@@ -182,7 +190,7 @@ pub enum PaymentDirection {
 
 impl_writeable_tlv_based_enum!(PaymentDirection,
 	(0, Inbound) => {},
-	(1, Outbound) => {};
+	(1, Outbound) => {}
 );
 
 /// Represents the current status of a payment.
@@ -199,7 +207,7 @@ pub enum PaymentStatus {
 impl_writeable_tlv_based_enum!(PaymentStatus,
 	(0, Pending) => {},
 	(2, Succeeded) => {},
-	(4, Failed) => {};
+	(4, Failed) => {}
 );
 
 /// Represents the kind of a payment.
@@ -254,6 +262,18 @@ pub enum PaymentKind {
 		secret: Option<PaymentSecret>,
 		/// The ID of the offer this payment is for.
 		offer_id: OfferId,
+		/// The payer note for the payment.
+		///
+		/// Truncated to [`PAYER_NOTE_LIMIT`] characters.
+		///
+		/// This will always be `None` for payments serialized with version `v0.3.0`.
+		///
+		/// [`PAYER_NOTE_LIMIT`]: lightning::offers::invoice_request::PAYER_NOTE_LIMIT
+		payer_note: Option<UntrustedString>,
+		/// The quantity of an item requested in the offer.
+		///
+		/// This will always be `None` for payments serialized with version `v0.3.0`.
+		quantity: Option<u64>,
 	},
 	/// A [BOLT 12] 'refund' payment, i.e., a payment for a [`Refund`].
 	///
@@ -266,6 +286,14 @@ pub enum PaymentKind {
 		preimage: Option<PaymentPreimage>,
 		/// The secret used by the payment.
 		secret: Option<PaymentSecret>,
+		/// The payer note for the refund payment.
+		///
+		/// This will always be `None` for payments serialized with version `v0.3.0`.
+		payer_note: Option<UntrustedString>,
+		/// The quantity of an item that the refund is for.
+		///
+		/// This will always be `None` for payments serialized with version `v0.3.0`.
+		quantity: Option<u64>,
 	},
 	/// A spontaneous ("keysend") payment.
 	Spontaneous {
@@ -294,7 +322,9 @@ impl_writeable_tlv_based_enum!(PaymentKind,
 	},
 	(6, Bolt12Offer) => {
 		(0, hash, option),
+		(1, payer_note, option),
 		(2, preimage, option),
+		(3, quantity, option),
 		(4, secret, option),
 		(6, offer_id, required),
 	},
@@ -305,9 +335,11 @@ impl_writeable_tlv_based_enum!(PaymentKind,
 	},
 	(10, Bolt12Refund) => {
 		(0, hash, option),
+		(1, payer_note, option),
 		(2, preimage, option),
+		(3, quantity, option),
 		(4, secret, option),
-	};
+	}
 );
 
 /// Limits applying to how much fee we allow an LSP to deduct from the payment amount.
@@ -531,11 +563,11 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use bitcoin::io::Cursor;
 	use lightning::util::{
 		ser::Readable,
 		test_utils::{TestLogger, TestStore},
 	};
-	use std::io::Cursor;
 	use std::sync::Arc;
 
 	/// We refactored `PaymentDetails` to hold a payment id and moved some required fields into

@@ -1,29 +1,36 @@
+// This file is Copyright its original authors, visible in version control history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
+// accordance with one or both of these licenses.
+
+use crate::chain::ChainSource;
+use crate::config::ChannelConfig;
+use crate::fee_estimator::OnchainFeeEstimator;
 use crate::logger::FilesystemLogger;
 use crate::message_handler::NodeCustomMessageHandler;
 
 use lightning::chain::chainmonitor;
 use lightning::impl_writeable_tlv_based;
-use lightning::ln::channelmanager::ChannelDetails as LdkChannelDetails;
+use lightning::ln::channel_state::ChannelDetails as LdkChannelDetails;
 use lightning::ln::msgs::RoutingMessageHandler;
 use lightning::ln::msgs::SocketAddress;
 use lightning::ln::peer_handler::IgnoringMessageHandler;
-use lightning::ln::ChannelId;
+use lightning::ln::types::ChannelId;
 use lightning::routing::gossip;
 use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringFeeParameters};
 use lightning::sign::InMemorySigner;
-use lightning::util::config::ChannelConfig as LdkChannelConfig;
-use lightning::util::config::MaxDustHTLCExposure as LdkMaxDustHTLCExposure;
 use lightning::util::persist::KVStore;
 use lightning::util::ser::{Readable, Writeable, Writer};
 use lightning::util::sweep::OutputSweeper;
 use lightning_net_tokio::SocketDescriptor;
-use lightning_transaction_sync::EsploraSyncClient;
 
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::OutPoint;
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 pub(crate) type DynStore = dyn KVStore + Sync + Send;
 
@@ -31,7 +38,7 @@ pub(crate) type ChainMonitor = chainmonitor::ChainMonitor<
 	InMemorySigner,
 	Arc<ChainSource>,
 	Arc<Broadcaster>,
-	Arc<FeeEstimator>,
+	Arc<OnchainFeeEstimator>,
 	Arc<FilesystemLogger>,
 	Arc<DynStore>,
 >;
@@ -46,8 +53,6 @@ pub(crate) type PeerManager = lightning::ln::peer_handler::PeerManager<
 	Arc<KeysManager>,
 >;
 
-pub(crate) type ChainSource = EsploraSyncClient<Arc<FilesystemLogger>>;
-
 pub(crate) type LiquidityManager =
 	lightning_liquidity::LiquidityManager<Arc<KeysManager>, Arc<ChannelManager>, Arc<ChainSource>>;
 
@@ -57,26 +62,19 @@ pub(crate) type ChannelManager = lightning::ln::channelmanager::ChannelManager<
 	Arc<KeysManager>,
 	Arc<KeysManager>,
 	Arc<KeysManager>,
-	Arc<FeeEstimator>,
+	Arc<OnchainFeeEstimator>,
 	Arc<Router>,
 	Arc<FilesystemLogger>,
 >;
 
 pub(crate) type Broadcaster = crate::tx_broadcaster::TransactionBroadcaster<Arc<FilesystemLogger>>;
 
-pub(crate) type FeeEstimator = crate::fee_estimator::OnchainFeeEstimator<Arc<FilesystemLogger>>;
-
-pub(crate) type Wallet = crate::wallet::Wallet<
-	bdk::database::SqliteDatabase,
-	Arc<Broadcaster>,
-	Arc<FeeEstimator>,
-	Arc<FilesystemLogger>,
->;
+pub(crate) type Wallet =
+	crate::wallet::Wallet<Arc<Broadcaster>, Arc<OnchainFeeEstimator>, Arc<FilesystemLogger>>;
 
 pub(crate) type KeysManager = crate::wallet::WalletKeysManager<
-	bdk::database::SqliteDatabase,
 	Arc<Broadcaster>,
-	Arc<FeeEstimator>,
+	Arc<OnchainFeeEstimator>,
 	Arc<FilesystemLogger>,
 >;
 
@@ -115,6 +113,7 @@ pub(crate) type OnionMessenger = lightning::onion_message::messenger::OnionMesse
 	Arc<MessageRouter>,
 	Arc<ChannelManager>,
 	IgnoringMessageHandler,
+	IgnoringMessageHandler,
 >;
 
 pub(crate) type MessageRouter = lightning::onion_message::messenger::DefaultMessageRouter<
@@ -126,7 +125,7 @@ pub(crate) type MessageRouter = lightning::onion_message::messenger::DefaultMess
 pub(crate) type Sweeper = OutputSweeper<
 	Arc<Broadcaster>,
 	Arc<KeysManager>,
-	Arc<FeeEstimator>,
+	Arc<OnchainFeeEstimator>,
 	Arc<ChainSource>,
 	Arc<DynStore>,
 	Arc<FilesystemLogger>,
@@ -218,11 +217,11 @@ pub struct ChannelDetails {
 	/// balance is not available for inclusion in new outbound HTLCs). This further does not include
 	/// any pending outgoing HTLCs which are awaiting some other resolution to be sent.
 	pub outbound_capacity_msat: u64,
-	/// The available outbound capacity for sending HTLCs to the remote peer.
+	/// The available inbound capacity for receiving HTLCs from the remote peer.
 	///
 	/// The amount does not include any pending HTLCs which are not yet resolved
 	/// (and, thus, whose balance is not available for inclusion in new inbound HTLCs). This further
-	/// does not include any pending outgoing HTLCs which are awaiting some other resolution to be
+	/// does not include any pending incoming HTLCs which are awaiting some other resolution to be
 	/// sent.
 	pub inbound_capacity_msat: u64,
 	/// The number of required confirmations on the funding transactions before the funding is
@@ -245,7 +244,7 @@ pub struct ChannelDetails {
 	/// This is a strict superset of `is_channel_ready`.
 	pub is_usable: bool,
 	/// Returns `true` if this channel is (or will be) publicly-announced
-	pub is_public: bool,
+	pub is_announced: bool,
 	/// The difference in the CLTV value between incoming HTLCs and an outbound HTLC forwarded over
 	/// the channel.
 	pub cltv_expiry_delta: Option<u16>,
@@ -297,7 +296,7 @@ pub struct ChannelDetails {
 	/// The largest value HTLC (in msat) we currently will accept, for this channel.
 	pub inbound_htlc_maximum_msat: Option<u64>,
 	/// Set of configurable parameters that affect channel operation.
-	pub config: Arc<ChannelConfig>,
+	pub config: ChannelConfig,
 }
 
 impl From<LdkChannelDetails> for ChannelDetails {
@@ -328,7 +327,7 @@ impl From<LdkChannelDetails> for ChannelDetails {
 			is_outbound: value.is_outbound,
 			is_channel_ready: value.is_channel_ready,
 			is_usable: value.is_usable,
-			is_public: value.is_public,
+			is_announced: value.is_announced,
 			cltv_expiry_delta: value.config.map(|c| c.cltv_expiry_delta),
 			counterparty_unspendable_punishment_reserve: value
 				.counterparty
@@ -357,7 +356,7 @@ impl From<LdkChannelDetails> for ChannelDetails {
 			inbound_htlc_minimum_msat: value.inbound_htlc_minimum_msat.unwrap_or(0),
 			inbound_htlc_maximum_msat: value.inbound_htlc_maximum_msat,
 			// unwrap safety: `config` is only `None` for LDK objects serialized prior to 0.0.109.
-			config: value.config.map(|c| Arc::new(c.into())).unwrap(),
+			config: value.config.map(|c| c.into()).unwrap(),
 		}
 	}
 }
@@ -375,107 +374,6 @@ pub struct PeerDetails {
 	pub is_persisted: bool,
 	/// Indicates whether we currently have an active connection with the peer.
 	pub is_connected: bool,
-}
-
-/// Options which apply on a per-channel basis.
-///
-/// See documentation of [`LdkChannelConfig`] for details.
-#[derive(Debug)]
-pub struct ChannelConfig {
-	inner: RwLock<LdkChannelConfig>,
-}
-
-impl Clone for ChannelConfig {
-	fn clone(&self) -> Self {
-		self.inner.read().unwrap().clone().into()
-	}
-}
-
-impl ChannelConfig {
-	/// Constructs a new `ChannelConfig`.
-	pub fn new() -> Self {
-		Self::default()
-	}
-
-	/// Returns the set `forwarding_fee_proportional_millionths`.
-	pub fn forwarding_fee_proportional_millionths(&self) -> u32 {
-		self.inner.read().unwrap().forwarding_fee_proportional_millionths
-	}
-
-	/// Sets the `forwarding_fee_proportional_millionths`.
-	pub fn set_forwarding_fee_proportional_millionths(&self, value: u32) {
-		self.inner.write().unwrap().forwarding_fee_proportional_millionths = value;
-	}
-
-	/// Returns the set `forwarding_fee_base_msat`.
-	pub fn forwarding_fee_base_msat(&self) -> u32 {
-		self.inner.read().unwrap().forwarding_fee_base_msat
-	}
-
-	/// Sets the `forwarding_fee_base_msat`.
-	pub fn set_forwarding_fee_base_msat(&self, fee_msat: u32) {
-		self.inner.write().unwrap().forwarding_fee_base_msat = fee_msat;
-	}
-
-	/// Returns the set `cltv_expiry_delta`.
-	pub fn cltv_expiry_delta(&self) -> u16 {
-		self.inner.read().unwrap().cltv_expiry_delta
-	}
-
-	/// Sets the `cltv_expiry_delta`.
-	pub fn set_cltv_expiry_delta(&self, value: u16) {
-		self.inner.write().unwrap().cltv_expiry_delta = value;
-	}
-
-	/// Returns the set `force_close_avoidance_max_fee_satoshis`.
-	pub fn force_close_avoidance_max_fee_satoshis(&self) -> u64 {
-		self.inner.read().unwrap().force_close_avoidance_max_fee_satoshis
-	}
-
-	/// Sets the `force_close_avoidance_max_fee_satoshis`.
-	pub fn set_force_close_avoidance_max_fee_satoshis(&self, value_sat: u64) {
-		self.inner.write().unwrap().force_close_avoidance_max_fee_satoshis = value_sat;
-	}
-
-	/// Returns the set `accept_underpaying_htlcs`.
-	pub fn accept_underpaying_htlcs(&self) -> bool {
-		self.inner.read().unwrap().accept_underpaying_htlcs
-	}
-
-	/// Sets the `accept_underpaying_htlcs`.
-	pub fn set_accept_underpaying_htlcs(&self, value: bool) {
-		self.inner.write().unwrap().accept_underpaying_htlcs = value;
-	}
-
-	/// Sets the `max_dust_htlc_exposure` from a fixed limit.
-	pub fn set_max_dust_htlc_exposure_from_fixed_limit(&self, limit_msat: u64) {
-		self.inner.write().unwrap().max_dust_htlc_exposure =
-			LdkMaxDustHTLCExposure::FixedLimitMsat(limit_msat);
-	}
-
-	/// Sets the `max_dust_htlc_exposure` from a fee rate multiplier.
-	pub fn set_max_dust_htlc_exposure_from_fee_rate_multiplier(&self, multiplier: u64) {
-		self.inner.write().unwrap().max_dust_htlc_exposure =
-			LdkMaxDustHTLCExposure::FeeRateMultiplier(multiplier);
-	}
-}
-
-impl From<LdkChannelConfig> for ChannelConfig {
-	fn from(value: LdkChannelConfig) -> Self {
-		Self { inner: RwLock::new(value) }
-	}
-}
-
-impl From<ChannelConfig> for LdkChannelConfig {
-	fn from(value: ChannelConfig) -> Self {
-		*value.inner.read().unwrap()
-	}
-}
-
-impl Default for ChannelConfig {
-	fn default() -> Self {
-		LdkChannelConfig::default().into()
-	}
 }
 
 /// Custom TLV entry.

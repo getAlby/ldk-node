@@ -1,3 +1,10 @@
+// This file is Copyright its original authors, visible in version control history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
+// accordance with one or both of these licenses.
+
 #![cfg(cln_test)]
 
 mod common;
@@ -38,7 +45,7 @@ fn test_cln() {
 	// Setup LDK Node
 	let config = common::random_config(true);
 	let mut builder = Builder::from_config(config);
-	builder.set_esplora_server("http://127.0.0.1:3002".to_string());
+	builder.set_chain_source_esplora("http://127.0.0.1:3002".to_string(), None);
 
 	let node = builder.build().unwrap();
 	node.start().unwrap();
@@ -75,15 +82,8 @@ fn test_cln() {
 	// Open the channel
 	let funding_amount_sat = 1_000_000;
 
-	node.connect_open_channel(
-		cln_node_id,
-		cln_address,
-		funding_amount_sat,
-		Some(500_000_000),
-		None,
-		false,
-	)
-	.unwrap();
+	node.open_channel(cln_node_id, cln_address, funding_amount_sat, Some(500_000_000), None)
+		.unwrap();
 
 	let funding_txo = common::expect_channel_pending_event!(node, cln_node_id);
 	common::wait_for_tx(&electrs_client, funding_txo.txid);
@@ -99,7 +99,7 @@ fn test_cln() {
 		cln_client.invoice(Some(10_000_000), &rand_label, &rand_label, None, None, None).unwrap();
 	let parsed_invoice = Bolt11Invoice::from_str(&cln_invoice.bolt11).unwrap();
 
-	node.bolt11_payment().send(&parsed_invoice).unwrap();
+	node.bolt11_payment().send(&parsed_invoice, None).unwrap();
 	common::expect_event!(node, PaymentSuccessful);
 	let cln_listed_invoices =
 		cln_client.listinvoices(Some(&rand_label), None, None, None).unwrap().invoices;

@@ -45,18 +45,34 @@ jobs:
           cargo update -p proptest --precise "1.2.0" --verbose # proptest 1.3.0 requires rustc 1.64.0
           cargo update -p regex --precise "1.9.6" --verbose # regex 1.10.0 requires rustc 1.65.0
           cargo update -p home --precise "0.5.5" --verbose # home v0.5.9 requires rustc 1.70 or newer
-          cargo update -p url --precise "2.5.0" --verbose # url v2.5.1 requires rustc 1.67 or newer
+          cargo update -p tokio --precise "1.38.1" --verbose # tokio v1.39.0 requires rustc 1.70 or newer
+          cargo update -p tokio-util --precise "0.7.11" --verbose # tokio-util v0.7.12 requires rustc 1.70 or newer
       - name: Set RUSTFLAGS to deny warnings
         if: "matrix.toolchain == 'stable'"
         run: echo "RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
-      - name: Download bitcoind/electrs and set environment variables
-        if: "matrix.platform != 'windows-latest'"
+      - name: Enable caching for bitcoind
+        id: cache-bitcoind
+        uses: actions/cache@v4
+        with:
+          path: bin/bitcoind-${{ runner.os }}-${{ runner.arch }}
+          key: bitcoind-${{ runner.os }}-${{ runner.arch }}
+      - name: Enable caching for electrs
+        id: cache-electrs
+        uses: actions/cache@v4
+        with:
+          path: bin/electrs-${{ runner.os }}-${{ runner.arch }}
+          key: electrs-${{ runner.os }}-${{ runner.arch }}
+      - name: Download bitcoind/electrs
+        if: "matrix.platform != 'windows-latest' && (steps.cache-bitcoind.outputs.cache-hit != 'true' || steps.cache-electrs.outputs.cache-hit != 'true')"
         run: |
           source ./scripts/download_bitcoind_electrs.sh
-          cp "$BITCOIND_EXE" "$HOME"/bitcoind
-          cp "$ELECTRS_EXE" "$HOME"/electrs
-          echo "BITCOIND_EXE=$HOME/bitcoind" >> "$GITHUB_ENV"
-          echo "ELECTRS_EXE=$HOME/electrs" >> "$GITHUB_ENV"
+          mkdir bin
+          mv "$BITCOIND_EXE" bin/bitcoind-${{ runner.os }}-${{ runner.arch }}
+          mv "$ELECTRS_EXE" bin/electrs-${{ runner.os }}-${{ runner.arch }}
+      - name: Set bitcoind/electrs environment variables
+        run: |
+          echo "BITCOIND_EXE=$( pwd )/bin/bitcoind-${{ runner.os }}-${{ runner.arch }}" >> "$GITHUB_ENV"
+          echo "ELECTRS_EXE=$( pwd )/bin/electrs-${{ runner.os }}-${{ runner.arch }}" >> "$GITHUB_ENV"
       - name: Build on Rust ${{ matrix.toolchain }}
         run: cargo build --verbose --color always
       - name: Build with UniFFI support on Rust ${{ matrix.toolchain }}
