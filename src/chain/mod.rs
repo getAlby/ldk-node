@@ -417,8 +417,8 @@ impl ChainSource {
 				let res = {
 					// If this is our first sync, do a full scan with the configured gap limit.
 					// Otherwise just do an incremental sync.
-					let incremental_sync =
-						node_metrics.read().unwrap().latest_onchain_wallet_sync_timestamp.is_some();
+					// Alby: always do full sync
+					let incremental_sync = false; //node_metrics.read().unwrap().latest_onchain_wallet_sync_timestamp.is_some();
 
 					log_info!(logger, "Starting onchain wallet sync");
 
