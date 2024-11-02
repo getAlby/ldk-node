@@ -818,7 +818,7 @@ fn build_with_store_internal(
 
 	let chain_source = match chain_data_source_config {
 		Some(ChainDataSourceConfig::Esplora { server_url, sync_config }) => {
-			log_info!(logger, "Using custom esplora server: {}", server_url);
+			log_info!(logger, "Using esplora server: {}", server_url);
 			let sync_config = sync_config.unwrap_or(EsploraSyncConfig::default());
 			Arc::new(ChainSource::new_esplora(
 				server_url.clone(),
