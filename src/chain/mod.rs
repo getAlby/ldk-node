@@ -420,6 +420,8 @@ impl ChainSource {
 					let incremental_sync =
 						node_metrics.read().unwrap().latest_onchain_wallet_sync_timestamp.is_some();
 
+					log_info!(logger, "Starting onchain wallet sync");
+
 					macro_rules! get_and_apply_wallet_update {
 						($sync_future: expr) => {{
 							let now = Instant::now();
@@ -555,6 +557,7 @@ impl ChainSource {
 						tx_sync.sync(confirmables),
 					);
 					let now = Instant::now();
+					log_info!(logger, "Starting lightning wallet sync");
 					match timeout_fut.await {
 						Ok(res) => match res {
 							Ok(()) => {
@@ -758,6 +761,7 @@ impl ChainSource {
 				..
 			} => {
 				let now = Instant::now();
+				log_info!(logger, "Starting fee estimates sync");
 				let estimates = tokio::time::timeout(
 					Duration::from_secs(FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS),
 					esplora_client.get_fee_estimates(),
