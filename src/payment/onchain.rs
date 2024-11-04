@@ -1,3 +1,10 @@
+// This file is Copyright its original authors, visible in version control history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
+// accordance with one or both of these licenses.
+
 //! Holds a payment handler allowing to send and receive on-chain payments.
 
 use crate::config::Config;
@@ -5,7 +12,7 @@ use crate::error::Error;
 use crate::logger::{log_error, log_info, FilesystemLogger, Logger};
 use crate::types::{ChannelManager, Wallet};
 
-use bitcoin::{Address, Txid};
+use bitcoin::{Address, Amount, Txid};
 
 use std::sync::{Arc, RwLock};
 
@@ -15,7 +22,7 @@ use std::sync::{Arc, RwLock};
 ///
 /// [`Node::onchain_payment`]: crate::Node::onchain_payment
 pub struct OnchainPayment {
-	runtime: Arc<RwLock<Option<tokio::runtime::Runtime>>>,
+	runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>,
 	wallet: Arc<Wallet>,
 	channel_manager: Arc<ChannelManager>,
 	config: Arc<Config>,
@@ -24,7 +31,7 @@ pub struct OnchainPayment {
 
 impl OnchainPayment {
 	pub(crate) fn new(
-		runtime: Arc<RwLock<Option<tokio::runtime::Runtime>>>, wallet: Arc<Wallet>,
+		runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>, wallet: Arc<Wallet>,
 		channel_manager: Arc<ChannelManager>, config: Arc<Config>, logger: Arc<FilesystemLogger>,
 	) -> Self {
 		Self { runtime, wallet, channel_manager, config, logger }
@@ -63,7 +70,9 @@ impl OnchainPayment {
 			);
 			return Err(Error::InsufficientFunds);
 		}
-		self.wallet.send_to_address(address, Some(amount_sats))
+
+		let amount = Amount::from_sat(amount_sats);
+		self.wallet.send_to_address(address, Some(amount))
 	}
 
 	/// Send an on-chain payment to the given address, draining all the available funds.

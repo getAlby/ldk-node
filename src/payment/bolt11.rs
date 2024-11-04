@@ -1,3 +1,10 @@
+// This file is Copyright its original authors, visible in version control history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
+// accordance with one or both of these licenses.
+
 //! Holds a payment handler allowing to create and pay [BOLT 11] invoices.
 //!
 //! [BOLT 11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
@@ -11,14 +18,20 @@ use crate::payment::store::{
 	LSPFeeLimits, PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind,
 	PaymentStatus, PaymentStore,
 };
+use crate::payment::SendingParameters;
 use crate::peer_store::{PeerInfo, PeerStore};
 use crate::types::{ChannelManager, KeysManager};
 
 use lightning::ln::channelmanager::{PaymentId, RecipientOnionFields, Retry, RetryableSendFailure};
+use lightning::ln::invoice_utils::{
+	create_invoice_from_channelmanager_and_duration_since_epoch,
+	create_invoice_from_channelmanager_and_duration_since_epoch_with_payment_hash,
+};
 use lightning::ln::{PaymentHash, PaymentPreimage};
 use lightning::routing::router::{PaymentParameters, RouteParameters};
 
-use lightning_invoice::{payment, Bolt11Invoice, Currency};
+use lightning::ln::bolt11_payment;
+use lightning_invoice::{Bolt11Invoice, Currency};
 
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
@@ -33,7 +46,7 @@ use std::time::SystemTime;
 /// [BOLT 11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
 /// [`Node::bolt11_payment`]: crate::Node::bolt11_payment
 pub struct Bolt11Payment {
-	runtime: Arc<RwLock<Option<tokio::runtime::Runtime>>>,
+	runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>,
 	channel_manager: Arc<ChannelManager>,
 	connection_manager: Arc<ConnectionManager<Arc<FilesystemLogger>>>,
 	keys_manager: Arc<KeysManager>,
@@ -46,7 +59,7 @@ pub struct Bolt11Payment {
 
 impl Bolt11Payment {
 	pub(crate) fn new(
-		runtime: Arc<RwLock<Option<tokio::runtime::Runtime>>>,
+		runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>,
 		channel_manager: Arc<ChannelManager>,
 		connection_manager: Arc<ConnectionManager<Arc<FilesystemLogger>>>,
 		keys_manager: Arc<KeysManager>,
@@ -69,13 +82,18 @@ impl Bolt11Payment {
 	}
 
 	/// Send a payment given an invoice.
-	pub fn send(&self, invoice: &Bolt11Invoice) -> Result<PaymentId, Error> {
+	///
+	/// If `sending_parameters` are provided they will override the default as well as the
+	/// node-wide parameters configured via [`Config::sending_parameters`] on a per-field basis.
+	pub fn send(
+		&self, invoice: &Bolt11Invoice, sending_parameters: Option<SendingParameters>,
+	) -> Result<PaymentId, Error> {
 		let rt_lock = self.runtime.read().unwrap();
 		if rt_lock.is_none() {
 			return Err(Error::NotRunning);
 		}
 
-		let (payment_hash, recipient_onion, route_params) = payment::payment_parameters_from_invoice(&invoice).map_err(|_| {
+		let (payment_hash, recipient_onion, mut route_params) = bolt11_payment::payment_parameters_from_invoice(&invoice).map_err(|_| {
 			log_error!(self.logger, "Failed to send payment due to the given invoice being \"zero-amount\". Please use send_using_amount instead.");
 			Error::InvalidInvoice
 		})?;
@@ -89,6 +107,21 @@ impl Bolt11Payment {
 				return Err(Error::DuplicatePayment);
 			}
 		}
+
+		let override_params =
+			sending_parameters.as_ref().or(self.config.sending_parameters.as_ref());
+		if let Some(override_params) = override_params {
+			override_params
+				.max_total_routing_fee_msat
+				.map(|f| route_params.max_total_routing_fee_msat = f.into());
+			override_params
+				.max_total_cltv_expiry_delta
+				.map(|d| route_params.payment_params.max_total_cltv_expiry_delta = d);
+			override_params.max_path_count.map(|p| route_params.payment_params.max_path_count = p);
+			override_params
+				.max_channel_saturation_power_of_half
+				.map(|s| route_params.payment_params.max_channel_saturation_power_of_half = s);
+		};
 
 		let payment_secret = Some(*invoice.payment_secret());
 		let retry_strategy = Retry::Timeout(LDK_PAYMENT_RETRY_TIMEOUT);
@@ -150,14 +183,18 @@ impl Bolt11Payment {
 		}
 	}
 
-	/// Send a payment given an invoice and an amount in millisatoshi.
+	/// Send a payment given an invoice and an amount in millisatoshis.
 	///
 	/// This will fail if the amount given is less than the value required by the given invoice.
 	///
 	/// This can be used to pay a so-called "zero-amount" invoice, i.e., an invoice that leaves the
 	/// amount paid to be determined by the user.
+	///
+	/// If `sending_parameters` are provided they will override the default as well as the
+	/// node-wide parameters configured via [`Config::sending_parameters`] on a per-field basis.
 	pub fn send_using_amount(
 		&self, invoice: &Bolt11Invoice, amount_msat: u64,
+		sending_parameters: Option<SendingParameters>,
 	) -> Result<PaymentId, Error> {
 		let rt_lock = self.runtime.read().unwrap();
 		if rt_lock.is_none() {
@@ -198,8 +235,23 @@ impl Bolt11Payment {
 				.with_bolt11_features(features.clone())
 				.map_err(|_| Error::InvalidInvoice)?;
 		}
-		let route_params =
+		let mut route_params =
 			RouteParameters::from_payment_params_and_value(payment_params, amount_msat);
+
+		let override_params =
+			sending_parameters.as_ref().or(self.config.sending_parameters.as_ref());
+		if let Some(override_params) = override_params {
+			override_params
+				.max_total_routing_fee_msat
+				.map(|f| route_params.max_total_routing_fee_msat = f.into());
+			override_params
+				.max_total_cltv_expiry_delta
+				.map(|d| route_params.payment_params.max_total_cltv_expiry_delta = d);
+			override_params.max_path_count.map(|p| route_params.payment_params.max_path_count = p);
+			override_params
+				.max_channel_saturation_power_of_half
+				.map(|s| route_params.payment_params.max_channel_saturation_power_of_half = s);
+		};
 
 		let retry_strategy = Retry::Timeout(LDK_PAYMENT_RETRY_TIMEOUT);
 		let recipient_fields = RecipientOnionFields::secret_only(*payment_secret);
@@ -430,7 +482,7 @@ impl Bolt11Payment {
 
 		let invoice = {
 			let invoice_res = if let Some(payment_hash) = manual_claim_payment_hash {
-				lightning_invoice::utils::create_invoice_from_channelmanager_and_duration_since_epoch_with_payment_hash(
+				create_invoice_from_channelmanager_and_duration_since_epoch_with_payment_hash(
 					&self.channel_manager,
 					keys_manager,
 					Arc::clone(&self.logger),
@@ -443,7 +495,7 @@ impl Bolt11Payment {
 					None,
 				)
 			} else {
-				lightning_invoice::utils::create_invoice_from_channelmanager_and_duration_since_epoch(
+				create_invoice_from_channelmanager_and_duration_since_epoch(
 					&self.channel_manager,
 					keys_manager,
 					Arc::clone(&self.logger),
@@ -658,7 +710,7 @@ impl Bolt11Payment {
 			return Err(Error::NotRunning);
 		}
 
-		let (_payment_hash, _recipient_onion, route_params) = payment::payment_parameters_from_invoice(&invoice).map_err(|_| {
+		let (_payment_hash, _recipient_onion, route_params) = bolt11_payment::payment_parameters_from_invoice(&invoice).map_err(|_| {
 			log_error!(self.logger, "Failed to send probes due to the given invoice being \"zero-amount\". Please use send_probes_using_amount instead.");
 			Error::InvalidInvoice
 		})?;
@@ -700,12 +752,12 @@ impl Bolt11Payment {
 				return Err(Error::InvalidAmount);
 			}
 
-			payment::payment_parameters_from_invoice(&invoice).map_err(|_| {
+			bolt11_payment::payment_parameters_from_invoice(&invoice).map_err(|_| {
 				log_error!(self.logger, "Failed to send probes due to the given invoice unexpectedly being \"zero-amount\".");
 				Error::InvalidInvoice
 			})?
 		} else {
-			payment::payment_parameters_from_zero_amount_invoice(&invoice, amount_msat).map_err(|_| {
+			bolt11_payment::payment_parameters_from_zero_amount_invoice(&invoice, amount_msat).map_err(|_| {
 				log_error!(self.logger, "Failed to send probes due to the given invoice unexpectedly being not \"zero-amount\".");
 				Error::InvalidInvoice
 			})?

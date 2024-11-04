@@ -84,7 +84,7 @@ def setup_node(tmp_dir, esplora_endpoint, listening_addresses):
     config = default_config()
     builder = Builder.from_config(config)
     builder.set_storage_dir_path(tmp_dir)
-    builder.set_esplora_server(esplora_endpoint)
+    builder.set_chain_source_esplora(esplora_endpoint, None)
     builder.set_network(DEFAULT_TEST_NETWORK)
     builder.set_listening_addresses(listening_addresses)
     return builder.build()
@@ -155,7 +155,7 @@ class TestLdkNode(unittest.TestCase):
         print("TOTAL 2:", total_balance_2)
         self.assertEqual(total_balance_2, 100000)
 
-        node_1.connect_open_channel(node_id_2, listening_addresses_2[0], 50000, None, None, True)
+        node_1.open_channel(node_id_2, listening_addresses_2[0], 50000, None, None)
 
         channel_pending_event_1 = node_1.wait_next_event()
         assert isinstance(channel_pending_event_1, Event.CHANNEL_PENDING)
@@ -186,7 +186,7 @@ class TestLdkNode(unittest.TestCase):
         node_2.event_handled()
 
         invoice = node_2.bolt11_payment().receive(2500000, "asdf", 9217)
-        node_1.bolt11_payment().send(invoice)
+        node_1.bolt11_payment().send(invoice, None)
 
         payment_successful_event_1 = node_1.wait_next_event()
         assert isinstance(payment_successful_event_1, Event.PAYMENT_SUCCESSFUL)

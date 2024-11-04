@@ -1,3 +1,10 @@
+// This file is Copyright its original authors, visible in version control history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
+// accordance with one or both of these licenses.
+
 use crate::liquidity::LiquiditySource;
 
 use lightning::ln::features::{InitFeatures, NodeFeatures};
@@ -89,6 +96,26 @@ where
 			Self::Ignoring => InitFeatures::empty(),
 			Self::Liquidity { liquidity_source, .. } => {
 				liquidity_source.liquidity_manager().provided_init_features(their_node_id)
+			},
+		}
+	}
+
+	fn peer_connected(
+		&self, their_node_id: &PublicKey, msg: &lightning::ln::msgs::Init, inbound: bool,
+	) -> Result<(), ()> {
+		match self {
+			Self::Ignoring => Ok(()),
+			Self::Liquidity { liquidity_source, .. } => {
+				liquidity_source.liquidity_manager().peer_connected(their_node_id, msg, inbound)
+			},
+		}
+	}
+
+	fn peer_disconnected(&self, their_node_id: &PublicKey) {
+		match self {
+			Self::Ignoring => {},
+			Self::Liquidity { liquidity_source, .. } => {
+				liquidity_source.liquidity_manager().peer_disconnected(their_node_id)
 			},
 		}
 	}

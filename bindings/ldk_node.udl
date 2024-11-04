@@ -8,19 +8,23 @@ dictionary Config {
 	string? log_dir_path;
 	Network network;
 	sequence<SocketAddress>? listening_addresses;
-	u32 default_cltv_expiry_delta;
-	u64 onchain_wallet_sync_interval_secs;
-	u64 wallet_sync_interval_secs;
-	u64 fee_rate_cache_update_interval_secs;
+	NodeAlias? node_alias;
 	sequence<PublicKey> trusted_peers_0conf;
 	u64 probing_liquidity_limit_multiplier;
 	LogLevel log_level;
 	AnchorChannelsConfig? anchor_channels_config;
+	SendingParameters? sending_parameters;
 };
 
 dictionary AnchorChannelsConfig {
 	sequence<PublicKey> trusted_peers_no_reserve;
 	u64 per_channel_reserve_sats;
+};
+
+dictionary EsploraSyncConfig {
+	u64 onchain_wallet_sync_interval_secs;
+	u64 lightning_wallet_sync_interval_secs;
+	u64 fee_rate_cache_update_interval_secs;
 };
 
 interface Builder {
@@ -31,7 +35,8 @@ interface Builder {
 	[Throws=BuildError]
 	void set_entropy_seed_bytes(sequence<u8> seed_bytes);
 	void set_entropy_bip39_mnemonic(Mnemonic mnemonic, string? passphrase);
-	void set_esplora_server(string esplora_server_url);
+	void set_chain_source_esplora(string server_url, EsploraSyncConfig? config);
+	void set_chain_source_bitcoind_rpc(string rpc_host, u16 rpc_port, string rpc_user, string rpc_password);
 	void set_gossip_source_p2p();
 	void set_gossip_source_rgs(string rgs_server_url);
 	void set_liquidity_source_lsps2(SocketAddress address, PublicKey node_id, string? token);
@@ -40,10 +45,18 @@ interface Builder {
 	[Throws=BuildError]
 	void set_listening_addresses(sequence<SocketAddress> listening_addresses);
 	[Throws=BuildError]
+	void set_node_alias(string node_alias);
+	[Throws=BuildError]
 	Node build();
 	[Throws=BuildError]
 	Node build_with_fs_store();
 	void restore_encoded_channel_monitors(sequence<KeyValue> monitors);
+	[Throws=BuildError]
+	Node build_with_vss_store(string vss_url, string store_id, string lnurl_auth_server_url, record<string, string> fixed_headers);
+	[Throws=BuildError]
+	Node build_with_vss_store_and_fixed_headers(string vss_url, string store_id, record<string, string> fixed_headers);
+	//[Throws=BuildError]
+	//Node build_with_vss_store_and_header_provider(string vss_url, string store_id, VssHeaderProvider header_provider);
 };
 
 interface Node {
@@ -60,20 +73,24 @@ interface Node {
 	void event_handled();
 	PublicKey node_id();
 	sequence<SocketAddress>? listening_addresses();
+	NodeAlias? node_alias();
 	Bolt11Payment bolt11_payment();
 	Bolt12Payment bolt12_payment();
 	SpontaneousPayment spontaneous_payment();
 	OnchainPayment onchain_payment();
+	UnifiedQrPayment unified_qr_payment();
 	[Throws=NodeError]
 	void connect(PublicKey node_id, SocketAddress address, boolean persist);
 	[Throws=NodeError]
 	void disconnect(PublicKey node_id);
 	[Throws=NodeError]
-	UserChannelId connect_open_channel(PublicKey node_id, SocketAddress address, u64 channel_amount_sats, u64? push_to_counterparty_msat, ChannelConfig? channel_config, boolean announce_channel);
+	UserChannelId open_channel(PublicKey node_id, SocketAddress address, u64 channel_amount_sats, u64? push_to_counterparty_msat, ChannelConfig? channel_config);
+	[Throws=NodeError]
+	UserChannelId open_announced_channel(PublicKey node_id, SocketAddress address, u64 channel_amount_sats, u64? push_to_counterparty_msat, ChannelConfig? channel_config);
 	[Throws=NodeError]
 	void close_channel([ByRef]UserChannelId user_channel_id, PublicKey counterparty_node_id);
 	[Throws=NodeError]
-	void force_close_channel([ByRef]UserChannelId user_channel_id, PublicKey counterparty_node_id);
+	void force_close_channel([ByRef]UserChannelId user_channel_id, PublicKey counterparty_node_id, string? reason);
 	[Throws=NodeError]
 	void update_channel_config([ByRef]UserChannelId user_channel_id, PublicKey counterparty_node_id, ChannelConfig channel_config);
 	[Throws=NodeError]
@@ -88,7 +105,6 @@ interface Node {
 	sequence<PeerDetails> list_peers();
 	sequence<ChannelDetails> list_channels();
 	NetworkGraph network_graph();
-	[Throws=NodeError]
 	string sign_message([ByRef]sequence<u8> msg);
 	boolean verify_signature([ByRef]sequence<u8> msg, [ByRef]string sig, [ByRef]PublicKey pkey);
 	[Throws=NodeError]
@@ -98,9 +114,9 @@ interface Node {
 
 interface Bolt11Payment {
 	[Throws=NodeError]
-	PaymentId send([ByRef]Bolt11Invoice invoice);
+	PaymentId send([ByRef]Bolt11Invoice invoice, SendingParameters? sending_parameters);
 	[Throws=NodeError]
-	PaymentId send_using_amount([ByRef]Bolt11Invoice invoice, u64 amount_msat);
+	PaymentId send_using_amount([ByRef]Bolt11Invoice invoice, u64 amount_msat, SendingParameters? sending_parameters);
 	[Throws=NodeError]
 	void send_probes([ByRef]Bolt11Invoice invoice);
 	[Throws=NodeError]
@@ -125,22 +141,22 @@ interface Bolt11Payment {
 
 interface Bolt12Payment {
 	[Throws=NodeError]
-	PaymentId send([ByRef]Offer offer, string? payer_note);
+	PaymentId send([ByRef]Offer offer, u64? quantity, string? payer_note);
 	[Throws=NodeError]
-	PaymentId send_using_amount([ByRef]Offer offer, string? payer_note, u64 amount_msat);
+	PaymentId send_using_amount([ByRef]Offer offer, u64 amount_msat, u64? quantity, string? payer_note);
 	[Throws=NodeError]
-	Offer receive(u64 amount_msat, [ByRef]string description);
+	Offer receive(u64 amount_msat, [ByRef]string description, u32? expiry_secs, u64? quantity);
 	[Throws=NodeError]
-	Offer receive_variable_amount([ByRef]string description);
+	Offer receive_variable_amount([ByRef]string description, u32? expiry_secs);
 	[Throws=NodeError]
 	Bolt12Invoice request_refund_payment([ByRef]Refund refund);
 	[Throws=NodeError]
-	Refund initiate_refund(u64 amount_msat, u32 expiry_secs);
+	Refund initiate_refund(u64 amount_msat, u32 expiry_secs, u64? quantity, string? payer_note);
 };
 
 interface SpontaneousPayment {
 	[Throws=NodeError]
-	PaymentId send(u64 amount_msat, PublicKey node_id, sequence<TlvEntry> custom_tlvs, PaymentPreimage? preimage);
+	PaymentId send(u64 amount_msat, PublicKey node_id, SendingParameters? sending_parameters, sequence<TlvEntry> custom_tlvs, PaymentPreimage? preimage);
 	[Throws=NodeError]
 	void send_probes(u64 amount_msat, PublicKey node_id);
 };
@@ -152,6 +168,13 @@ interface OnchainPayment {
 	Txid send_to_address([ByRef]Address address, u64 amount_sats);
 	[Throws=NodeError]
 	Txid send_all_to_address([ByRef]Address address);
+};
+
+interface UnifiedQrPayment {
+	[Throws=NodeError]
+	string receive(u64 amount_sats, [ByRef]string message, u32 expiry_sec);
+	[Throws=NodeError]
+	QrPaymentResult send([ByRef]string uri_str);
 };
 
 [Error]
@@ -175,12 +198,12 @@ enum NodeError {
 	"WalletOperationFailed",
 	"WalletOperationTimeout",
 	"OnchainTxSigningFailed",
-	"MessageSigningFailed",
 	"TxSyncFailed",
 	"TxSyncTimeout",
 	"GossipUpdateFailed",
 	"GossipUpdateTimeout",
 	"LiquidityRequestFailed",
+	"UriParameterParsingFailed",
 	"InvalidAddress",
 	"InvalidSocketAddress",
 	"InvalidPublicKey",
@@ -198,6 +221,9 @@ enum NodeError {
 	"InvalidChannelId",
 	"InvalidNetwork",
 	"InvalidCustomTlv",
+	"InvalidUri",
+	"InvalidQuantity",
+	"InvalidNodeAlias",
 	"DuplicatePayment",
 	"UnsupportedCurrency",
 	"InsufficientFunds",
@@ -209,11 +235,12 @@ dictionary NodeStatus {
 	boolean is_running;
 	boolean is_listening;
 	BestBlock current_best_block;
-	u64? latest_wallet_sync_timestamp;
+	u64? latest_lightning_wallet_sync_timestamp;
 	u64? latest_onchain_wallet_sync_timestamp;
 	u64? latest_fee_rate_cache_update_timestamp;
 	u64? latest_rgs_snapshot_timestamp;
 	u64? latest_node_announcement_broadcast_timestamp;
+	u32? latest_channel_monitor_archival_height;
 };
 
 dictionary BestBlock {
@@ -228,6 +255,7 @@ enum BuildError {
 	"InvalidSystemTime",
 	"InvalidChannelMonitor",
 	"InvalidListeningAddresses",
+	"InvalidNodeAlias",
 	"ReadFailed",
 	"WriteFailed",
 	"StoragePathAccessFailed",
@@ -236,10 +264,24 @@ enum BuildError {
 	"LoggerSetupFailed",
 };
 
+//[Trait]
+//interface VssHeaderProvider {
+//	[Async, Throws=VssHeaderProviderError]
+//	record<string, string> get_headers([ByRef]sequence<u8> request);
+//};
+
+[Error]
+enum VssHeaderProviderError {
+	"InvalidData",
+	"RequestError",
+	"AuthorizationError",
+	"InternalError",
+};
+
 [Enum]
 interface Event {
 	PaymentSuccessful(PaymentId? payment_id, PaymentHash payment_hash, u64? fee_paid_msat);
-	PaymentFailed(PaymentId? payment_id, PaymentHash payment_hash, PaymentFailureReason? reason);
+	PaymentFailed(PaymentId? payment_id, PaymentHash? payment_hash, PaymentFailureReason? reason);
 	PaymentReceived(PaymentId? payment_id, PaymentHash payment_hash, u64 amount_msat);
 	PaymentClaimable(PaymentId payment_id, PaymentHash payment_hash, u64 claimable_amount_msat, u32? claim_deadline);
 	ChannelPending(ChannelId channel_id, UserChannelId user_channel_id, ChannelId former_temporary_channel_id, PublicKey counterparty_node_id, OutPoint funding_txo);
@@ -254,12 +296,15 @@ enum PaymentFailureReason {
 	"PaymentExpired",
 	"RouteNotFound",
 	"UnexpectedError",
+	"UnknownRequiredFeatures",
+	"InvoiceRequestExpired",
+	"InvoiceRequestRejected",
 };
 
 [Enum]
 interface ClosureReason {
 	CounterpartyForceClosed(UntrustedString peer_msg);
-	HolderForceClosed();
+	HolderForceClosed(boolean? broadcasted_latest_txn);
 	LegacyCooperativeClosure();
 	CounterpartyInitiatedCooperativeClosure();
 	LocallyInitiatedCooperativeClosure();
@@ -271,6 +316,7 @@ interface ClosureReason {
 	CounterpartyCoopClosedUnfundedChannel();
 	FundingBatchClosure();
 	HTLCsTimedOut();
+	PeerFeerateTooLow(u32 peer_feerate_sat_per_kw, u32 required_feerate_sat_per_kw);
 };
 
 [Enum]
@@ -278,9 +324,16 @@ interface PaymentKind {
 	Onchain();
 	Bolt11(PaymentHash hash, PaymentPreimage? preimage, PaymentSecret? secret, string? bolt11_invoice);
 	Bolt11Jit(PaymentHash hash, PaymentPreimage? preimage, PaymentSecret? secret, LSPFeeLimits lsp_fee_limits);
-	Bolt12Offer(PaymentHash? hash, PaymentPreimage? preimage, PaymentSecret? secret, OfferId offer_id);
-	Bolt12Refund(PaymentHash? hash, PaymentPreimage? preimage, PaymentSecret? secret);
+	Bolt12Offer(PaymentHash? hash, PaymentPreimage? preimage, PaymentSecret? secret, OfferId offer_id, UntrustedString? payer_note, u64? quantity);
+	Bolt12Refund(PaymentHash? hash, PaymentPreimage? preimage, PaymentSecret? secret, UntrustedString? payer_note, u64? quantity);
 	Spontaneous(PaymentHash hash, PaymentPreimage? preimage, sequence<TlvEntry> custom_tlvs);
+};
+
+[Enum]
+interface QrPaymentResult {
+	Onchain(Txid txid);
+	Bolt11(PaymentId payment_id);
+	Bolt12(PaymentId payment_id);
 };
 
 enum PaymentDirection {
@@ -310,6 +363,19 @@ dictionary PaymentDetails {
 	u64? fee_msat;
 	u64 created_at;
 	u64 latest_update_timestamp;
+};
+
+dictionary SendingParameters {
+	MaxTotalRoutingFeeLimit? max_total_routing_fee_msat;
+	u32? max_total_cltv_expiry_delta;
+	u8? max_path_count;
+	u8? max_channel_saturation_power_of_half;
+};
+
+[Enum]
+interface MaxTotalRoutingFeeLimit {
+	None ();
+	Some ( u64 amount_msat );
 };
 
 // [NonExhaustive]
@@ -349,7 +415,7 @@ dictionary ChannelDetails {
 	boolean is_outbound;
 	boolean is_channel_ready;
 	boolean is_usable;
-	boolean is_public;
+	boolean is_announced;
 	u16? cltv_expiry_delta;
 	u64 counterparty_unspendable_punishment_reserve;
 	u64? counterparty_outbound_htlc_minimum_msat;
@@ -374,12 +440,58 @@ dictionary PeerDetails {
 
 [Enum]
 interface LightningBalance {
-	ClaimableOnChannelClose ( ChannelId channel_id, PublicKey counterparty_node_id, u64 amount_satoshis );
-	ClaimableAwaitingConfirmations ( ChannelId channel_id, PublicKey counterparty_node_id, u64 amount_satoshis, u32 confirmation_height );
-	ContentiousClaimable ( ChannelId channel_id, PublicKey counterparty_node_id, u64 amount_satoshis, u32 timeout_height, PaymentHash payment_hash, PaymentPreimage payment_preimage );
-	MaybeTimeoutClaimableHTLC ( ChannelId channel_id, PublicKey counterparty_node_id, u64 amount_satoshis, u32 claimable_height, PaymentHash payment_hash);
-	MaybePreimageClaimableHTLC ( ChannelId channel_id, PublicKey counterparty_node_id, u64 amount_satoshis, u32 expiry_height, PaymentHash payment_hash);
-	CounterpartyRevokedOutputClaimable ( ChannelId channel_id, PublicKey counterparty_node_id, u64 amount_satoshis );
+	ClaimableOnChannelClose (
+		ChannelId channel_id,
+		PublicKey counterparty_node_id,
+		u64 amount_satoshis,
+		u64 transaction_fee_satoshis,
+		u64 outbound_payment_htlc_rounded_msat,
+		u64 outbound_forwarded_htlc_rounded_msat,
+		u64 inbound_claiming_htlc_rounded_msat,
+		u64 inbound_htlc_rounded_msat
+	);
+	ClaimableAwaitingConfirmations (
+		ChannelId channel_id,
+		PublicKey counterparty_node_id,
+		u64 amount_satoshis,
+		u32 confirmation_height,
+		BalanceSource source
+	);
+	ContentiousClaimable (
+		ChannelId channel_id,
+		PublicKey counterparty_node_id,
+		u64 amount_satoshis,
+		u32 timeout_height,
+		PaymentHash payment_hash,
+		PaymentPreimage payment_preimage
+	);
+	MaybeTimeoutClaimableHTLC (
+		ChannelId channel_id,
+		PublicKey counterparty_node_id,
+		u64 amount_satoshis,
+		u32 claimable_height,
+		PaymentHash payment_hash,
+		boolean outbound_payment
+	);
+	MaybePreimageClaimableHTLC (
+		ChannelId channel_id,
+		PublicKey counterparty_node_id,
+		u64 amount_satoshis,
+		u32 expiry_height,
+		PaymentHash payment_hash
+	);
+	CounterpartyRevokedOutputClaimable (
+		ChannelId channel_id,
+		PublicKey counterparty_node_id,
+		u64 amount_satoshis
+	);
+};
+
+enum BalanceSource {
+	"HolderForceClosed",
+	"CounterpartyForceClosed",
+	"CoopClose",
+	"Htlc",
 };
 
 [Enum]
@@ -398,20 +510,19 @@ dictionary BalanceDetails {
 	sequence<PendingSweepBalance> pending_balances_from_channel_closures;
 };
 
-interface ChannelConfig {
-	constructor();
-	u32 forwarding_fee_proportional_millionths();
-	void set_forwarding_fee_proportional_millionths(u32 value);
-	u32 forwarding_fee_base_msat();
-	void set_forwarding_fee_base_msat(u32 fee_msat);
-	u16 cltv_expiry_delta();
-	void set_cltv_expiry_delta(u16 value);
-	u64 force_close_avoidance_max_fee_satoshis();
-	void set_force_close_avoidance_max_fee_satoshis(u64 value_sat);
-	boolean accept_underpaying_htlcs();
-	void set_accept_underpaying_htlcs(boolean value);
-	void set_max_dust_htlc_exposure_from_fixed_limit(u64 limit_msat);
-	void set_max_dust_htlc_exposure_from_fee_rate_multiplier(u64 multiplier);
+dictionary ChannelConfig {
+	u32 forwarding_fee_proportional_millionths;
+	u32 forwarding_fee_base_msat;
+	u16 cltv_expiry_delta;
+	MaxDustHTLCExposure max_dust_htlc_exposure;
+	u64 force_close_avoidance_max_fee_satoshis;
+	boolean accept_underpaying_htlcs;
+};
+
+[Enum]
+interface MaxDustHTLCExposure {
+	FixedLimit ( u64 limit_msat );
+	FeeRateMultiplier ( u64 multiplier );
 };
 
 enum LogLevel {
@@ -529,3 +640,6 @@ typedef string Mnemonic;
 
 [Custom]
 typedef string UntrustedString;
+
+[Custom]
+typedef string NodeAlias;
