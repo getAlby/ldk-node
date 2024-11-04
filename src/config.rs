@@ -36,9 +36,8 @@ pub(crate) const ENABLE_BACKGROUND_SYNC: bool = false;
 
 // The 'stop gap' parameter used by BDK's wallet sync. This seems to configure the threshold
 // number of derivation indexes after which BDK stops looking for new scripts belonging to the wallet.
-// Alby: decreased to do less unnecessary requests. The actual amount is twice this (for internal + external addresses)
-// but also is based on the BDK_CLIENT_CONCURRENCY below (using less than 4 has no effect).
-pub(crate) const BDK_CLIENT_STOP_GAP: usize = 1; // 20
+// Alby: this is only used in the first ever sync. Afterward, it only checks ~4 external and interal addresses (until more addresses are generated)
+pub(crate) const BDK_CLIENT_STOP_GAP: usize = 20;
 
 // The number of concurrent requests made against the API provider.
 pub(crate) const BDK_CLIENT_CONCURRENCY: usize = 4;
