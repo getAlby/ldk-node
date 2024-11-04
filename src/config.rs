@@ -36,12 +36,15 @@ pub(crate) const ENABLE_BACKGROUND_SYNC: bool = false;
 
 // The 'stop gap' parameter used by BDK's wallet sync. This seems to configure the threshold
 // number of derivation indexes after which BDK stops looking for new scripts belonging to the wallet.
-pub(crate) const BDK_CLIENT_STOP_GAP: usize = 20;
+// Alby: decreased to do less unnecessary requests. The actual amount is twice this (for internal + external addresses)
+// but also is based on the BDK_CLIENT_CONCURRENCY below (using less than 4 has no effect).
+pub(crate) const BDK_CLIENT_STOP_GAP: usize = 1; // 20
 
 // The number of concurrent requests made against the API provider.
 pub(crate) const BDK_CLIENT_CONCURRENCY: usize = 4;
 
 // The timeout after which we abandon retrying failed payments.
+// Alby: increase this for extra retries
 pub(crate) const LDK_PAYMENT_RETRY_TIMEOUT: Duration = Duration::from_secs(50); // (10);
 
 // The interval (in block height) after which we retry archiving fully resolved channel monitors.
