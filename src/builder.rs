@@ -480,8 +480,20 @@ impl NodeBuilder {
 
 		let vss_seed_bytes: [u8; 32] = vss_xprv.private_key.secret_bytes();
 
+		// Alby: use a secondary KV store for non-essential data (not needed by VSS)
+		let storage_dir_path = config.storage_dir_path.clone();
+		let secondary_kv_store = Arc::new(
+			SqliteStore::new(
+				storage_dir_path.into(),
+				Some(io::sqlite_store::SQLITE_DB_FILE_NAME.to_string()),
+				Some(io::sqlite_store::KV_TABLE_NAME.to_string()),
+			)
+			.map_err(|_| BuildError::KVStoreSetupFailed)?,
+		) as Arc<DynStore>;
+
 		let vss_store =
-			VssStore::new(vss_url, store_id, vss_seed_bytes, header_provider).map_err(|e| {
+			VssStore::new(vss_url, store_id, vss_seed_bytes, header_provider, secondary_kv_store)
+				.map_err(|e| {
 				log_error!(logger, "Failed to setup VssStore: {}", e);
 				BuildError::KVStoreSetupFailed
 			})?;

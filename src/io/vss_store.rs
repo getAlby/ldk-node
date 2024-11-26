@@ -8,7 +8,10 @@
 use crate::io::utils::check_namespace_key_validity;
 use bitcoin::hashes::{sha256, Hash, HashEngine, Hmac, HmacEngine};
 use lightning::io::{self, Error, ErrorKind};
-use lightning::util::persist::KVStore;
+use lightning::util::persist::{
+	KVStore, NETWORK_GRAPH_PERSISTENCE_KEY, NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
+	NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
+};
 use prost::Message;
 use rand::RngCore;
 #[cfg(test)]
@@ -44,12 +47,14 @@ pub struct VssStore {
 	runtime: Runtime,
 	storable_builder: StorableBuilder<RandEntropySource>,
 	key_obfuscator: KeyObfuscator,
+	secondary_kv_store: Arc<dyn KVStore + Send + Sync>,
 }
 
 impl VssStore {
 	pub(crate) fn new(
 		base_url: String, store_id: String, vss_seed: [u8; 32],
 		header_provider: Arc<dyn VssHeaderProvider>,
+		secondary_kv_store: Arc<dyn KVStore + Send + Sync>,
 	) -> io::Result<Self> {
 		let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
 		let (data_encryption_key, obfuscation_master_key) =
@@ -70,7 +75,7 @@ impl VssStore {
 			}) as _);
 
 		let client = VssClient::new_with_headers(base_url, retry_policy, header_provider);
-		Ok(Self { client, store_id, runtime, storable_builder, key_obfuscator })
+		Ok(Self { client, store_id, runtime, storable_builder, key_obfuscator, secondary_kv_store })
 	}
 
 	fn build_key(
@@ -131,6 +136,14 @@ impl KVStore for VssStore {
 	fn read(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
 	) -> io::Result<Vec<u8>> {
+		// Alby: write network graph to secondary storage
+		if primary_namespace == NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE
+			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
+			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
+		{
+			return self.secondary_kv_store.read(primary_namespace, secondary_namespace, key);
+		}
+
 		check_namespace_key_validity(primary_namespace, secondary_namespace, Some(key), "read")?;
 		let request = GetObjectRequest {
 			store_id: self.store_id.clone(),
@@ -165,6 +178,14 @@ impl KVStore for VssStore {
 	fn write(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: &[u8],
 	) -> io::Result<()> {
+		// Alby: write network graph to secondary storage
+		if primary_namespace == NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE
+			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
+			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
+		{
+			return self.secondary_kv_store.write(primary_namespace, secondary_namespace, key, buf);
+		}
+
 		check_namespace_key_validity(primary_namespace, secondary_namespace, Some(key), "write")?;
 		let version = -1;
 		let storable = self.storable_builder.build(buf.to_vec(), version);
@@ -194,6 +215,18 @@ impl KVStore for VssStore {
 	fn remove(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, _lazy: bool,
 	) -> io::Result<()> {
+		// Alby: write network graph to secondary storage
+		if primary_namespace == NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE
+			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
+			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
+		{
+			return self.secondary_kv_store.remove(
+				primary_namespace,
+				secondary_namespace,
+				key,
+				_lazy,
+			);
+		}
 		check_namespace_key_validity(primary_namespace, secondary_namespace, Some(key), "remove")?;
 		let request = DeleteObjectRequest {
 			store_id: self.store_id.clone(),
@@ -229,7 +262,13 @@ impl KVStore for VssStore {
 			Error::new(ErrorKind::Other, msg)
 		})?;
 
-		Ok(keys)
+		// Alby: also list keys from secondary storage
+		let secondary_keys =
+			self.secondary_kv_store.list(primary_namespace, secondary_namespace)?;
+
+		let all_keys: Vec<String> =
+			keys.iter().cloned().chain(secondary_keys.iter().cloned()).collect();
+		Ok(all_keys)
 	}
 }
 
