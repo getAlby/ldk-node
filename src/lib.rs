@@ -136,9 +136,11 @@ use payment::{
 	UnifiedQrPayment,
 };
 use peer_store::{PeerInfo, PeerStore};
+#[cfg(feature = "uniffi")]
+use types::ResetState;
 use types::{
 	Broadcaster, BumpTransactionEventHandler, ChainMonitor, ChannelManager, DynStore, Graph,
-	KeysManager, OnionMessenger, PeerManager, ResetState, Router, Scorer, Sweeper, Wallet,
+	KeysManager, OnionMessenger, PeerManager, Router, Scorer, Sweeper, Wallet,
 };
 pub use types::{ChannelDetails, ChannelType, KeyValue, PeerDetails, TlvEntry, UserChannelId};
 
