@@ -15,6 +15,9 @@ use crate::gossip::GossipSource;
 use crate::io::sqlite_store::SqliteStore;
 use crate::io::utils::{read_node_metrics, write_node_metrics};
 use crate::io::vss_store::VssStore;
+use crate::io::{
+	NODE_METRICS_KEY, NODE_METRICS_PRIMARY_NAMESPACE, NODE_METRICS_SECONDARY_NAMESPACE,
+};
 use crate::liquidity::LiquiditySource;
 use crate::logger::{log_error, log_info, FilesystemLogger, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
@@ -23,7 +26,7 @@ use crate::peer_store::PeerStore;
 use crate::tx_broadcaster::TransactionBroadcaster;
 use crate::types::{
 	ChainMonitor, ChannelManager, DynStore, GossipSync, Graph, KeyValue, KeysManager,
-	MessageRouter, OnionMessenger, PeerManager,
+	MessageRouter, OnionMessenger, PeerManager, ResetState,
 };
 use crate::wallet::persist::KVStoreWalletPersister;
 use crate::wallet::Wallet;
@@ -45,6 +48,9 @@ use lightning::sign::EntropySource;
 use lightning::util::persist::{
 	read_channel_monitors, CHANNEL_MANAGER_PERSISTENCE_KEY,
 	CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE, CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+	NETWORK_GRAPH_PERSISTENCE_KEY, NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
+	NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE, SCORER_PERSISTENCE_KEY,
+	SCORER_PERSISTENCE_PRIMARY_NAMESPACE, SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use lightning::util::ser::ReadableArgs;
 use lightning::util::sweep::OutputSweeper;
@@ -183,6 +189,7 @@ pub struct NodeBuilder {
 	gossip_source_config: Option<GossipSourceConfig>,
 	liquidity_source_config: Option<LiquiditySourceConfig>,
 	monitors_to_restore: Option<Vec<KeyValue>>,
+	reset_state: Option<ResetState>,
 }
 
 impl NodeBuilder {
@@ -199,6 +206,7 @@ impl NodeBuilder {
 		let gossip_source_config = None;
 		let liquidity_source_config = None;
 		let monitors_to_restore = None;
+		let reset_state = None;
 		Self {
 			config,
 			entropy_source_config,
@@ -206,12 +214,19 @@ impl NodeBuilder {
 			gossip_source_config,
 			liquidity_source_config,
 			monitors_to_restore,
+			reset_state,
 		}
 	}
 
 	/// Alby: set monitors to restore when restoring SCB
 	pub fn restore_encoded_channel_monitors(&mut self, monitors: Vec<KeyValue>) -> &mut Self {
 		self.monitors_to_restore = Some(monitors);
+		self
+	}
+
+	/// Alby: persistent state components to reset on startup.
+	pub fn reset_state(&mut self, what: ResetState) -> &mut Self {
+		self.reset_state = Some(what);
 		self
 	}
 
@@ -505,6 +520,7 @@ impl NodeBuilder {
 			seed_bytes,
 			logger,
 			Arc::new(vss_store),
+			self.reset_state,
 		)
 	}
 
@@ -537,6 +553,7 @@ impl NodeBuilder {
 			seed_bytes,
 			logger,
 			kv_store,
+			self.reset_state,
 		)
 	}
 }
@@ -571,6 +588,11 @@ impl ArcedNodeBuilder {
 	/// Alby: set monitors to restore when restoring SCB
 	pub fn restore_encoded_channel_monitors(&self, monitors: Vec<KeyValue>) {
 		self.inner.write().unwrap().restore_encoded_channel_monitors(monitors);
+	}
+
+	/// Alby: persistent state components to reset on startup.
+	pub fn reset_state(&self, what: ResetState) {
+		self.inner.write().unwrap().reset_state(what);
 	}
 
 	/// Configures the [`Node`] instance to source its wallet entropy from a seed file on disk.
@@ -772,8 +794,13 @@ fn build_with_store_internal(
 	config: Arc<Config>, chain_data_source_config: Option<&ChainDataSourceConfig>,
 	gossip_source_config: Option<&GossipSourceConfig>,
 	liquidity_source_config: Option<&LiquiditySourceConfig>, seed_bytes: [u8; 64],
-	logger: Arc<FilesystemLogger>, kv_store: Arc<DynStore>,
+	logger: Arc<FilesystemLogger>, kv_store: Arc<DynStore>, reset_state: Option<ResetState>,
 ) -> Result<Node, BuildError> {
+	// Alby: reset persistent state if requested.
+	if let Some(what) = reset_state {
+		reset_persistent_state(logger.clone(), kv_store.clone(), what);
+	}
+
 	// Initialize the status fields.
 	let is_listening = Arc::new(AtomicBool::new(false));
 	let node_metrics = match read_node_metrics(Arc::clone(&kv_store), Arc::clone(&logger)) {
@@ -1328,6 +1355,53 @@ fn derive_vss_xprv(
 		log_error!(logger, "Failed to derive VSS secret: {}", e);
 		BuildError::KVStoreSetupFailed
 	})
+}
+
+fn reset_persistent_state(
+	logger: Arc<FilesystemLogger>, kv_store: Arc<DynStore>, what: ResetState,
+) {
+	let (node_metrics, scorer, network_graph) = match what {
+		ResetState::NodeMetrics => (true, false, false),
+		ResetState::Scorer => (false, true, false),
+		ResetState::NetworkGraph => (false, false, true),
+		ResetState::All => (true, true, true),
+	};
+
+	if node_metrics {
+		let result = kv_store.remove(
+			NODE_METRICS_PRIMARY_NAMESPACE,
+			NODE_METRICS_SECONDARY_NAMESPACE,
+			NODE_METRICS_KEY,
+			false,
+		);
+		if result.is_err() {
+			log_error!(logger, "Failed to reset node metrics: {}", result.unwrap_err());
+		}
+	}
+
+	if scorer {
+		let result = kv_store.remove(
+			SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
+			SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
+			SCORER_PERSISTENCE_KEY,
+			false,
+		);
+		if result.is_err() {
+			log_error!(logger, "Failed to reset scorer: {}", result.unwrap_err());
+		}
+	}
+
+	if network_graph {
+		let result = kv_store.remove(
+			NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
+			NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
+			NETWORK_GRAPH_PERSISTENCE_KEY,
+			false,
+		);
+		if result.is_err() {
+			log_error!(logger, "Failed to reset network graph: {}", result.unwrap_err());
+		}
+	}
 }
 
 /// Sanitize the user-provided node alias to ensure that it is a valid protocol-specified UTF-8 string.

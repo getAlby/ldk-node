@@ -138,7 +138,7 @@ use payment::{
 use peer_store::{PeerInfo, PeerStore};
 use types::{
 	Broadcaster, BumpTransactionEventHandler, ChainMonitor, ChannelManager, DynStore, Graph,
-	KeysManager, OnionMessenger, PeerManager, Router, Scorer, Sweeper, Wallet,
+	KeysManager, OnionMessenger, PeerManager, ResetState, Router, Scorer, Sweeper, Wallet,
 };
 pub use types::{ChannelDetails, ChannelType, KeyValue, PeerDetails, TlvEntry, UserChannelId};
 
