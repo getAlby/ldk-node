@@ -399,3 +399,19 @@ pub struct KeyValue {
 	/// Serialized value.
 	pub value: Vec<u8>,
 }
+
+/// State components to reset.
+#[derive(Debug, Copy, Clone)]
+pub enum ResetState {
+	/// Node metrics data (NODE_METRICS_KEY).
+	NodeMetrics,
+
+	/// Scorer data (SCORER_PERSISTENCE_KEY).
+	Scorer,
+
+	/// Network graph data (NETWORK_GRAPH_PERSISTENCE_KEY).
+	NetworkGraph,
+
+	/// All of the above.
+	All,
+}
