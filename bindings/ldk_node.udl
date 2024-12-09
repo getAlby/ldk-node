@@ -52,6 +52,7 @@ interface Builder {
 	Node build_with_fs_store();
 	void restore_encoded_channel_monitors(sequence<KeyValue> monitors);
 	void reset_state(ResetState what);
+	void migrate_storage(MigrateStorage what);
 	[Throws=BuildError]
 	Node build_with_vss_store(string vss_url, string store_id, string lnurl_auth_server_url, record<string, string> fixed_headers);
 	[Throws=BuildError]
@@ -650,4 +651,9 @@ enum ResetState {
  	"Scorer",
  	"NetworkGraph",
  	"All",
+ };
+
+enum MigrateStorage {
+ 	"VSS",
+ 	// "Sqlite",
  };

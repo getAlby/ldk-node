@@ -26,13 +26,15 @@ use crate::peer_store::PeerStore;
 use crate::tx_broadcaster::TransactionBroadcaster;
 use crate::types::{
 	ChainMonitor, ChannelManager, DynStore, GossipSync, Graph, KeyValue, KeysManager,
-	MessageRouter, OnionMessenger, PeerManager, ResetState,
+	MessageRouter, MigrateStorage, OnionMessenger, PeerManager, ResetState,
 };
 use crate::wallet::persist::KVStoreWalletPersister;
 use crate::wallet::Wallet;
 use crate::{io, NodeMetrics};
 use crate::{LogLevel, Node};
+use lightning::util::persist::KVStore;
 
+use chrono::Local;
 use lightning::chain::{chainmonitor, BestBlock, Watch};
 use lightning::io::Cursor;
 use lightning::ln::channelmanager::{self, ChainParameters, ChannelManagerReadArgs};
@@ -48,6 +50,7 @@ use lightning::sign::EntropySource;
 use lightning::util::persist::{
 	read_channel_monitors, CHANNEL_MANAGER_PERSISTENCE_KEY,
 	CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE, CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+	CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE, CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
 	NETWORK_GRAPH_PERSISTENCE_KEY, NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
 	NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE, SCORER_PERSISTENCE_KEY,
 	SCORER_PERSISTENCE_PRIMARY_NAMESPACE, SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
@@ -75,7 +78,7 @@ use std::convert::TryInto;
 use std::default::Default;
 use std::fmt;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
@@ -190,6 +193,7 @@ pub struct NodeBuilder {
 	liquidity_source_config: Option<LiquiditySourceConfig>,
 	monitors_to_restore: Option<Vec<KeyValue>>,
 	reset_state: Option<ResetState>,
+	migrate_storage: Option<MigrateStorage>,
 }
 
 impl NodeBuilder {
@@ -207,6 +211,7 @@ impl NodeBuilder {
 		let liquidity_source_config = None;
 		let monitors_to_restore = None;
 		let reset_state = None;
+		let migrate_storage = None;
 		Self {
 			config,
 			entropy_source_config,
@@ -215,6 +220,7 @@ impl NodeBuilder {
 			liquidity_source_config,
 			monitors_to_restore,
 			reset_state,
+			migrate_storage,
 		}
 	}
 
@@ -227,6 +233,12 @@ impl NodeBuilder {
 	/// Alby: persistent state components to reset on startup.
 	pub fn reset_state(&mut self, what: ResetState) -> &mut Self {
 		self.reset_state = Some(what);
+		self
+	}
+
+	/// Alby: migrate storage on startup.
+	pub fn migrate_storage(&mut self, what: MigrateStorage) -> &mut Self {
+		self.migrate_storage = Some(what);
 		self
 	}
 
@@ -495,6 +507,40 @@ impl NodeBuilder {
 
 		let vss_seed_bytes: [u8; 32] = vss_xprv.private_key.secret_bytes();
 
+		// Alby: migrate from sqlite to VSS
+		let mut migrate_from_store = None;
+		let migrate_to_vss = match self.migrate_storage {
+			Some(MigrateStorage::VSS) => true,
+			_ => false,
+		};
+		if migrate_to_vss {
+			// rename and read existing file
+			let storage_dir_path = config.storage_dir_path.clone();
+
+			// Get the current date and time
+			let now = Local::now();
+			let timestamp = now.format("%Y%m%d_%H%M%S").to_string();
+
+			// Create a backup filename based on the current date and time
+			let backup_filename = format!("ldk_node_data_{}.sqlite", timestamp);
+			let old_file_path =
+				Path::new(storage_dir_path.as_str()).join(io::sqlite_store::SQLITE_DB_FILE_NAME);
+			let new_file_path = Path::new(storage_dir_path.as_str()).join(backup_filename.clone());
+
+			// Rename the file, so that we start fresh
+			fs::rename(&old_file_path, &new_file_path).unwrap();
+
+			// Read from the old file
+			migrate_from_store = Some(Arc::new(
+				SqliteStore::new(
+					storage_dir_path.into(),
+					Some(backup_filename),
+					Some(io::sqlite_store::KV_TABLE_NAME.to_string()),
+				)
+				.map_err(|_| BuildError::KVStoreSetupFailed)?,
+			) as Arc<DynStore>);
+		}
+
 		// Alby: use a secondary KV store for non-essential data (not needed by VSS)
 		let storage_dir_path = config.storage_dir_path.clone();
 		let secondary_kv_store = Arc::new(
@@ -512,6 +558,62 @@ impl NodeBuilder {
 				log_error!(logger, "Failed to setup VssStore: {}", e);
 				BuildError::KVStoreSetupFailed
 			})?;
+
+		if migrate_from_store.is_some() {
+			// write essential data from old store to new store
+			let from_store = migrate_from_store.unwrap();
+
+			// TODO: migrate peers (IMPORTANT otherwise channel is offline!)
+			// TODO: error handling
+			// TODO: add logging (log all keys that were migrated)
+			// TODO: cleanup the code
+			// TODO: close the DB connection
+
+			let channel_monitor_keys = from_store
+				.list(
+					CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+					CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+				)
+				.unwrap();
+
+			for key in channel_monitor_keys {
+				let channel_monitor_value = from_store
+					.read(
+						CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+						CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+						key.as_str(),
+					)
+					.unwrap();
+				// write value to new store
+				vss_store
+					.write(
+						CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+						CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+						key.as_str(),
+						&channel_monitor_value,
+					)
+					.unwrap();
+			}
+
+			// migrate channel manager
+			let channel_manager_value = from_store
+				.read(
+					CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+					CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+					CHANNEL_MANAGER_PERSISTENCE_KEY,
+				)
+				.unwrap();
+			// write value to new store
+			vss_store
+				.write(
+					CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+					CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+					CHANNEL_MANAGER_PERSISTENCE_KEY,
+					&channel_manager_value,
+				)
+				.unwrap();
+		}
+
 		build_with_store_internal(
 			config,
 			self.chain_data_source_config.as_ref(),
@@ -593,6 +695,11 @@ impl ArcedNodeBuilder {
 	/// Alby: persistent state components to reset on startup.
 	pub fn reset_state(&self, what: ResetState) {
 		self.inner.write().unwrap().reset_state(what);
+	}
+
+	/// Alby: migrate storage on startup.
+	pub fn migrate_storage(&self, what: MigrateStorage) {
+		self.inner.write().unwrap().migrate_storage(what);
 	}
 
 	/// Configures the [`Node`] instance to source its wallet entropy from a seed file on disk.

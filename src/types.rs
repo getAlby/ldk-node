@@ -415,3 +415,12 @@ pub enum ResetState {
 	/// All of the above.
 	All,
 }
+
+/// Options to migrate from one storage type to another.
+#[derive(Debug, Copy, Clone)]
+pub enum MigrateStorage {
+	/// SQLite to VSS
+	VSS,
+	// VSS to SQLite - currently unsupported
+	// Sqlite,
+}
