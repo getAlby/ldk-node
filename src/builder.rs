@@ -17,6 +17,8 @@ use crate::io::utils::{read_node_metrics, write_node_metrics};
 use crate::io::vss_store::VssStore;
 use crate::io::{
 	NODE_METRICS_KEY, NODE_METRICS_PRIMARY_NAMESPACE, NODE_METRICS_SECONDARY_NAMESPACE,
+	PEER_INFO_PERSISTENCE_KEY, PEER_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+	PEER_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use crate::liquidity::LiquiditySource;
 use crate::logger::{log_error, log_info, FilesystemLogger, Logger};
@@ -507,7 +509,7 @@ impl NodeBuilder {
 
 		let vss_seed_bytes: [u8; 32] = vss_xprv.private_key.secret_bytes();
 
-		// Alby: migrate from sqlite to VSS
+		// Alby: move sqlite store for migration from sqlite to VSS
 		let mut migrate_from_store = None;
 		let migrate_to_vss = match self.migrate_storage {
 			Some(MigrateStorage::VSS) => true,
@@ -523,12 +525,21 @@ impl NodeBuilder {
 
 			// Create a backup filename based on the current date and time
 			let backup_filename = format!("ldk_node_data_{}.sqlite", timestamp);
-			let old_file_path =
+			let current_file_path =
 				Path::new(storage_dir_path.as_str()).join(io::sqlite_store::SQLITE_DB_FILE_NAME);
-			let new_file_path = Path::new(storage_dir_path.as_str()).join(backup_filename.clone());
+			let backup_file_path =
+				Path::new(storage_dir_path.as_str()).join(backup_filename.clone());
 
 			// Rename the file, so that we start fresh
-			fs::rename(&old_file_path, &new_file_path).unwrap();
+			log_info!(
+				logger,
+				"Migrating to VSS - Moving sqlite db to backup file: {}",
+				backup_file_path.to_str().expect("Invalid backup file path")
+			);
+			fs::rename(&current_file_path, &backup_file_path).map_err(|e| {
+				log_error!(logger, "Failed to rename existing sqlite file: {}", e);
+				BuildError::KVStoreSetupFailed
+			})?;
 
 			// Read from the old file
 			migrate_from_store = Some(Arc::new(
@@ -559,31 +570,34 @@ impl NodeBuilder {
 				BuildError::KVStoreSetupFailed
 			})?;
 
+		// Alby: migrate from backed up sqlite store to VSS
 		if migrate_from_store.is_some() {
+			log_info!(logger, "Migrating to VSS - migrating store data");
 			// write essential data from old store to new store
-			let from_store = migrate_from_store.unwrap();
-
-			// TODO: migrate peers (IMPORTANT otherwise channel is offline!)
-			// TODO: error handling
-			// TODO: add logging (log all keys that were migrated)
-			// TODO: cleanup the code
-			// TODO: close the DB connection
+			let from_store = migrate_from_store.expect("Invalid migrate_from_store");
 
 			let channel_monitor_keys = from_store
 				.list(
 					CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
 					CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
 				)
-				.unwrap();
+				.map_err(|e| {
+					log_error!(logger, "Failed to fetch channel_monitor_keys: {}", e);
+					BuildError::KVStoreSetupFailed
+				})?;
 
 			for key in channel_monitor_keys {
+				log_info!(logger, "Migrating channel monitor key {}", key);
 				let channel_monitor_value = from_store
 					.read(
 						CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
 						CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
 						key.as_str(),
 					)
-					.unwrap();
+					.map_err(|e| {
+						log_error!(logger, "Failed to fetch channel monitor value: {}", e);
+						BuildError::KVStoreSetupFailed
+					})?;
 				// write value to new store
 				vss_store
 					.write(
@@ -592,17 +606,24 @@ impl NodeBuilder {
 						key.as_str(),
 						&channel_monitor_value,
 					)
-					.unwrap();
+					.map_err(|e| {
+						log_error!(logger, "Failed to migrate channel monitor value: {}", e);
+						BuildError::KVStoreSetupFailed
+					})?;
 			}
 
 			// migrate channel manager
+			log_info!(logger, "Migrating channel manager key {}", CHANNEL_MANAGER_PERSISTENCE_KEY);
 			let channel_manager_value = from_store
 				.read(
 					CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
 					CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
 					CHANNEL_MANAGER_PERSISTENCE_KEY,
 				)
-				.unwrap();
+				.map_err(|e| {
+					log_error!(logger, "Failed to fetch channel manager value: {}", e);
+					BuildError::KVStoreSetupFailed
+				})?;
 			// write value to new store
 			vss_store
 				.write(
@@ -611,7 +632,37 @@ impl NodeBuilder {
 					CHANNEL_MANAGER_PERSISTENCE_KEY,
 					&channel_manager_value,
 				)
-				.unwrap();
+				.map_err(|e| {
+					log_error!(logger, "Failed to migrate channel manager value: {}", e);
+					BuildError::KVStoreSetupFailed
+				})?;
+
+			// migrate peers
+			log_info!(logger, "Migrating peers key {}", PEER_INFO_PERSISTENCE_KEY);
+			let channel_manager_value = from_store
+				.read(
+					PEER_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+					PEER_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+					PEER_INFO_PERSISTENCE_KEY,
+				)
+				.map_err(|e| {
+					log_error!(logger, "Failed to fetch peers value: {}", e);
+					BuildError::KVStoreSetupFailed
+				})?;
+			// write value to new store
+			vss_store
+				.write(
+					PEER_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+					PEER_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+					PEER_INFO_PERSISTENCE_KEY,
+					&channel_manager_value,
+				)
+				.map_err(|e| {
+					log_error!(logger, "Failed to migrate peers value: {}", e);
+					BuildError::KVStoreSetupFailed
+				})?;
+
+			log_info!(logger, "Migration to VSS completed successfully");
 		}
 
 		build_with_store_internal(
