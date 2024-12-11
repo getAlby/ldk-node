@@ -586,18 +586,18 @@ impl NodeBuilder {
 					secondary_namespace,
 					key
 				);
-				let channel_monitor_value =
+				let value =
 					from_store.read(primary_namespace, secondary_namespace, key).map_err(|e| {
 						log_error!(logger, "Failed to fetch value: {}", e);
 						BuildError::KVStoreSetupFailed
 					})?;
 				// write value to new store
-				vss_store
-					.write(primary_namespace, secondary_namespace, key, &channel_monitor_value)
-					.map_err(|e| {
+				vss_store.write(primary_namespace, secondary_namespace, key, &value).map_err(
+					|e| {
 						log_error!(logger, "Failed to migrate value: {}", e);
 						BuildError::KVStoreSetupFailed
-					})?;
+					},
+				)?;
 				Ok(())
 			};
 
