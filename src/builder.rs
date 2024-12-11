@@ -571,10 +571,35 @@ impl NodeBuilder {
 			})?;
 
 		// Alby: migrate from backed up sqlite store to VSS
-		if migrate_from_store.is_some() {
+		if let Some(from_store) = migrate_from_store {
 			log_info!(logger, "Migrating to VSS - migrating store data");
 			// write essential data from old store to new store
-			let from_store = migrate_from_store.expect("Invalid migrate_from_store");
+
+			let migrate_kv = |primary_namespace: &str,
+			                  secondary_namespace: &str,
+			                  key: &str|
+			 -> Result<(), BuildError> {
+				log_info!(
+					logger,
+					"Migrating key {} {} {}",
+					primary_namespace,
+					secondary_namespace,
+					key
+				);
+				let channel_monitor_value =
+					from_store.read(primary_namespace, secondary_namespace, key).map_err(|e| {
+						log_error!(logger, "Failed to fetch value: {}", e);
+						BuildError::KVStoreSetupFailed
+					})?;
+				// write value to new store
+				vss_store
+					.write(primary_namespace, secondary_namespace, key, &channel_monitor_value)
+					.map_err(|e| {
+						log_error!(logger, "Failed to migrate value: {}", e);
+						BuildError::KVStoreSetupFailed
+					})?;
+				Ok(())
+			};
 
 			let channel_monitor_keys = from_store
 				.list(
@@ -587,80 +612,26 @@ impl NodeBuilder {
 				})?;
 
 			for key in channel_monitor_keys {
-				log_info!(logger, "Migrating channel monitor key {}", key);
-				let channel_monitor_value = from_store
-					.read(
-						CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
-						CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
-						key.as_str(),
-					)
-					.map_err(|e| {
-						log_error!(logger, "Failed to fetch channel monitor value: {}", e);
-						BuildError::KVStoreSetupFailed
-					})?;
-				// write value to new store
-				vss_store
-					.write(
-						CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
-						CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
-						key.as_str(),
-						&channel_monitor_value,
-					)
-					.map_err(|e| {
-						log_error!(logger, "Failed to migrate channel monitor value: {}", e);
-						BuildError::KVStoreSetupFailed
-					})?;
+				migrate_kv(
+					CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+					CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+					key.as_str(),
+				)?;
 			}
 
 			// migrate channel manager
-			log_info!(logger, "Migrating channel manager key {}", CHANNEL_MANAGER_PERSISTENCE_KEY);
-			let channel_manager_value = from_store
-				.read(
-					CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
-					CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
-					CHANNEL_MANAGER_PERSISTENCE_KEY,
-				)
-				.map_err(|e| {
-					log_error!(logger, "Failed to fetch channel manager value: {}", e);
-					BuildError::KVStoreSetupFailed
-				})?;
-			// write value to new store
-			vss_store
-				.write(
-					CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
-					CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
-					CHANNEL_MANAGER_PERSISTENCE_KEY,
-					&channel_manager_value,
-				)
-				.map_err(|e| {
-					log_error!(logger, "Failed to migrate channel manager value: {}", e);
-					BuildError::KVStoreSetupFailed
-				})?;
+			migrate_kv(
+				CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+				CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+				CHANNEL_MANAGER_PERSISTENCE_KEY,
+			)?;
 
 			// migrate peers
-			log_info!(logger, "Migrating peers key {}", PEER_INFO_PERSISTENCE_KEY);
-			let channel_manager_value = from_store
-				.read(
-					PEER_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
-					PEER_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
-					PEER_INFO_PERSISTENCE_KEY,
-				)
-				.map_err(|e| {
-					log_error!(logger, "Failed to fetch peers value: {}", e);
-					BuildError::KVStoreSetupFailed
-				})?;
-			// write value to new store
-			vss_store
-				.write(
-					PEER_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
-					PEER_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
-					PEER_INFO_PERSISTENCE_KEY,
-					&channel_manager_value,
-				)
-				.map_err(|e| {
-					log_error!(logger, "Failed to migrate peers value: {}", e);
-					BuildError::KVStoreSetupFailed
-				})?;
+			migrate_kv(
+				PEER_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+				PEER_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+				PEER_INFO_PERSISTENCE_KEY,
+			)?;
 
 			log_info!(logger, "Migration to VSS completed successfully");
 		}
