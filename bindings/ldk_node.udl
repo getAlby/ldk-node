@@ -14,6 +14,7 @@ dictionary Config {
 	LogLevel log_level;
 	AnchorChannelsConfig? anchor_channels_config;
 	SendingParameters? sending_parameters;
+	boolean transient_network_graph;
 };
 
 dictionary AnchorChannelsConfig {
