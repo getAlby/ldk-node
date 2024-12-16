@@ -12,7 +12,7 @@ use crate::connection::ConnectionManager;
 use crate::event::EventQueue;
 use crate::fee_estimator::OnchainFeeEstimator;
 use crate::gossip::GossipSource;
-use crate::io::sqlite_store::SqliteStore;
+use crate::io::sqlite_store::{SqliteStore, SqliteStoreConfig};
 use crate::io::utils::{read_node_metrics, write_node_metrics};
 use crate::io::vss_store::VssStore;
 use crate::io::{
@@ -383,11 +383,14 @@ impl NodeBuilder {
 		let storage_dir_path = self.config.storage_dir_path.clone();
 		fs::create_dir_all(storage_dir_path.clone())
 			.map_err(|_| BuildError::StoragePathAccessFailed)?;
+		let sql_store_config =
+			SqliteStoreConfig { transient_graph: self.config.transient_network_graph };
 		let kv_store = Arc::new(
-			SqliteStore::new(
+			SqliteStore::with_config(
 				storage_dir_path.into(),
 				Some(io::sqlite_store::SQLITE_DB_FILE_NAME.to_string()),
 				Some(io::sqlite_store::KV_TABLE_NAME.to_string()),
+				sql_store_config,
 			)
 			.map_err(|_| BuildError::KVStoreSetupFailed)?,
 		);
@@ -554,11 +557,14 @@ impl NodeBuilder {
 
 		// Alby: use a secondary KV store for non-essential data (not needed by VSS)
 		let storage_dir_path = config.storage_dir_path.clone();
+		let sql_store_config =
+			SqliteStoreConfig { transient_graph: self.config.transient_network_graph };
 		let secondary_kv_store = Arc::new(
-			SqliteStore::new(
+			SqliteStore::with_config(
 				storage_dir_path.into(),
 				Some(io::sqlite_store::SQLITE_DB_FILE_NAME.to_string()),
 				Some(io::sqlite_store::KV_TABLE_NAME.to_string()),
+				sql_store_config,
 			)
 			.map_err(|_| BuildError::KVStoreSetupFailed)?,
 		) as Arc<DynStore>;

@@ -9,7 +9,10 @@
 use crate::io::utils::check_namespace_key_validity;
 
 use lightning::io;
-use lightning::util::persist::KVStore;
+use lightning::util::persist::{
+	KVStore, NETWORK_GRAPH_PERSISTENCE_KEY, NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
+	NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
+};
 use lightning::util::string::PrintableString;
 
 use rusqlite::{named_params, Connection};
@@ -41,6 +44,19 @@ pub struct SqliteStore {
 	connection: Arc<Mutex<Connection>>,
 	data_dir: PathBuf,
 	kv_table_name: String,
+	config: SqliteStoreConfig,
+}
+
+/// Alby: extended SqliteStore configuration.
+pub struct SqliteStoreConfig {
+	/// Do not persist network graph.
+	pub(crate) transient_graph: bool,
+}
+
+impl Default for SqliteStoreConfig {
+	fn default() -> Self {
+		Self { transient_graph: false }
+	}
 }
 
 impl SqliteStore {
@@ -120,7 +136,28 @@ impl SqliteStore {
 		})?;
 
 		let connection = Arc::new(Mutex::new(connection));
-		Ok(Self { connection, data_dir, kv_table_name })
+		Ok(Self { connection, data_dir, kv_table_name, config: SqliteStoreConfig::default() })
+	}
+
+	/// Alby: constructs a new [`SqliteStore`] with an extended configuration.
+	pub fn with_config(
+		data_dir: PathBuf, db_file_name: Option<String>, kv_table_name: Option<String>,
+		config: SqliteStoreConfig,
+	) -> io::Result<Self> {
+		let mut ret = SqliteStore::new(data_dir, db_file_name, kv_table_name)?;
+
+		if config.transient_graph {
+			// Drop existing network graph if it has been persisted before.
+			ret.remove(
+				NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
+				NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
+				NETWORK_GRAPH_PERSISTENCE_KEY,
+				false,
+			)?;
+		}
+
+		ret.config = config;
+		Ok(ret)
 	}
 
 	/// Returns the data directory.
@@ -134,6 +171,15 @@ impl KVStore for SqliteStore {
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
 	) -> io::Result<Vec<u8>> {
 		check_namespace_key_validity(primary_namespace, secondary_namespace, Some(key), "read")?;
+
+		if self.config.transient_graph
+			&& primary_namespace == NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE
+			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
+			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
+		{
+			// Alby: returning "not found" here will cause the network graph to be rebuilt from scratch.
+			return Err(io::Error::new(io::ErrorKind::NotFound, "network graph is not persisted"));
+		}
 
 		let locked_conn = self.connection.lock().unwrap();
 		let sql =
@@ -182,6 +228,15 @@ impl KVStore for SqliteStore {
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: &[u8],
 	) -> io::Result<()> {
 		check_namespace_key_validity(primary_namespace, secondary_namespace, Some(key), "write")?;
+
+		if self.config.transient_graph
+			&& primary_namespace == NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE
+			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
+			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
+		{
+			// Alby: transient network graph is not persisted.
+			return Ok(());
+		}
 
 		let locked_conn = self.connection.lock().unwrap();
 

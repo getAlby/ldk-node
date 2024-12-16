@@ -166,6 +166,11 @@ pub struct Config {
 	/// **Note:** If unset, default parameters will be used, and you will be able to override the
 	/// parameters on a per-payment basis in the corresponding method calls.
 	pub sending_parameters: Option<SendingParameters>,
+	/// Alby: Transient network graph.
+	///
+	/// If set to `true`, the graph is not persisted in the database and is only kept in memory.
+	/// It will be rebuilt on each restart.
+	pub transient_network_graph: bool,
 }
 
 impl Default for Config {
@@ -181,6 +186,7 @@ impl Default for Config {
 			anchor_channels_config: Some(AnchorChannelsConfig::default()),
 			sending_parameters: None,
 			node_alias: None,
+			transient_network_graph: false,
 		}
 	}
 }
