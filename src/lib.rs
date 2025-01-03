@@ -1449,6 +1449,7 @@ impl Node {
 						lightning_balances.push(LightningBalance::from_ldk_balance(
 							channel_id,
 							counterparty_node_id,
+							funding_txo,
 							ldk_balance,
 						));
 					}

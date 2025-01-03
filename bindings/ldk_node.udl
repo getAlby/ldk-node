@@ -446,6 +446,8 @@ interface LightningBalance {
 	ClaimableOnChannelClose (
 		ChannelId channel_id,
 		PublicKey counterparty_node_id,
+		Txid funding_tx_id,
+		u16 funding_tx_index,
 		u64 amount_satoshis,
 		u64 transaction_fee_satoshis,
 		u64 outbound_payment_htlc_rounded_msat,
@@ -456,6 +458,8 @@ interface LightningBalance {
 	ClaimableAwaitingConfirmations (
 		ChannelId channel_id,
 		PublicKey counterparty_node_id,
+		Txid funding_tx_id,
+		u16 funding_tx_index,
 		u64 amount_satoshis,
 		u32 confirmation_height,
 		BalanceSource source
@@ -463,6 +467,8 @@ interface LightningBalance {
 	ContentiousClaimable (
 		ChannelId channel_id,
 		PublicKey counterparty_node_id,
+		Txid funding_tx_id,
+		u16 funding_tx_index,
 		u64 amount_satoshis,
 		u32 timeout_height,
 		PaymentHash payment_hash,
@@ -471,6 +477,8 @@ interface LightningBalance {
 	MaybeTimeoutClaimableHTLC (
 		ChannelId channel_id,
 		PublicKey counterparty_node_id,
+		Txid funding_tx_id,
+		u16 funding_tx_index,
 		u64 amount_satoshis,
 		u32 claimable_height,
 		PaymentHash payment_hash,
@@ -479,6 +487,8 @@ interface LightningBalance {
 	MaybePreimageClaimableHTLC (
 		ChannelId channel_id,
 		PublicKey counterparty_node_id,
+		Txid funding_tx_id,
+		u16 funding_tx_index,
 		u64 amount_satoshis,
 		u32 expiry_height,
 		PaymentHash payment_hash
@@ -486,6 +496,8 @@ interface LightningBalance {
 	CounterpartyRevokedOutputClaimable (
 		ChannelId channel_id,
 		PublicKey counterparty_node_id,
+		Txid funding_tx_id,
+		u16 funding_tx_index,
 		u64 amount_satoshis
 	);
 };

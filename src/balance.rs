@@ -15,6 +15,7 @@ use lightning::util::sweep::{OutputSpendStatus, TrackedSpendableOutput};
 
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{BlockHash, Txid};
+use lightning::chain::transaction::OutPoint;
 
 /// Details of the known available balances returned by [`Node::list_balances`].
 ///
@@ -79,6 +80,10 @@ pub enum LightningBalance {
 		channel_id: ChannelId,
 		/// The identifier of our channel counterparty.
 		counterparty_node_id: PublicKey,
+		/// Alby: funding transaction ID.
+		funding_tx_id: Txid,
+		/// Alby: funding transaction output index.
+		funding_tx_index: u16,
 		/// The amount available to claim, in satoshis, excluding the on-chain fees which will be
 		/// required to do so.
 		amount_satoshis: u64,
@@ -133,6 +138,10 @@ pub enum LightningBalance {
 		channel_id: ChannelId,
 		/// The identifier of our channel counterparty.
 		counterparty_node_id: PublicKey,
+		/// Alby: funding transaction ID.
+		funding_tx_id: Txid,
+		/// Alby: funding transaction output index.
+		funding_tx_index: u16,
 		/// The amount available to claim, in satoshis, possibly excluding the on-chain fees which
 		/// were spent in broadcasting the transaction.
 		amount_satoshis: u64,
@@ -156,6 +165,10 @@ pub enum LightningBalance {
 		channel_id: ChannelId,
 		/// The identifier of our channel counterparty.
 		counterparty_node_id: PublicKey,
+		/// Alby: funding transaction ID.
+		funding_tx_id: Txid,
+		/// Alby: funding transaction output index.
+		funding_tx_index: u16,
 		/// The amount available to claim, in satoshis, excluding the on-chain fees which will be
 		/// required to do so.
 		amount_satoshis: u64,
@@ -175,6 +188,10 @@ pub enum LightningBalance {
 		channel_id: ChannelId,
 		/// The identifier of our channel counterparty.
 		counterparty_node_id: PublicKey,
+		/// Alby: funding transaction ID.
+		funding_tx_id: Txid,
+		/// Alby: funding transaction output index.
+		funding_tx_index: u16,
 		/// The amount potentially available to claim, in satoshis, excluding the on-chain fees
 		/// which will be required to do so.
 		amount_satoshis: u64,
@@ -194,6 +211,10 @@ pub enum LightningBalance {
 		channel_id: ChannelId,
 		/// The identifier of our channel counterparty.
 		counterparty_node_id: PublicKey,
+		/// Alby: funding transaction ID.
+		funding_tx_id: Txid,
+		/// Alby: funding transaction output index.
+		funding_tx_index: u16,
 		/// The amount potentially available to claim, in satoshis, excluding the on-chain fees
 		/// which will be required to do so.
 		amount_satoshis: u64,
@@ -213,6 +234,10 @@ pub enum LightningBalance {
 		channel_id: ChannelId,
 		/// The identifier of our channel counterparty.
 		counterparty_node_id: PublicKey,
+		/// Alby: funding transaction ID.
+		funding_tx_id: Txid,
+		/// Alby: funding transaction output index.
+		funding_tx_index: u16,
 		/// The amount, in satoshis, of the output which we can claim.
 		amount_satoshis: u64,
 	},
@@ -220,8 +245,10 @@ pub enum LightningBalance {
 
 impl LightningBalance {
 	pub(crate) fn from_ldk_balance(
-		channel_id: ChannelId, counterparty_node_id: PublicKey, balance: LdkBalance,
+		channel_id: ChannelId, counterparty_node_id: PublicKey, funding_txo: OutPoint,
+		balance: LdkBalance,
 	) -> Self {
+		let OutPoint { txid: funding_tx_id, index: funding_tx_index } = funding_txo;
 		match balance {
 			LdkBalance::ClaimableOnChannelClose {
 				amount_satoshis,
@@ -233,6 +260,8 @@ impl LightningBalance {
 			} => Self::ClaimableOnChannelClose {
 				channel_id,
 				counterparty_node_id,
+				funding_tx_id,
+				funding_tx_index,
 				amount_satoshis,
 				transaction_fee_satoshis,
 				outbound_payment_htlc_rounded_msat,
@@ -247,6 +276,8 @@ impl LightningBalance {
 			} => Self::ClaimableAwaitingConfirmations {
 				channel_id,
 				counterparty_node_id,
+				funding_tx_id,
+				funding_tx_index,
 				amount_satoshis,
 				confirmation_height,
 				source,
@@ -259,6 +290,8 @@ impl LightningBalance {
 			} => Self::ContentiousClaimable {
 				channel_id,
 				counterparty_node_id,
+				funding_tx_id,
+				funding_tx_index,
 				amount_satoshis,
 				timeout_height,
 				payment_hash,
@@ -272,6 +305,8 @@ impl LightningBalance {
 			} => Self::MaybeTimeoutClaimableHTLC {
 				channel_id,
 				counterparty_node_id,
+				funding_tx_id,
+				funding_tx_index,
 				amount_satoshis,
 				claimable_height,
 				payment_hash,
@@ -284,6 +319,8 @@ impl LightningBalance {
 			} => Self::MaybePreimageClaimableHTLC {
 				channel_id,
 				counterparty_node_id,
+				funding_tx_id,
+				funding_tx_index,
 				amount_satoshis,
 				expiry_height,
 				payment_hash,
@@ -292,6 +329,8 @@ impl LightningBalance {
 				Self::CounterpartyRevokedOutputClaimable {
 					channel_id,
 					counterparty_node_id,
+					funding_tx_id,
+					funding_tx_index,
 					amount_satoshis,
 				}
 			},
