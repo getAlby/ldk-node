@@ -348,6 +348,12 @@ pub enum PendingSweepBalance {
 		channel_id: Option<ChannelId>,
 		/// The amount, in satoshis, of the output being swept.
 		amount_satoshis: u64,
+		/// Alby: the identifier of our channel counterparty.
+		counterparty_node_id: Option<PublicKey>,
+		/// Alby: funding transaction ID.
+		funding_tx_id: Option<Txid>,
+		/// Alby: funding transaction output index.
+		funding_tx_index: Option<u16>,
 	},
 	/// A spending transaction has been generated and broadcast and is awaiting confirmation
 	/// on-chain.
@@ -360,6 +366,12 @@ pub enum PendingSweepBalance {
 		latest_spending_txid: Txid,
 		/// The amount, in satoshis, of the output being swept.
 		amount_satoshis: u64,
+		/// Alby: the identifier of our channel counterparty.
+		counterparty_node_id: Option<PublicKey>,
+		/// Alby: funding transaction ID.
+		funding_tx_id: Option<Txid>,
+		/// Alby: funding transaction output index.
+		funding_tx_index: Option<u16>,
 	},
 	/// A spending transaction has been confirmed on-chain and is awaiting threshold confirmations.
 	///
@@ -377,16 +389,31 @@ pub enum PendingSweepBalance {
 		confirmation_height: u32,
 		/// The amount, in satoshis, of the output being swept.
 		amount_satoshis: u64,
+		/// Alby: the identifier of our channel counterparty.
+		counterparty_node_id: Option<PublicKey>,
+		/// Alby: funding transaction ID.
+		funding_tx_id: Option<Txid>,
+		/// Alby: funding transaction output index.
+		funding_tx_index: Option<u16>,
 	},
 }
 
 impl PendingSweepBalance {
-	pub(crate) fn from_tracked_spendable_output(output_info: TrackedSpendableOutput) -> Self {
+	pub(crate) fn from_tracked_spendable_output(
+		output_info: TrackedSpendableOutput, counterparty_node_id: Option<PublicKey>,
+		funding_txo: Option<OutPoint>,
+	) -> Self {
 		match output_info.status {
 			OutputSpendStatus::PendingInitialBroadcast { .. } => {
 				let channel_id = output_info.channel_id;
 				let amount_satoshis = value_from_descriptor(&output_info.descriptor).to_sat();
-				Self::PendingBroadcast { channel_id, amount_satoshis }
+				Self::PendingBroadcast {
+					channel_id,
+					amount_satoshis,
+					counterparty_node_id,
+					funding_tx_id: funding_txo.map(|funding_txo| funding_txo.txid),
+					funding_tx_index: funding_txo.map(|funding_txo| funding_txo.index),
+				}
 			},
 			OutputSpendStatus::PendingFirstConfirmation {
 				latest_broadcast_height,
@@ -401,6 +428,9 @@ impl PendingSweepBalance {
 					latest_broadcast_height,
 					latest_spending_txid,
 					amount_satoshis,
+					counterparty_node_id,
+					funding_tx_id: funding_txo.map(|funding_txo| funding_txo.txid),
+					funding_tx_index: funding_txo.map(|funding_txo| funding_txo.index),
 				}
 			},
 			OutputSpendStatus::PendingThresholdConfirmations {
@@ -418,6 +448,9 @@ impl PendingSweepBalance {
 					confirmation_hash,
 					confirmation_height,
 					amount_satoshis,
+					counterparty_node_id,
+					funding_tx_id: funding_txo.map(|funding_txo| funding_txo.txid),
+					funding_tx_index: funding_txo.map(|funding_txo| funding_txo.index),
 				}
 			},
 		}
