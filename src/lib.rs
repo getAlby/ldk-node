@@ -100,6 +100,7 @@ pub use bip39;
 pub use bitcoin;
 pub use lightning;
 pub use lightning_invoice;
+use std::collections::HashMap;
 pub use vss_client;
 
 pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
@@ -1436,11 +1437,16 @@ impl Node {
 		let total_anchor_channels_reserve_sats =
 			std::cmp::min(cur_anchor_reserve_sats, total_onchain_balance_sats);
 
+		// Alby: build a map of funding TXOs by channel ID.
+		let mut funding_txo_by_channel_id = HashMap::new();
+
 		let mut total_lightning_balance_sats = 0;
 		let mut lightning_balances = Vec::new();
 		for (funding_txo, channel_id) in self.chain_monitor.list_monitors() {
 			match self.chain_monitor.get_monitor(funding_txo) {
 				Ok(monitor) => {
+					funding_txo_by_channel_id.insert(channel_id, funding_txo);
+
 					// unwrap safety: `get_counterparty_node_id` will always be `Some` after 0.0.110 and
 					// LDK Node 0.1 depended on 0.0.115 already.
 					let counterparty_node_id = monitor.get_counterparty_node_id().unwrap();
@@ -1464,7 +1470,20 @@ impl Node {
 			.output_sweeper
 			.tracked_spendable_outputs()
 			.into_iter()
-			.map(PendingSweepBalance::from_tracked_spendable_output)
+			.map(|out| {
+				// Alby: try to fetch channel details. After the channel is closed, its monitor is kept around
+				// by LDK for a while (4032 blocks since balances become empty), so we can still try to access it.
+				// See [`periodically_archive_fully_resolved_monitors`] for details.
+				let funding_txo =
+					out.channel_id.and_then(|c| funding_txo_by_channel_id.get(&c)).cloned();
+				let chmon = funding_txo.and_then(|txo| self.chain_monitor.get_monitor(txo).ok());
+				let counterparty_node_id = chmon.and_then(|m| m.get_counterparty_node_id());
+				PendingSweepBalance::from_tracked_spendable_output(
+					out,
+					counterparty_node_id,
+					funding_txo,
+				)
+			})
 			.collect();
 
 		BalanceDetails {

@@ -27,6 +27,17 @@ panic = 'abort'     # Abort on panic
 [features]
 default = []
 
+# Alby: workaround for builds failing since Rust 1.84.0 due to newly added unexpected_cfg lints for external macros.
+# This should be removed once we merge upstream LDK updates:
+# - https://github.com/lightningdevkit/rust-lightning/issues/3424
+# - https://github.com/lightningdevkit/rust-lightning/pull/3431
+max_level_off = []
+max_level_error = []
+max_level_warn = []
+max_level_info = []
+max_level_debug = []
+max_level_trace = []
+
 [dependencies]
 lightning = { version = "0.0.125", features = ["std"] }
 lightning-invoice = { version = "0.32.0" }

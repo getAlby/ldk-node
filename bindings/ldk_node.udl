@@ -511,9 +511,32 @@ enum BalanceSource {
 
 [Enum]
 interface PendingSweepBalance {
-	PendingBroadcast ( ChannelId? channel_id, u64 amount_satoshis );
-	BroadcastAwaitingConfirmation ( ChannelId? channel_id, u32 latest_broadcast_height, Txid latest_spending_txid, u64 amount_satoshis );
-	AwaitingThresholdConfirmations ( ChannelId? channel_id, Txid latest_spending_txid, BlockHash confirmation_hash, u32 confirmation_height, u64 amount_satoshis);
+	PendingBroadcast (
+		ChannelId? channel_id,
+		u64 amount_satoshis,
+		PublicKey? counterparty_node_id,
+		Txid? funding_tx_id,
+		u16? funding_tx_index
+	);
+	BroadcastAwaitingConfirmation (
+		ChannelId? channel_id,
+		u32 latest_broadcast_height,
+		Txid latest_spending_txid,
+		u64 amount_satoshis,
+		PublicKey? counterparty_node_id,
+		Txid? funding_tx_id,
+		u16? funding_tx_index
+	);
+	AwaitingThresholdConfirmations (
+		ChannelId? channel_id,
+		Txid latest_spending_txid,
+		BlockHash confirmation_hash,
+		u32 confirmation_height,
+		u64 amount_satoshis,
+		PublicKey? counterparty_node_id,
+		Txid? funding_tx_id,
+		u16? funding_tx_index
+	);
 };
 
 dictionary BalanceDetails {
