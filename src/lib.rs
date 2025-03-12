@@ -145,7 +145,7 @@ pub use types::{ChannelDetails, ChannelType, KeyValue, PeerDetails, TlvEntry, Us
 #[cfg(feature = "uniffi")]
 use types::{MigrateStorage, ResetState};
 
-use logger::{log_error, log_info, log_trace, FilesystemLogger, Logger};
+use logger::{log_debug, log_error, log_info, log_trace, FilesystemLogger, Logger};
 
 use lightning::chain::BestBlock;
 use lightning::events::bump_transaction::Wallet as LdkWallet;
@@ -389,6 +389,11 @@ impl Node {
 		runtime.spawn(async move {
 			let mut interval = tokio::time::interval(PEER_RECONNECTION_INTERVAL);
 			interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+			// Alby: reconnection backoff for peers
+			let mut peer_retry_backoffs: HashMap<PublicKey, usize> = HashMap::new();
+			// Alby: reconnect iteration used to check if we should skip a reconnect attempt
+			let mut reconnect_iteration = 0;
 			loop {
 				tokio::select! {
 						_ = stop_connect.changed() => {
@@ -399,13 +404,29 @@ impl Node {
 							return;
 						}
 						_ = interval.tick() => {
+							reconnect_iteration += 1;
 							let pm_peers = connect_pm
 								.list_peers()
 								.iter()
 								.map(|peer| peer.counterparty_node_id)
 								.collect::<Vec<_>>();
 
+							for connected_peer in pm_peers.iter() {
+								// Alby: reset backoff for connected peers
+								// because this is not the only place
+								// a peer can be re-connected to (e.g.)
+								// a peer could initiate the connection to this node
+								peer_retry_backoffs.insert(*connected_peer, 0);
+							}
+
 							for peer_info in connect_peer_store.list_peers().iter().filter(|info| !pm_peers.contains(&info.node_id)) {
+								// Alby: backoff reconnection attempts backoff for connected peers
+								let peer_retry_backoff = peer_retry_backoffs.get(&peer_info.node_id).cloned().unwrap_or(0);
+								if peer_retry_backoff > 0 && reconnect_iteration % peer_retry_backoff != 0 {
+									log_debug!(connect_logger, "Skipping reconnecting to peer {} iteration {} backoff {}", peer_info.node_id, reconnect_iteration, peer_retry_backoff);
+									continue
+								}
+
 								let res = connect_cm.do_connect_peer(
 									peer_info.node_id,
 									peer_info.address.clone(),
@@ -415,7 +436,15 @@ impl Node {
 										log_info!(connect_logger, "Successfully reconnected to peer {}", peer_info.node_id);
 									},
 									Err(e) => {
-										log_error!(connect_logger, "Failed to reconnect to peer {}: {}", peer_info.node_id, e);
+										// increase backoff randomly e.g. for the first 6 iterations:
+										// 1, [2-3], [3-5], [4-7], [5-9], [6-11], [7-13]
+										let mut new_peer_retry_backoff = peer_retry_backoff + 1;
+										new_peer_retry_backoff += rand::thread_rng().gen_range(0..new_peer_retry_backoff);
+										if new_peer_retry_backoff > 360 {
+											new_peer_retry_backoff = 360 // 360 * 10 seconds = approx 1 hour maximum backoff
+										}
+										log_error!(connect_logger, "Failed to reconnect to peer {}: {} backoff {} -> {}", peer_info.node_id, e, peer_retry_backoff, new_peer_retry_backoff);
+										peer_retry_backoffs.insert(peer_info.node_id, new_peer_retry_backoff);
 									}
 								}
 							}
