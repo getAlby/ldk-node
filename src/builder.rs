@@ -1251,6 +1251,22 @@ fn build_with_store_internal(
 			p2p_source
 		},
 		GossipSourceConfig::RapidGossipSync(rgs_server) => {
+			if config.transient_network_graph {
+				// Alby: Reset the RGS sync timestamp if we don't persist the network graph
+				// otherwise the network graph will be incomplete
+				let mut locked_node_metrics = node_metrics.write().unwrap();
+				locked_node_metrics.latest_rgs_snapshot_timestamp = None;
+				write_node_metrics(
+					&*locked_node_metrics,
+					Arc::clone(&kv_store),
+					Arc::clone(&logger),
+				)
+				.map_err(|e| {
+					log_error!(logger, "Failed writing to store: {}", e);
+					BuildError::WriteFailed
+				})?;
+			}
+
 			let latest_sync_timestamp =
 				node_metrics.read().unwrap().latest_rgs_snapshot_timestamp.unwrap_or(0);
 			Arc::new(GossipSource::new_rgs(
