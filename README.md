@@ -93,7 +93,7 @@ You can test locally with the following:
 - copied the outputs to my alby hub directory (cp ffi/golang/ldk_node ../hub -r)
 - inside the hub, updated imports in ldk.go / ldk-event-broadcaster.go to use local version
 
-Alterate flow:
+Alternate flow:
 
 - Check out hub, ldk-node, ldk-node-go
 - Build the bindings in ldk-node
