@@ -79,3 +79,23 @@ The Minimum Supported Rust Version (MSRV) is currently 1.63.0.
 [kotlin]: https://kotlinlang.org/
 [python]: https://www.python.org/
 [flutter_bindings]: https://github.com/LtbLightning/ldk-node-flutter
+
+## Alby Go Bindings
+
+Alby Go bindings are automatically built by a github workflow and published to ldk-node-go.
+
+You can test locally with the following:
+
+- install a recent version of rust
+- cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.3.0+v0.28.3
+- ran cargo clean
+- run ./scripts/uniffi_bindgen_generate_go.sh
+- copied the outputs to my alby hub directory (cp ffi/golang/ldk_node ../hub -r)
+- inside the hub, updated imports in ldk.go / ldk-event-broadcaster.go to use local version
+
+Alternate flow:
+
+- Check out hub, ldk-node, ldk-node-go
+- Build the bindings in ldk-node
+- Copy the binding files (go, h, dylib) into the ldk-node-go directory, overwriting existing ones
+- In the Hub, add a replace directive to go mod to build with the local package
