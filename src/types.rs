@@ -168,13 +168,13 @@ impl Readable for UserChannelId {
 /// See [`BOLT 2`] for more information.
 ///
 /// [`BOLT 2`]: https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#defined-channel-types
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChannelType {
-	/// A channel of type `option_static_remotekey`.
-	StaticRemoteKey,
-	/// A channel of type `option_anchors_zero_fee_htlc_tx`.
-	Anchors,
-}
+// #[derive(Debug, Clone, PartialEq, Eq)]
+// pub enum ChannelType {
+// 	/// A channel of type `option_static_remotekey`.
+// 	StaticRemoteKey,
+// 	/// A channel of type `option_anchors_zero_fee_htlc_tx`.
+// 	Anchors,
+// }
 
 /// Details of a channel as returned by [`Node::list_channels`].
 ///
@@ -333,13 +333,13 @@ pub struct ChannelDetails {
 
 impl From<LdkChannelDetails> for ChannelDetails {
 	fn from(value: LdkChannelDetails) -> Self {
-		let channel_type = value.channel_type.map(|t| {
-			if t.requires_anchors_zero_fee_htlc_tx() {
-				ChannelType::Anchors
-			} else {
-				ChannelType::StaticRemoteKey
-			}
-		});
+		// let channel_type = value.channel_type.map(|t| {
+		// 	if t.requires_anchors_zero_fee_htlc_tx() {
+		// 		ChannelType::Anchors
+		// 	} else {
+		// 		ChannelType::StaticRemoteKey
+		// 	}
+		// });
 
 		ChannelDetails {
 			channel_id: value.channel_id,

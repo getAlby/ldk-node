@@ -276,7 +276,7 @@ impl Readable for PaymentDetails {
 		let amount_msat: Option<u64> = amount_msat.0.ok_or(DecodeError::InvalidValue)?;
 		let direction: PaymentDirection = direction.0.ok_or(DecodeError::InvalidValue)?;
 		let status: PaymentStatus = status.0.ok_or(DecodeError::InvalidValue)?;
-		let last_update: u64 = last_update.unwrap_or(0);
+		//let last_update: u64 = last_update.unwrap_or(0);
 		let created_at: u64 = created_at.unwrap_or(0);
 
 		let kind = if let Some(kind) = kind_opt {

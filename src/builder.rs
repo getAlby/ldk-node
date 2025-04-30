@@ -1813,9 +1813,7 @@ fn derive_xprv(
 		})
 }
 
-fn reset_persistent_state(
-	logger: Arc<FilesystemLogger>, kv_store: Arc<DynStore>, what: ResetState,
-) {
+fn reset_persistent_state(logger: Arc<Logger>, kv_store: Arc<DynStore>, what: ResetState) {
 	let (node_metrics, scorer, network_graph) = match what {
 		ResetState::NodeMetrics => (true, false, false),
 		ResetState::Scorer => (false, true, false),

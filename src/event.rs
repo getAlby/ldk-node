@@ -55,7 +55,7 @@ use std::collections::VecDeque;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// An event emitted by [`Node`], which should be handled by the user.
 ///
@@ -817,13 +817,13 @@ where
 						);
 
 						// TODO: remove (use latest_update_timestamp)
-						payment.last_update = SystemTime::now()
-							.duration_since(UNIX_EPOCH)
-							.unwrap_or(Duration::ZERO)
-							.as_secs();
+						// payment.last_update = SystemTime::now()
+						// 	.duration_since(UNIX_EPOCH)
+						// 	.unwrap_or(Duration::ZERO)
+						// 	.as_secs();
 
-						// TODO: is this still needed?
-						payment.fee_msat = None;
+						// // TODO: is this still needed?
+						// payment.fee_msat = None;
 						// TODO: move to PaymentDetails::new ?
 						payment.created_at = 0;
 
@@ -994,7 +994,7 @@ where
 					preimage: Some(Some(payment_preimage)),
 					fee_paid_msat: Some(fee_paid_msat),
 					status: Some(PaymentStatus::Succeeded),
-					fee_msat: Some(fee_paid_msat),
+					//fee_msat: Some(fee_paid_msat),
 					..PaymentDetailsUpdate::new(payment_id)
 				};
 

@@ -1302,6 +1302,9 @@ impl Node {
 						ChainSource::Esplora { .. } => {
 							chain_source.update_fee_rate_estimates().await?;
 						},
+						ChainSource::Electrum { .. } => {
+							chain_source.update_fee_rate_estimates().await?;
+						},
 						ChainSource::BitcoindRpc { .. } => {
 							chain_source.update_fee_rate_estimates().await?;
 						},
