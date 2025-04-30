@@ -6,40 +6,44 @@
 // accordance with one or both of these licenses.
 
 mod bitcoind_rpc;
+mod electrum;
 
 use crate::chain::bitcoind_rpc::{
 	BitcoindRpcClient, BoundedHeaderCache, ChainListener, FeeRateEstimationMode,
 };
+use crate::chain::electrum::ElectrumRuntimeClient;
 use crate::config::{
-	Config, EsploraSyncConfig, BDK_CLIENT_CONCURRENCY, BDK_CLIENT_STOP_GAP,
-	BDK_WALLET_SYNC_TIMEOUT_SECS, FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS, LDK_WALLET_SYNC_TIMEOUT_SECS,
-	RESOLVED_CHANNEL_MONITOR_ARCHIVAL_INTERVAL, TX_BROADCAST_TIMEOUT_SECS,
-	WALLET_SYNC_INTERVAL_MINIMUM_SECS,
+	BackgroundSyncConfig, Config, ElectrumSyncConfig, EsploraSyncConfig, BDK_CLIENT_CONCURRENCY,
+	BDK_CLIENT_STOP_GAP, BDK_WALLET_SYNC_TIMEOUT_SECS, FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS,
+	LDK_WALLET_SYNC_TIMEOUT_SECS, RESOLVED_CHANNEL_MONITOR_ARCHIVAL_INTERVAL,
+	TX_BROADCAST_TIMEOUT_SECS, WALLET_SYNC_INTERVAL_MINIMUM_SECS,
 };
 use crate::fee_estimator::{
 	apply_post_estimation_adjustments, get_all_conf_targets, get_num_block_defaults_for_target,
 	ConfirmationTarget, OnchainFeeEstimator,
 };
 use crate::io::utils::write_node_metrics;
-use crate::logger::{log_bytes, log_error, log_info, log_trace, FilesystemLogger, Logger};
+use crate::logger::{log_bytes, log_error, log_info, log_trace, LdkLogger, Logger};
 use crate::types::{Broadcaster, ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, NodeMetrics};
 
 use lightning::chain::chaininterface::ConfirmationTarget as LdkConfirmationTarget;
-use lightning::chain::{Confirm, Filter, Listen};
+use lightning::chain::{Confirm, Filter, Listen, WatchedOutput};
 use lightning::util::ser::Writeable;
 
 use lightning_transaction_sync::EsploraSyncClient;
 
+use lightning_block_sync::gossip::UtxoSource;
 use lightning_block_sync::init::{synchronize_listeners, validate_best_block_header};
 use lightning_block_sync::poll::{ChainPoller, ChainTip, ValidatedBlockHeader};
 use lightning_block_sync::SpvClient;
 
 use bdk_esplora::EsploraAsyncExt;
+use bdk_wallet::Update as BdkUpdate;
 
 use esplora_client::AsyncClient as EsploraAsyncClient;
 
-use bitcoin::{FeeRate, Network};
+use bitcoin::{FeeRate, Network, Script, ScriptBuf, Txid};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -106,19 +110,109 @@ impl WalletSyncStatus {
 	}
 }
 
+pub(crate) enum ElectrumRuntimeStatus {
+	Started(Arc<ElectrumRuntimeClient>),
+	Stopped {
+		pending_registered_txs: Vec<(Txid, ScriptBuf)>,
+		pending_registered_outputs: Vec<WatchedOutput>,
+	},
+}
+
+impl ElectrumRuntimeStatus {
+	pub(crate) fn new() -> Self {
+		let pending_registered_txs = Vec::new();
+		let pending_registered_outputs = Vec::new();
+		Self::Stopped { pending_registered_txs, pending_registered_outputs }
+	}
+
+	pub(crate) fn start(
+		&mut self, server_url: String, runtime: Arc<tokio::runtime::Runtime>, config: Arc<Config>,
+		logger: Arc<Logger>,
+	) -> Result<(), Error> {
+		match self {
+			Self::Stopped { pending_registered_txs, pending_registered_outputs } => {
+				let client = Arc::new(ElectrumRuntimeClient::new(
+					server_url.clone(),
+					runtime,
+					config,
+					logger,
+				)?);
+
+				// Apply any pending `Filter` entries
+				for (txid, script_pubkey) in pending_registered_txs.drain(..) {
+					client.register_tx(&txid, &script_pubkey);
+				}
+
+				for output in pending_registered_outputs.drain(..) {
+					client.register_output(output)
+				}
+
+				*self = Self::Started(client);
+			},
+			Self::Started(_) => {
+				debug_assert!(false, "We shouldn't call start if we're already started")
+			},
+		}
+		Ok(())
+	}
+
+	pub(crate) fn stop(&mut self) {
+		*self = Self::new()
+	}
+
+	pub(crate) fn client(&self) -> Option<Arc<ElectrumRuntimeClient>> {
+		match self {
+			Self::Started(client) => Some(Arc::clone(&client)),
+			Self::Stopped { .. } => None,
+		}
+	}
+
+	fn register_tx(&mut self, txid: &Txid, script_pubkey: &Script) {
+		match self {
+			Self::Started(client) => client.register_tx(txid, script_pubkey),
+			Self::Stopped { pending_registered_txs, .. } => {
+				pending_registered_txs.push((*txid, script_pubkey.to_owned()))
+			},
+		}
+	}
+
+	fn register_output(&mut self, output: lightning::chain::WatchedOutput) {
+		match self {
+			Self::Started(client) => client.register_output(output),
+			Self::Stopped { pending_registered_outputs, .. } => {
+				pending_registered_outputs.push(output)
+			},
+		}
+	}
+}
+
 pub(crate) enum ChainSource {
 	Esplora {
 		sync_config: EsploraSyncConfig,
 		esplora_client: EsploraAsyncClient,
 		onchain_wallet: Arc<Wallet>,
 		onchain_wallet_sync_status: Mutex<WalletSyncStatus>,
-		tx_sync: Arc<EsploraSyncClient<Arc<FilesystemLogger>>>,
+		tx_sync: Arc<EsploraSyncClient<Arc<Logger>>>,
 		lightning_wallet_sync_status: Mutex<WalletSyncStatus>,
 		fee_estimator: Arc<OnchainFeeEstimator>,
 		tx_broadcaster: Arc<Broadcaster>,
 		kv_store: Arc<DynStore>,
 		config: Arc<Config>,
-		logger: Arc<FilesystemLogger>,
+		logger: Arc<Logger>,
+		node_metrics: Arc<RwLock<NodeMetrics>>,
+	},
+	Electrum {
+		server_url: String,
+		sync_config: ElectrumSyncConfig,
+		electrum_runtime_status: RwLock<ElectrumRuntimeStatus>,
+		onchain_wallet: Arc<Wallet>,
+		onchain_wallet_sync_status: Mutex<WalletSyncStatus>,
+		lightning_wallet_sync_status: Mutex<WalletSyncStatus>,
+		fee_estimator: Arc<OnchainFeeEstimator>,
+		tx_broadcaster: Arc<Broadcaster>,
+		kv_store: Arc<DynStore>,
+		config: Arc<Config>,
+		logger: Arc<Logger>,
 		node_metrics: Arc<RwLock<NodeMetrics>>,
 	},
 	BitcoindRpc {
@@ -131,7 +225,7 @@ pub(crate) enum ChainSource {
 		tx_broadcaster: Arc<Broadcaster>,
 		kv_store: Arc<DynStore>,
 		config: Arc<Config>,
-		logger: Arc<FilesystemLogger>,
+		logger: Arc<Logger>,
 		node_metrics: Arc<RwLock<NodeMetrics>>,
 	},
 }
@@ -140,7 +234,7 @@ impl ChainSource {
 	pub(crate) fn new_esplora(
 		server_url: String, sync_config: EsploraSyncConfig, onchain_wallet: Arc<Wallet>,
 		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
-		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<FilesystemLogger>,
+		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
 		node_metrics: Arc<RwLock<NodeMetrics>>,
 	) -> Self {
 		let mut client_builder = esplora_client::Builder::new(&server_url);
@@ -166,11 +260,36 @@ impl ChainSource {
 		}
 	}
 
+	pub(crate) fn new_electrum(
+		server_url: String, sync_config: ElectrumSyncConfig, onchain_wallet: Arc<Wallet>,
+		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
+		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
+		node_metrics: Arc<RwLock<NodeMetrics>>,
+	) -> Self {
+		let electrum_runtime_status = RwLock::new(ElectrumRuntimeStatus::new());
+		let onchain_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
+		let lightning_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
+		Self::Electrum {
+			server_url,
+			sync_config,
+			electrum_runtime_status,
+			onchain_wallet,
+			onchain_wallet_sync_status,
+			lightning_wallet_sync_status,
+			fee_estimator,
+			tx_broadcaster,
+			kv_store,
+			config,
+			logger,
+			node_metrics,
+		}
+	}
+
 	pub(crate) fn new_bitcoind_rpc(
 		host: String, port: u16, rpc_user: String, rpc_password: String,
 		onchain_wallet: Arc<Wallet>, fee_estimator: Arc<OnchainFeeEstimator>,
 		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, config: Arc<Config>,
-		logger: Arc<FilesystemLogger>, node_metrics: Arc<RwLock<NodeMetrics>>,
+		logger: Arc<Logger>, node_metrics: Arc<RwLock<NodeMetrics>>,
 	) -> Self {
 		let bitcoind_rpc_client =
 			Arc::new(BitcoindRpcClient::new(host, port, rpc_user, rpc_password));
@@ -192,6 +311,41 @@ impl ChainSource {
 		}
 	}
 
+	pub(crate) fn start(&self, runtime: Arc<tokio::runtime::Runtime>) -> Result<(), Error> {
+		match self {
+			Self::Electrum { server_url, electrum_runtime_status, config, logger, .. } => {
+				electrum_runtime_status.write().unwrap().start(
+					server_url.clone(),
+					Arc::clone(&runtime),
+					Arc::clone(&config),
+					Arc::clone(&logger),
+				)?;
+			},
+			_ => {
+				// Nothing to do for other chain sources.
+			},
+		}
+		Ok(())
+	}
+
+	pub(crate) fn stop(&self) {
+		match self {
+			Self::Electrum { electrum_runtime_status, .. } => {
+				electrum_runtime_status.write().unwrap().stop();
+			},
+			_ => {
+				// Nothing to do for other chain sources.
+			},
+		}
+	}
+
+	pub(crate) fn as_utxo_source(&self) -> Option<Arc<dyn UtxoSource>> {
+		match self {
+			Self::BitcoindRpc { bitcoind_rpc_client, .. } => Some(bitcoind_rpc_client.rpc_client()),
+			_ => None,
+		}
+	}
+
 	pub(crate) async fn continuously_sync_wallets(
 		&self, mut stop_sync_receiver: tokio::sync::watch::Receiver<()>,
 		channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
@@ -199,57 +353,43 @@ impl ChainSource {
 	) {
 		match self {
 			Self::Esplora { sync_config, logger, .. } => {
-				// Setup syncing intervals
-				let onchain_wallet_sync_interval_secs = sync_config
-					.onchain_wallet_sync_interval_secs
-					.max(WALLET_SYNC_INTERVAL_MINIMUM_SECS);
-				let mut onchain_wallet_sync_interval =
-					tokio::time::interval(Duration::from_secs(onchain_wallet_sync_interval_secs));
-				onchain_wallet_sync_interval
-					.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-				let fee_rate_cache_update_interval_secs = sync_config
-					.fee_rate_cache_update_interval_secs
-					.max(WALLET_SYNC_INTERVAL_MINIMUM_SECS);
-				let mut fee_rate_update_interval =
-					tokio::time::interval(Duration::from_secs(fee_rate_cache_update_interval_secs));
-				// When starting up, we just blocked on updating, so skip the first tick.
-				fee_rate_update_interval.reset();
-				fee_rate_update_interval
-					.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-				let lightning_wallet_sync_interval_secs = sync_config
-					.lightning_wallet_sync_interval_secs
-					.max(WALLET_SYNC_INTERVAL_MINIMUM_SECS);
-				let mut lightning_wallet_sync_interval =
-					tokio::time::interval(Duration::from_secs(lightning_wallet_sync_interval_secs));
-				lightning_wallet_sync_interval
-					.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-				// Start the syncing loop.
-				loop {
-					tokio::select! {
-						_ = stop_sync_receiver.changed() => {
-							log_trace!(
-								logger,
-								"Stopping background syncing on-chain wallet.",
-							);
-							return;
-						}
-						_ = onchain_wallet_sync_interval.tick() => {
-							let _ = self.sync_onchain_wallet().await;
-						}
-						_ = fee_rate_update_interval.tick() => {
-							let _ = self.update_fee_rate_estimates().await;
-						}
-						_ = lightning_wallet_sync_interval.tick() => {
-							let _ = self.sync_lightning_wallet(
-								Arc::clone(&channel_manager),
-								Arc::clone(&chain_monitor),
-								Arc::clone(&output_sweeper),
-							).await;
-						}
-					}
+				if let Some(background_sync_config) = sync_config.background_sync_config.as_ref() {
+					self.start_tx_based_sync_loop(
+						stop_sync_receiver,
+						channel_manager,
+						chain_monitor,
+						output_sweeper,
+						background_sync_config,
+						Arc::clone(&logger),
+					)
+					.await
+				} else {
+					// Background syncing is disabled
+					log_info!(
+						logger,
+						"Background syncing is disabled. Manual syncing required for onchain wallet, lightning wallet, and fee rate updates.",
+					);
+					return;
+				}
+			},
+			Self::Electrum { sync_config, logger, .. } => {
+				if let Some(background_sync_config) = sync_config.background_sync_config.as_ref() {
+					self.start_tx_based_sync_loop(
+						stop_sync_receiver,
+						channel_manager,
+						chain_monitor,
+						output_sweeper,
+						background_sync_config,
+						Arc::clone(&logger),
+					)
+					.await
+				} else {
+					// Background syncing is disabled
+					log_info!(
+						logger,
+						"Background syncing is disabled. Manual syncing required for onchain wallet, lightning wallet, and fee rate updates.",
+					);
+					return;
 				}
 			},
 			Self::BitcoindRpc {
@@ -273,44 +413,51 @@ impl ChainSource {
 					}
 				}
 
-				let channel_manager_best_block_hash =
-					channel_manager.current_best_block().block_hash;
-				let sweeper_best_block_hash = output_sweeper.current_best_block().block_hash;
-				let onchain_wallet_best_block_hash = onchain_wallet.current_best_block().block_hash;
-
-				let mut chain_listeners = vec![
-					(
-						onchain_wallet_best_block_hash,
-						&**onchain_wallet as &(dyn Listen + Send + Sync),
-					),
-					(
-						channel_manager_best_block_hash,
-						&*channel_manager as &(dyn Listen + Send + Sync),
-					),
-					(sweeper_best_block_hash, &*output_sweeper as &(dyn Listen + Send + Sync)),
-				];
-
-				// TODO: Eventually we might want to see if we can synchronize `ChannelMonitor`s
-				// before giving them to `ChainMonitor` it the first place. However, this isn't
-				// trivial as we load them on initialization (in the `Builder`) and only gain
-				// network access during `start`. For now, we just make sure we get the worst known
-				// block hash and sychronize them via `ChainMonitor`.
-				if let Some(worst_channel_monitor_block_hash) = chain_monitor
-					.list_monitors()
-					.iter()
-					.flat_map(|(txo, _)| chain_monitor.get_monitor(*txo))
-					.map(|m| m.current_best_block())
-					.min_by_key(|b| b.height)
-					.map(|b| b.block_hash)
-				{
-					chain_listeners.push((
-						worst_channel_monitor_block_hash,
-						&*chain_monitor as &(dyn Listen + Send + Sync),
-					));
-				}
+				log_info!(
+					logger,
+					"Starting initial synchronization of chain listeners. This might take a while..",
+				);
 
 				loop {
+					let channel_manager_best_block_hash =
+						channel_manager.current_best_block().block_hash;
+					let sweeper_best_block_hash = output_sweeper.current_best_block().block_hash;
+					let onchain_wallet_best_block_hash =
+						onchain_wallet.current_best_block().block_hash;
+
+					let mut chain_listeners = vec![
+						(
+							onchain_wallet_best_block_hash,
+							&**onchain_wallet as &(dyn Listen + Send + Sync),
+						),
+						(
+							channel_manager_best_block_hash,
+							&*channel_manager as &(dyn Listen + Send + Sync),
+						),
+						(sweeper_best_block_hash, &*output_sweeper as &(dyn Listen + Send + Sync)),
+					];
+
+					// TODO: Eventually we might want to see if we can synchronize `ChannelMonitor`s
+					// before giving them to `ChainMonitor` it the first place. However, this isn't
+					// trivial as we load them on initialization (in the `Builder`) and only gain
+					// network access during `start`. For now, we just make sure we get the worst known
+					// block hash and sychronize them via `ChainMonitor`.
+					if let Some(worst_channel_monitor_block_hash) = chain_monitor
+						.list_monitors()
+						.iter()
+						.flat_map(|(txo, _)| chain_monitor.get_monitor(*txo))
+						.map(|m| m.current_best_block())
+						.min_by_key(|b| b.height)
+						.map(|b| b.block_hash)
+					{
+						chain_listeners.push((
+							worst_channel_monitor_block_hash,
+							&*chain_monitor as &(dyn Listen + Send + Sync),
+						));
+					}
+
 					let mut locked_header_cache = header_cache.lock().await;
+					let now = SystemTime::now();
 					match synchronize_listeners(
 						bitcoind_rpc_client.as_ref(),
 						config.network,
@@ -321,6 +468,11 @@ impl ChainSource {
 					{
 						Ok(chain_tip) => {
 							{
+								log_info!(
+									logger,
+									"Finished synchronizing listeners in {}ms",
+									now.elapsed().unwrap().as_millis()
+								);
 								*latest_chain_tip.write().unwrap() = Some(chain_tip);
 								let unix_time_secs_opt = SystemTime::now()
 									.duration_since(UNIX_EPOCH)
@@ -366,6 +518,8 @@ impl ChainSource {
 				fee_rate_update_interval
 					.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+				log_info!(logger, "Starting continuous polling for chain updates.");
+
 				// Start the polling loop.
 				loop {
 					tokio::select! {
@@ -385,6 +539,65 @@ impl ChainSource {
 					}
 				}
 			},
+		}
+	}
+
+	async fn start_tx_based_sync_loop(
+		&self, mut stop_sync_receiver: tokio::sync::watch::Receiver<()>,
+		channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
+		output_sweeper: Arc<Sweeper>, background_sync_config: &BackgroundSyncConfig,
+		logger: Arc<Logger>,
+	) {
+		// Setup syncing intervals
+		let onchain_wallet_sync_interval_secs = background_sync_config
+			.onchain_wallet_sync_interval_secs
+			.max(WALLET_SYNC_INTERVAL_MINIMUM_SECS);
+		let mut onchain_wallet_sync_interval =
+			tokio::time::interval(Duration::from_secs(onchain_wallet_sync_interval_secs));
+		onchain_wallet_sync_interval
+			.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+		let fee_rate_cache_update_interval_secs = background_sync_config
+			.fee_rate_cache_update_interval_secs
+			.max(WALLET_SYNC_INTERVAL_MINIMUM_SECS);
+		let mut fee_rate_update_interval =
+			tokio::time::interval(Duration::from_secs(fee_rate_cache_update_interval_secs));
+		// When starting up, we just blocked on updating, so skip the first tick.
+		fee_rate_update_interval.reset();
+		fee_rate_update_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+		let lightning_wallet_sync_interval_secs = background_sync_config
+			.lightning_wallet_sync_interval_secs
+			.max(WALLET_SYNC_INTERVAL_MINIMUM_SECS);
+		let mut lightning_wallet_sync_interval =
+			tokio::time::interval(Duration::from_secs(lightning_wallet_sync_interval_secs));
+		lightning_wallet_sync_interval
+			.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+		// Start the syncing loop.
+		loop {
+			tokio::select! {
+				_ = stop_sync_receiver.changed() => {
+					log_trace!(
+						logger,
+						"Stopping background syncing on-chain wallet.",
+						);
+					return;
+				}
+				_ = onchain_wallet_sync_interval.tick() => {
+					let _ = self.sync_onchain_wallet().await;
+				}
+				_ = fee_rate_update_interval.tick() => {
+					let _ = self.update_fee_rate_estimates().await;
+				}
+				_ = lightning_wallet_sync_interval.tick() => {
+					let _ = self.sync_lightning_wallet(
+						Arc::clone(&channel_manager),
+						Arc::clone(&chain_monitor),
+						Arc::clone(&output_sweeper),
+						).await;
+				}
+			}
 		}
 	}
 
@@ -507,6 +720,98 @@ impl ChainSource {
 
 				res
 			},
+			Self::Electrum {
+				electrum_runtime_status,
+				onchain_wallet,
+				onchain_wallet_sync_status,
+				kv_store,
+				logger,
+				node_metrics,
+				..
+			} => {
+				let electrum_client: Arc<ElectrumRuntimeClient> = if let Some(client) =
+					electrum_runtime_status.read().unwrap().client().as_ref()
+				{
+					Arc::clone(client)
+				} else {
+					debug_assert!(
+						false,
+						"We should have started the chain source before syncing the onchain wallet"
+					);
+					return Err(Error::FeerateEstimationUpdateFailed);
+				};
+				let receiver_res = {
+					let mut status_lock = onchain_wallet_sync_status.lock().unwrap();
+					status_lock.register_or_subscribe_pending_sync()
+				};
+				if let Some(mut sync_receiver) = receiver_res {
+					log_info!(logger, "Sync in progress, skipping.");
+					return sync_receiver.recv().await.map_err(|e| {
+						debug_assert!(false, "Failed to receive wallet sync result: {:?}", e);
+						log_error!(logger, "Failed to receive wallet sync result: {:?}", e);
+						Error::WalletOperationFailed
+					})?;
+				}
+
+				// If this is our first sync, do a full scan with the configured gap limit.
+				// Otherwise just do an incremental sync.
+				let incremental_sync =
+					node_metrics.read().unwrap().latest_onchain_wallet_sync_timestamp.is_some();
+
+				let apply_wallet_update =
+					|update_res: Result<BdkUpdate, Error>, now: Instant| match update_res {
+						Ok(update) => match onchain_wallet.apply_update(update) {
+							Ok(()) => {
+								log_info!(
+									logger,
+									"{} of on-chain wallet finished in {}ms.",
+									if incremental_sync { "Incremental sync" } else { "Sync" },
+									now.elapsed().as_millis()
+								);
+								let unix_time_secs_opt = SystemTime::now()
+									.duration_since(UNIX_EPOCH)
+									.ok()
+									.map(|d| d.as_secs());
+								{
+									let mut locked_node_metrics = node_metrics.write().unwrap();
+									locked_node_metrics.latest_onchain_wallet_sync_timestamp =
+										unix_time_secs_opt;
+									write_node_metrics(
+										&*locked_node_metrics,
+										Arc::clone(&kv_store),
+										Arc::clone(&logger),
+									)?;
+								}
+								Ok(())
+							},
+							Err(e) => Err(e),
+						},
+						Err(e) => Err(e),
+					};
+
+				let cached_txs = onchain_wallet.get_cached_txs();
+
+				let res = if incremental_sync {
+					let incremental_sync_request = onchain_wallet.get_incremental_sync_request();
+					let incremental_sync_fut = electrum_client
+						.get_incremental_sync_wallet_update(incremental_sync_request, cached_txs);
+
+					let now = Instant::now();
+					let update_res = incremental_sync_fut.await.map(|u| u.into());
+					apply_wallet_update(update_res, now)
+				} else {
+					let full_scan_request = onchain_wallet.get_full_scan_request();
+					let full_scan_fut =
+						electrum_client.get_full_scan_wallet_update(full_scan_request, cached_txs);
+					let now = Instant::now();
+					let update_res = full_scan_fut.await.map(|u| u.into());
+					apply_wallet_update(update_res, now)
+				};
+
+				onchain_wallet_sync_status.lock().unwrap().propagate_result_to_subscribers(res);
+
+				res
+			},
 			Self::BitcoindRpc { .. } => {
 				// In BitcoindRpc mode we sync lightning and onchain wallet in one go by via
 				// `ChainPoller`. So nothing to do here.
@@ -607,6 +912,77 @@ impl ChainSource {
 
 				res
 			},
+			Self::Electrum {
+				electrum_runtime_status,
+				lightning_wallet_sync_status,
+				kv_store,
+				logger,
+				node_metrics,
+				..
+			} => {
+				let electrum_client: Arc<ElectrumRuntimeClient> = if let Some(client) =
+					electrum_runtime_status.read().unwrap().client().as_ref()
+				{
+					Arc::clone(client)
+				} else {
+					debug_assert!(
+							false,
+							"We should have started the chain source before syncing the lightning wallet"
+						);
+					return Err(Error::TxSyncFailed);
+				};
+
+				let sync_cman = Arc::clone(&channel_manager);
+				let sync_cmon = Arc::clone(&chain_monitor);
+				let sync_sweeper = Arc::clone(&output_sweeper);
+				let confirmables = vec![
+					sync_cman as Arc<dyn Confirm + Sync + Send>,
+					sync_cmon as Arc<dyn Confirm + Sync + Send>,
+					sync_sweeper as Arc<dyn Confirm + Sync + Send>,
+				];
+
+				let receiver_res = {
+					let mut status_lock = lightning_wallet_sync_status.lock().unwrap();
+					status_lock.register_or_subscribe_pending_sync()
+				};
+				if let Some(mut sync_receiver) = receiver_res {
+					log_info!(logger, "Sync in progress, skipping.");
+					return sync_receiver.recv().await.map_err(|e| {
+						debug_assert!(false, "Failed to receive wallet sync result: {:?}", e);
+						log_error!(logger, "Failed to receive wallet sync result: {:?}", e);
+						Error::TxSyncFailed
+					})?;
+				}
+
+				let res = electrum_client.sync_confirmables(confirmables).await;
+
+				if let Ok(_) = res {
+					let unix_time_secs_opt =
+						SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
+					{
+						let mut locked_node_metrics = node_metrics.write().unwrap();
+						locked_node_metrics.latest_lightning_wallet_sync_timestamp =
+							unix_time_secs_opt;
+						write_node_metrics(
+							&*locked_node_metrics,
+							Arc::clone(&kv_store),
+							Arc::clone(&logger),
+						)?;
+					}
+
+					periodically_archive_fully_resolved_monitors(
+						Arc::clone(&channel_manager),
+						Arc::clone(&chain_monitor),
+						Arc::clone(&kv_store),
+						Arc::clone(&logger),
+						Arc::clone(&node_metrics),
+					)?;
+				}
+
+				lightning_wallet_sync_status.lock().unwrap().propagate_result_to_subscribers(res);
+
+				res
+			},
 			Self::BitcoindRpc { .. } => {
 				// In BitcoindRpc mode we sync lightning and onchain wallet in one go by via
 				// `ChainPoller`. So nothing to do here.
@@ -622,6 +998,11 @@ impl ChainSource {
 		match self {
 			Self::Esplora { .. } => {
 				// In Esplora mode we sync lightning and onchain wallets via
+				// `sync_onchain_wallet` and `sync_lightning_wallet`. So nothing to do here.
+				unreachable!("Listeners will be synced via transction-based syncing")
+			},
+			Self::Electrum { .. } => {
+				// In Electrum mode we sync lightning and onchain wallets via
 				// `sync_onchain_wallet` and `sync_lightning_wallet`. So nothing to do here.
 				unreachable!("Listeners will be synced via transction-based syncing")
 			},
@@ -687,13 +1068,15 @@ impl ChainSource {
 					&mut *locked_header_cache,
 					&chain_listener,
 				);
-				let mut chain_polling_interval =
-					tokio::time::interval(Duration::from_secs(CHAIN_POLLING_INTERVAL_SECS));
-				chain_polling_interval
-					.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+				let now = SystemTime::now();
 				match spv_client.poll_best_tip().await {
 					Ok((ChainTip::Better(tip), true)) => {
+						log_trace!(
+							logger,
+							"Finished polling best tip in {}ms",
+							now.elapsed().unwrap().as_millis()
+						);
 						*latest_chain_tip.write().unwrap() = Some(tip);
 					},
 					Ok(_) => {},
@@ -706,11 +1089,19 @@ impl ChainSource {
 				}
 
 				let cur_height = channel_manager.current_best_block().height;
+
+				let now = SystemTime::now();
 				match bitcoind_rpc_client
 					.get_mempool_transactions_and_timestamp_at_height(cur_height)
 					.await
 				{
 					Ok(unconfirmed_txs) => {
+						log_trace!(
+							logger,
+							"Finished polling mempool of size {} in {}ms",
+							unconfirmed_txs.len(),
+							now.elapsed().unwrap().as_millis()
+						);
 						let _ = onchain_wallet.apply_unconfirmed_txs(unconfirmed_txs);
 					},
 					Err(e) => {
@@ -791,18 +1182,12 @@ impl ChainSource {
 				for target in confirmation_targets {
 					let num_blocks = get_num_block_defaults_for_target(target);
 
+					// Convert the retrieved fee rate and fall back to 1 sat/vb if we fail or it
+					// yields less than that. This is mostly necessary to continue on
+					// `signet`/`regtest` where we might not get estimates (or bogus values).
 					let converted_estimate_sat_vb =
-						esplora_client::convert_fee_rate(num_blocks, estimates.clone()).map_err(
-							|e| {
-								log_error!(
-									logger,
-									"Failed to convert fee rate estimates for {:?}: {}",
-									target,
-									e
-								);
-								Error::FeerateEstimationUpdateFailed
-							},
-						)?;
+						esplora_client::convert_fee_rate(num_blocks, estimates.clone())
+							.map_or(1.0, |converted| converted.max(1.0));
 
 					let fee_rate =
 						FeeRate::from_sat_per_kwu((converted_estimate_sat_vb * 250.0) as u64);
@@ -828,6 +1213,51 @@ impl ChainSource {
 					"Fee rate cache update finished in {}ms.",
 					now.elapsed().as_millis()
 				);
+				let unix_time_secs_opt =
+					SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
+				{
+					let mut locked_node_metrics = node_metrics.write().unwrap();
+					locked_node_metrics.latest_fee_rate_cache_update_timestamp = unix_time_secs_opt;
+					write_node_metrics(
+						&*locked_node_metrics,
+						Arc::clone(&kv_store),
+						Arc::clone(&logger),
+					)?;
+				}
+
+				Ok(())
+			},
+			Self::Electrum {
+				electrum_runtime_status,
+				fee_estimator,
+				kv_store,
+				logger,
+				node_metrics,
+				..
+			} => {
+				let electrum_client: Arc<ElectrumRuntimeClient> = if let Some(client) =
+					electrum_runtime_status.read().unwrap().client().as_ref()
+				{
+					Arc::clone(client)
+				} else {
+					debug_assert!(
+						false,
+						"We should have started the chain source before updating fees"
+					);
+					return Err(Error::FeerateEstimationUpdateFailed);
+				};
+
+				let now = Instant::now();
+
+				let new_fee_rate_cache = electrum_client.get_fee_rate_cache_update().await?;
+				fee_estimator.set_fee_rate_cache(new_fee_rate_cache);
+
+				log_info!(
+					logger,
+					"Fee rate cache update finished in {}ms.",
+					now.elapsed().as_millis()
+				);
+
 				let unix_time_secs_opt =
 					SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
 				{
@@ -995,18 +1425,23 @@ impl ChainSource {
 									);
 								},
 								Err(e) => match e {
-									esplora_client::Error::Reqwest(err) => {
-										if err.status() == reqwest::StatusCode::from_u16(400).ok() {
-											// Ignore 400, as this just means bitcoind already knows the
+									esplora_client::Error::HttpResponse { status, message } => {
+										if status == 400 {
+											// Log 400 at lesser level, as this often just means bitcoind already knows the
 											// transaction.
 											// FIXME: We can further differentiate here based on the error
 											// message which will be available with rust-esplora-client 0.7 and
 											// later.
+											log_trace!(
+												logger,
+												"Failed to broadcast due to HTTP connection error: {}",
+												message
+											);
 										} else {
 											log_error!(
 												logger,
-												"Failed to broadcast due to HTTP connection error: {}",
-												err
+												"Failed to broadcast due to HTTP connection error: {} - {}",
+												status, message
 											);
 										}
 										log_trace!(
@@ -1044,6 +1479,26 @@ impl ChainSource {
 								);
 							},
 						}
+					}
+				}
+			},
+			Self::Electrum { electrum_runtime_status, tx_broadcaster, .. } => {
+				let electrum_client: Arc<ElectrumRuntimeClient> = if let Some(client) =
+					electrum_runtime_status.read().unwrap().client().as_ref()
+				{
+					Arc::clone(client)
+				} else {
+					debug_assert!(
+						false,
+						"We should have started the chain source before broadcasting"
+					);
+					return;
+				};
+
+				let mut receiver = tx_broadcaster.get_broadcast_queue().await;
+				while let Some(next_package) = receiver.recv().await {
+					for tx in next_package {
+						electrum_client.broadcast(tx).await;
 					}
 				}
 			},
@@ -1106,15 +1561,21 @@ impl ChainSource {
 }
 
 impl Filter for ChainSource {
-	fn register_tx(&self, txid: &bitcoin::Txid, script_pubkey: &bitcoin::Script) {
+	fn register_tx(&self, txid: &Txid, script_pubkey: &Script) {
 		match self {
 			Self::Esplora { tx_sync, .. } => tx_sync.register_tx(txid, script_pubkey),
+			Self::Electrum { electrum_runtime_status, .. } => {
+				electrum_runtime_status.write().unwrap().register_tx(txid, script_pubkey)
+			},
 			Self::BitcoindRpc { .. } => (),
 		}
 	}
 	fn register_output(&self, output: lightning::chain::WatchedOutput) {
 		match self {
 			Self::Esplora { tx_sync, .. } => tx_sync.register_output(output),
+			Self::Electrum { electrum_runtime_status, .. } => {
+				electrum_runtime_status.write().unwrap().register_output(output)
+			},
 			Self::BitcoindRpc { .. } => (),
 		}
 	}
@@ -1122,7 +1583,7 @@ impl Filter for ChainSource {
 
 fn periodically_archive_fully_resolved_monitors(
 	channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
-	kv_store: Arc<DynStore>, logger: Arc<FilesystemLogger>, node_metrics: Arc<RwLock<NodeMetrics>>,
+	kv_store: Arc<DynStore>, logger: Arc<Logger>, node_metrics: Arc<RwLock<NodeMetrics>>,
 ) -> Result<(), Error> {
 	let mut locked_node_metrics = node_metrics.write().unwrap();
 	let cur_height = channel_manager.current_best_block().height;

@@ -5,26 +5,29 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use crate::types::{DynStore, Sweeper, Wallet};
+use crate::types::{CustomTlvRecord, DynStore, Sweeper, Wallet};
 
 use crate::{
-	hex_utils, BumpTransactionEventHandler, ChannelManager, Config, Error, Graph, PeerInfo,
-	PeerStore, TlvEntry, UserChannelId,
+	hex_utils, BumpTransactionEventHandler, ChannelManager, Error, Graph, PeerInfo, PeerStore,
+	TlvEntry, UserChannelId,
 };
 
+use crate::config::{may_announce_channel, Config};
 use crate::connection::ConnectionManager;
 use crate::fee_estimator::ConfirmationTarget;
+use crate::liquidity::LiquiditySource;
+use crate::logger::Logger;
 
 use crate::payment::store::{
 	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
-	PaymentStore,
+	PaymentStore, PaymentStoreUpdateResult,
 };
 
 use crate::io::{
 	EVENT_QUEUE_PERSISTENCE_KEY, EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
 	EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
 };
-use crate::logger::{log_debug, log_error, log_info, Logger};
+use crate::logger::{log_debug, log_error, log_info, LdkLogger};
 
 use lightning::events::bump_transaction::BumpTransactionEvent;
 use lightning::events::{ClosureReason, PaymentPurpose, ReplayEvent};
@@ -32,10 +35,11 @@ use lightning::events::{Event as LdkEvent, PaymentFailureReason};
 use lightning::impl_writeable_tlv_based_enum;
 use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::types::ChannelId;
-use lightning::ln::PaymentHash;
 use lightning::routing::gossip::NodeId;
 use lightning::util::errors::APIError;
 use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
+
+use lightning_types::payment::{PaymentHash, PaymentPreimage};
 
 use lightning_liquidity::lsps2::utils::compute_opening_fee;
 
@@ -66,6 +70,12 @@ pub enum Event {
 		payment_id: Option<PaymentId>,
 		/// The hash of the payment.
 		payment_hash: PaymentHash,
+		/// The preimage to the `payment_hash`.
+		///
+		/// Note that this serves as a payment receipt.
+		///
+		/// Will only be `None` for events serialized with LDK Node v0.4.2 or prior.
+		payment_preimage: Option<PaymentPreimage>,
 		/// The total fee which was spent at intermediate hops in this payment.
 		fee_paid_msat: Option<u64>,
 	},
@@ -97,6 +107,62 @@ pub enum Event {
 		payment_hash: PaymentHash,
 		/// The value, in thousandths of a satoshi, that has been received.
 		amount_msat: u64,
+		/// Custom TLV records received on the payment
+		custom_records: Vec<CustomTlvRecord>,
+	},
+	/// A payment has been forwarded.
+	PaymentForwarded {
+		/// The channel id of the incoming channel between the previous node and us.
+		prev_channel_id: ChannelId,
+		/// The channel id of the outgoing channel between the next node and us.
+		next_channel_id: ChannelId,
+		/// The `user_channel_id` of the incoming channel between the previous node and us.
+		///
+		/// Will only be `None` for events serialized with LDK Node v0.3.0 or prior.
+		prev_user_channel_id: Option<UserChannelId>,
+		/// The `user_channel_id` of the outgoing channel between the next node and us.
+		///
+		/// This will be `None` if the payment was settled via an on-chain transaction. See the
+		/// caveat described for the `total_fee_earned_msat` field.
+		next_user_channel_id: Option<UserChannelId>,
+		/// The node id of the previous node.
+		///
+		/// This is only `None` for HTLCs received prior to LDK Node v0.5 or for events serialized by
+		/// versions prior to v0.5.
+		prev_node_id: Option<PublicKey>,
+		/// The node id of the next node.
+		///
+		/// This is only `None` for HTLCs received prior to LDK Node v0.5 or for events serialized by
+		/// versions prior to v0.5.
+		next_node_id: Option<PublicKey>,
+		/// The total fee, in milli-satoshis, which was earned as a result of the payment.
+		///
+		/// Note that if we force-closed the channel over which we forwarded an HTLC while the HTLC
+		/// was pending, the amount the next hop claimed will have been rounded down to the nearest
+		/// whole satoshi. Thus, the fee calculated here may be higher than expected as we still
+		/// claimed the full value in millisatoshis from the source. In this case,
+		/// `claim_from_onchain_tx` will be set.
+		///
+		/// If the channel which sent us the payment has been force-closed, we will claim the funds
+		/// via an on-chain transaction. In that case we do not yet know the on-chain transaction
+		/// fees which we will spend and will instead set this to `None`.
+		total_fee_earned_msat: Option<u64>,
+		/// The share of the total fee, in milli-satoshis, which was withheld in addition to the
+		/// forwarding fee.
+		///
+		/// This will only be `Some` if we forwarded an intercepted HTLC with less than the
+		/// expected amount. This means our counterparty accepted to receive less than the invoice
+		/// amount.
+		///
+		/// The caveat described above the `total_fee_earned_msat` field applies here as well.
+		skimmed_fee_msat: Option<u64>,
+		/// If this is `true`, the forwarded HTLC was claimed by our counterparty via an on-chain
+		/// transaction.
+		claim_from_onchain_tx: bool,
+		/// The final amount forwarded, in milli-satoshis, after the fee is deducted.
+		///
+		/// The caveat described above the `total_fee_earned_msat` field applies here as well.
+		outbound_amount_forwarded_msat: Option<u64>,
 	},
 	/// A payment for a previously-registered payment hash has been received.
 	///
@@ -119,6 +185,8 @@ pub enum Event {
 		/// The block height at which this payment will be failed back and will no longer be
 		/// eligible for claiming.
 		claim_deadline: Option<u32>,
+		/// Custom TLV records attached to the payment
+		custom_records: Vec<CustomTlvRecord>,
 	},
 	/// A channel has been created and is pending confirmation on-chain.
 	ChannelPending {
@@ -164,6 +232,7 @@ impl_writeable_tlv_based_enum!(Event,
 		(0, payment_hash, required),
 		(1, fee_paid_msat, option),
 		(3, payment_id, option),
+		(5, payment_preimage, option),
 	},
 	(1, PaymentFailed) => {
 		(0, payment_hash, option),
@@ -174,6 +243,7 @@ impl_writeable_tlv_based_enum!(Event,
 		(0, payment_hash, required),
 		(1, payment_id, option),
 		(2, amount_msat, required),
+		(3, custom_records, optional_vec),
 	},
 	(3, ChannelReady) => {
 		(0, channel_id, required),
@@ -198,12 +268,25 @@ impl_writeable_tlv_based_enum!(Event,
 		(2, payment_id, required),
 		(4, claimable_amount_msat, required),
 		(6, claim_deadline, option),
+		(7, custom_records, optional_vec),
+	},
+	(7, PaymentForwarded) => {
+		(0, prev_channel_id, required),
+		(1, prev_node_id, option),
+		(2, next_channel_id, required),
+		(3, next_node_id, option),
+		(4, prev_user_channel_id, option),
+		(6, next_user_channel_id, option),
+		(8, total_fee_earned_msat, option),
+		(10, skimmed_fee_msat, option),
+		(12, claim_from_onchain_tx, required),
+		(14, outbound_amount_forwarded_msat, option),
 	}
 );
 
 pub struct EventQueue<L: Deref>
 where
-	L::Target: Logger,
+	L::Target: LdkLogger,
 {
 	queue: Arc<Mutex<VecDeque<Event>>>,
 	waker: Arc<Mutex<Option<Waker>>>,
@@ -214,7 +297,7 @@ where
 
 impl<L: Deref> EventQueue<L>
 where
-	L::Target: Logger,
+	L::Target: LdkLogger,
 {
 	pub(crate) fn new(kv_store: Arc<DynStore>, logger: L) -> Self {
 		let queue = Arc::new(Mutex::new(VecDeque::new()));
@@ -293,7 +376,7 @@ where
 
 impl<L: Deref> ReadableArgs<(Arc<DynStore>, L)> for EventQueue<L>
 where
-	L::Target: Logger,
+	L::Target: LdkLogger,
 {
 	#[inline]
 	fn read<R: lightning::io::Read>(
@@ -357,7 +440,7 @@ impl Future for EventFuture {
 
 pub(crate) struct EventHandler<L: Deref + Clone + Sync + Send + 'static>
 where
-	L::Target: Logger,
+	L::Target: LdkLogger,
 {
 	event_queue: Arc<EventQueue<L>>,
 	wallet: Arc<Wallet>,
@@ -366,6 +449,7 @@ where
 	connection_manager: Arc<ConnectionManager<L>>,
 	output_sweeper: Arc<Sweeper>,
 	network_graph: Arc<Graph>,
+	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 	payment_store: Arc<PaymentStore<L>>,
 	peer_store: Arc<PeerStore<L>>,
 	runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>,
@@ -375,13 +459,14 @@ where
 
 impl<L: Deref + Clone + Sync + Send + 'static> EventHandler<L>
 where
-	L::Target: Logger,
+	L::Target: LdkLogger,
 {
 	pub fn new(
 		event_queue: Arc<EventQueue<L>>, wallet: Arc<Wallet>,
 		bump_tx_event_handler: Arc<BumpTransactionEventHandler>,
 		channel_manager: Arc<ChannelManager>, connection_manager: Arc<ConnectionManager<L>>,
 		output_sweeper: Arc<Sweeper>, network_graph: Arc<Graph>,
+		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 		payment_store: Arc<PaymentStore<L>>, peer_store: Arc<PeerStore<L>>,
 		runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>, logger: L, config: Arc<Config>,
 	) -> Self {
@@ -393,6 +478,7 @@ where
 			connection_manager,
 			output_sweeper,
 			network_graph,
+			liquidity_source,
 			payment_store,
 			peer_store,
 			logger,
@@ -484,6 +570,7 @@ where
 				claim_deadline,
 				onion_fields,
 				counterparty_skimmed_fee_msat,
+				payment_id: _,
 			} => {
 				let payment_id = PaymentId(payment_hash.0);
 				if let Some(info) = self.payment_store.get(&payment_id) {
@@ -573,6 +660,26 @@ where
 						};
 					}
 
+					// If the LSP skimmed anything, update our stored payment.
+					if counterparty_skimmed_fee_msat > 0 {
+						match info.kind {
+							PaymentKind::Bolt11Jit { .. } => {
+								let update = PaymentDetailsUpdate {
+									counterparty_skimmed_fee_msat: Some(Some(counterparty_skimmed_fee_msat)),
+									..PaymentDetailsUpdate::new(payment_id)
+								};
+								match self.payment_store.update(&update) {
+									Ok(_) => (),
+									Err(e) => {
+										log_error!(self.logger, "Failed to access payment store: {}", e);
+										return Err(ReplayEvent());
+									},
+								};
+							}
+							_ => debug_assert!(false, "We only expect the counterparty to get away with withholding fees for JIT payments."),
+						}
+					}
+
 					// If this is known by the store but ChannelManager doesn't know the preimage,
 					// the payment has been registered via `_for_hash` variants and needs to be manually claimed via
 					// user interaction.
@@ -584,11 +691,17 @@ where
 									"We would have registered the preimage if we knew"
 								);
 
+								let custom_records = onion_fields
+									.map(|cf| {
+										cf.custom_tlvs().into_iter().map(|tlv| tlv.into()).collect()
+									})
+									.unwrap_or_default();
 								let event = Event::PaymentClaimable {
 									payment_id,
 									payment_hash,
 									claimable_amount_msat: amount_msat,
 									claim_deadline,
+									custom_records,
 								};
 								match self.event_queue.add_event(event) {
 									Ok(_) => return Ok(()),
@@ -639,6 +752,7 @@ where
 							payment_id,
 							kind,
 							Some(amount_msat),
+							None,
 							PaymentDirection::Inbound,
 							PaymentStatus::Pending,
 						);
@@ -669,6 +783,7 @@ where
 						payment_preimage
 					},
 					PaymentPurpose::SpontaneousPayment(preimage) => {
+						// TODO: use CustomTlvRecord instead of TlvEntry
 						let custom_tlvs = onion_fields
 							.map(|of| {
 								of.custom_tlvs()
@@ -696,6 +811,7 @@ where
 							payment_id,
 							kind,
 							Some(amount_msat),
+							None,
 							PaymentDirection::Inbound,
 							PaymentStatus::Pending,
 						);
@@ -767,7 +883,8 @@ where
 				receiver_node_id: _,
 				htlcs: _,
 				sender_intended_total_msat: _,
-				onion_fields: _,
+				onion_fields,
+				payment_id: _,
 			} => {
 				let payment_id = PaymentId(payment_hash.0);
 				log_info!(
@@ -819,14 +936,17 @@ where
 				};
 
 				match self.payment_store.update(&update) {
-					Ok(true) => (),
-					Ok(false) => {
+					Ok(PaymentStoreUpdateResult::Updated)
+					| Ok(PaymentStoreUpdateResult::Unchanged) => (
+						// No need to do anything if the idempotent update was applied, which might
+						// be the result of a replayed event.
+					),
+					Ok(PaymentStoreUpdateResult::NotFound) => {
 						log_error!(
 							self.logger,
-							"Payment with ID {} couldn't be found in store",
+							"Claimed payment with ID {} couldn't be found in store",
 							payment_id,
 						);
-						debug_assert!(false);
 					},
 					Err(e) => {
 						log_error!(
@@ -843,6 +963,9 @@ where
 					payment_id: Some(payment_id),
 					payment_hash,
 					amount_msat,
+					custom_records: onion_fields
+						.map(|cf| cf.custom_tlvs().into_iter().map(|tlv| tlv.into()).collect())
+						.unwrap_or_default(),
 				};
 				match self.event_queue.add_event(event) {
 					Ok(_) => return Ok(()),
@@ -869,6 +992,7 @@ where
 				let update = PaymentDetailsUpdate {
 					hash: Some(Some(payment_hash)),
 					preimage: Some(Some(payment_preimage)),
+					fee_paid_msat: Some(fee_paid_msat),
 					status: Some(PaymentStatus::Succeeded),
 					fee_msat: Some(fee_paid_msat),
 					..PaymentDetailsUpdate::new(payment_id)
@@ -900,6 +1024,7 @@ where
 				let event = Event::PaymentSuccessful {
 					payment_id: Some(payment_id),
 					payment_hash,
+					payment_preimage: Some(payment_preimage),
 					fee_paid_msat,
 				};
 
@@ -947,7 +1072,11 @@ where
 			LdkEvent::PaymentPathFailed { .. } => {},
 			LdkEvent::ProbeSuccessful { .. } => {},
 			LdkEvent::ProbeFailed { .. } => {},
-			LdkEvent::HTLCHandlingFailed { .. } => {},
+			LdkEvent::HTLCHandlingFailed { failed_next_destination, .. } => {
+				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
+					liquidity_source.handle_htlc_handling_failed(failed_next_destination);
+				}
+			},
 			LdkEvent::PendingHTLCsForwardable { time_forwardable } => {
 				let forwarding_channel_manager = self.channel_manager.clone();
 				let min = time_forwardable.as_millis() as u64;
@@ -978,16 +1107,28 @@ where
 				counterparty_node_id,
 				funding_satoshis,
 				channel_type,
-				push_msat: _,
-				is_announced: _,
+				channel_negotiation_type: _,
+				is_announced,
 				params: _,
 			} => {
+				if is_announced {
+					if let Err(err) = may_announce_channel(&*self.config) {
+						log_error!(self.logger, "Rejecting inbound announced channel from peer {} due to missing configuration: {}", counterparty_node_id, err);
+
+						self.channel_manager
+							.force_close_without_broadcasting_txn(
+								&temporary_channel_id,
+								&counterparty_node_id,
+								"Channel request rejected".to_string(),
+							)
+							.unwrap_or_else(|e| {
+								log_error!(self.logger, "Failed to reject channel: {:?}", e)
+							});
+						return Ok(());
+					}
+				}
+
 				let anchor_channel = channel_type.requires_anchors_zero_fee_htlc_tx();
-
-				// TODO: We should use `is_announced` flag above and reject announced channels if
-				// we're not a forwading node, once we add a 'forwarding mode' based on listening
-				// address / node alias being set.
-
 				if anchor_channel {
 					if let Some(anchor_channels_config) =
 						self.config.anchor_channels_config.as_ref()
@@ -1131,10 +1272,14 @@ where
 			LdkEvent::PaymentForwarded {
 				prev_channel_id,
 				next_channel_id,
+				prev_user_channel_id,
+				next_user_channel_id,
+				prev_node_id,
+				next_node_id,
 				total_fee_earned_msat,
+				skimmed_fee_msat,
 				claim_from_onchain_tx,
 				outbound_amount_forwarded_msat,
-				..
 			} => {
 				let read_only_network_graph = self.network_graph.read_only();
 				let nodes = read_only_network_graph.nodes();
@@ -1168,14 +1313,13 @@ where
 					format!(" to {}{}", node_str(&next_channel_id), channel_str(&next_channel_id));
 
 				let fee_earned = total_fee_earned_msat.unwrap_or(0);
-				let outbound_amount_forwarded_msat = outbound_amount_forwarded_msat.unwrap_or(0);
 				if claim_from_onchain_tx {
 					log_info!(
 						self.logger,
 						"Forwarded payment{}{} of {}msat, earning {}msat in fees from claiming onchain.",
 						from_prev_str,
 						to_next_str,
-						outbound_amount_forwarded_msat,
+						outbound_amount_forwarded_msat.unwrap_or(0),
 						fee_earned,
 					);
 				} else {
@@ -1184,10 +1328,31 @@ where
 						"Forwarded payment{}{} of {}msat, earning {}msat in fees.",
 						from_prev_str,
 						to_next_str,
-						outbound_amount_forwarded_msat,
+						outbound_amount_forwarded_msat.unwrap_or(0),
 						fee_earned,
 					);
 				}
+
+				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
+					liquidity_source.handle_payment_forwarded(next_channel_id);
+				}
+
+				let event = Event::PaymentForwarded {
+					prev_channel_id: prev_channel_id.expect("prev_channel_id expected for events generated by LDK versions greater than 0.0.107."),
+					next_channel_id: next_channel_id.expect("next_channel_id expected for events generated by LDK versions greater than 0.0.107."),
+					prev_user_channel_id: prev_user_channel_id.map(UserChannelId),
+					next_user_channel_id: next_user_channel_id.map(UserChannelId),
+					prev_node_id,
+					next_node_id,
+					total_fee_earned_msat,
+					skimmed_fee_msat,
+					claim_from_onchain_tx,
+					outbound_amount_forwarded_msat,
+				};
+				self.event_queue.add_event(event).map_err(|e| {
+					log_error!(self.logger, "Failed to push to event queue: {}", e);
+					ReplayEvent()
+				})?;
 			},
 			LdkEvent::ChannelPending {
 				channel_id,
@@ -1261,6 +1426,14 @@ where
 					counterparty_node_id,
 				);
 
+				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
+					liquidity_source.handle_channel_ready(
+						user_channel_id,
+						&channel_id,
+						&counterparty_node_id,
+					);
+				}
+
 				let event = Event::ChannelReady {
 					channel_id,
 					user_channel_id: UserChannelId(user_channel_id),
@@ -1305,7 +1478,22 @@ where
 				};
 			},
 			LdkEvent::DiscardFunding { .. } => {},
-			LdkEvent::HTLCIntercepted { .. } => {},
+			LdkEvent::HTLCIntercepted {
+				requested_next_hop_scid,
+				intercept_id,
+				expected_outbound_amount_msat,
+				payment_hash,
+				..
+			} => {
+				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
+					liquidity_source.handle_htlc_intercepted(
+						requested_next_hop_scid,
+						intercept_id,
+						expected_outbound_amount_msat,
+						payment_hash,
+					);
+				}
+			},
 			LdkEvent::InvoiceReceived { .. } => {
 				debug_assert!(false, "We currently don't handle BOLT12 invoices manually, so this event should never be emitted.");
 			},
@@ -1337,30 +1525,29 @@ where
 				}
 			},
 			LdkEvent::BumpTransaction(bte) => {
-				let (channel_id, counterparty_node_id) = match bte {
+				match bte {
 					BumpTransactionEvent::ChannelClose {
 						ref channel_id,
 						ref counterparty_node_id,
 						..
-					} => (channel_id, counterparty_node_id),
-					BumpTransactionEvent::HTLCResolution {
-						ref channel_id,
-						ref counterparty_node_id,
-						..
-					} => (channel_id, counterparty_node_id),
-				};
-
-				if let Some(anchor_channels_config) = self.config.anchor_channels_config.as_ref() {
-					if anchor_channels_config
-						.trusted_peers_no_reserve
-						.contains(counterparty_node_id)
-					{
-						log_debug!(self.logger,
-							"Ignoring BumpTransactionEvent for channel {} due to trusted counterparty {}",
-							channel_id, counterparty_node_id
-						);
-						return Ok(());
-					}
+					} => {
+						// Skip bumping channel closes if our counterparty is trusted.
+						if let Some(anchor_channels_config) =
+							self.config.anchor_channels_config.as_ref()
+						{
+							if anchor_channels_config
+								.trusted_peers_no_reserve
+								.contains(counterparty_node_id)
+							{
+								log_debug!(self.logger,
+									"Ignoring BumpTransactionEvent::ChannelClose for channel {} due to trusted counterparty {}",
+									channel_id, counterparty_node_id
+								);
+								return Ok(());
+							}
+						}
+					},
+					BumpTransactionEvent::HTLCResolution { .. } => {},
 				}
 
 				self.bump_tx_event_handler.handle_event(&bte);

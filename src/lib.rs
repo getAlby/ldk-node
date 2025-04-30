@@ -84,8 +84,8 @@ mod gossip;
 pub mod graph;
 mod hex_utils;
 pub mod io;
-mod liquidity;
-mod logger;
+pub mod liquidity;
+pub mod logger;
 mod message_handler;
 pub mod payment;
 mod peer_store;
@@ -100,6 +100,8 @@ pub use bip39;
 pub use bitcoin;
 pub use lightning;
 pub use lightning_invoice;
+pub use lightning_liquidity;
+pub use lightning_types;
 use std::collections::HashMap;
 pub use vss_client;
 
@@ -130,7 +132,7 @@ use event::{EventHandler, EventQueue};
 use gossip::GossipSource;
 use graph::NetworkGraph;
 use io::utils::write_node_metrics;
-use liquidity::LiquiditySource;
+use liquidity::{LSPS1Liquidity, LiquiditySource};
 use payment::store::PaymentStore;
 use payment::{
 	Bolt11Payment, Bolt12Payment, OnchainPayment, PaymentDetails, SpontaneousPayment,
@@ -141,11 +143,11 @@ use types::{
 	Broadcaster, BumpTransactionEventHandler, ChainMonitor, ChannelManager, DynStore, Graph,
 	KeysManager, OnionMessenger, PeerManager, Router, Scorer, Sweeper, Wallet,
 };
-pub use types::{ChannelDetails, ChannelType, KeyValue, PeerDetails, TlvEntry, UserChannelId};
+pub use types::{ChannelDetails, CustomTlvRecord, KeyValue, PeerDetails, TlvEntry, UserChannelId};
 #[cfg(feature = "uniffi")]
 use types::{MigrateStorage, ResetState};
 
-use logger::{log_debug, log_error, log_info, log_trace, FilesystemLogger, Logger};
+use logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 
 use lightning::chain::BestBlock;
 use lightning::events::bump_transaction::Wallet as LdkWallet;
@@ -154,8 +156,6 @@ use lightning::ln::channel_state::ChannelShutdownState;
 use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::msgs::SocketAddress;
 use lightning::routing::gossip::NodeAlias;
-
-pub use lightning::util::logger::Level as LogLevel;
 
 use lightning_background_processor::process_events_async;
 
@@ -183,23 +183,23 @@ pub struct Node {
 	wallet: Arc<Wallet>,
 	chain_source: Arc<ChainSource>,
 	tx_broadcaster: Arc<Broadcaster>,
-	event_queue: Arc<EventQueue<Arc<FilesystemLogger>>>,
+	event_queue: Arc<EventQueue<Arc<Logger>>>,
 	channel_manager: Arc<ChannelManager>,
 	chain_monitor: Arc<ChainMonitor>,
 	output_sweeper: Arc<Sweeper>,
 	peer_manager: Arc<PeerManager>,
 	onion_messenger: Arc<OnionMessenger>,
-	connection_manager: Arc<ConnectionManager<Arc<FilesystemLogger>>>,
+	connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
 	keys_manager: Arc<KeysManager>,
 	network_graph: Arc<Graph>,
 	gossip_source: Arc<GossipSource>,
-	liquidity_source: Option<Arc<LiquiditySource<Arc<FilesystemLogger>>>>,
+	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 	kv_store: Arc<DynStore>,
-	logger: Arc<FilesystemLogger>,
+	logger: Arc<Logger>,
 	_router: Arc<Router>,
 	scorer: Arc<Mutex<Scorer>>,
-	peer_store: Arc<PeerStore<Arc<FilesystemLogger>>>,
-	payment_store: Arc<PaymentStore<Arc<FilesystemLogger>>>,
+	peer_store: Arc<PeerStore<Arc<Logger>>>,
+	payment_store: Arc<PaymentStore<Arc<Logger>>>,
 	is_listening: Arc<AtomicBool>,
 	node_metrics: Arc<RwLock<NodeMetrics>>,
 }
@@ -239,6 +239,12 @@ impl Node {
 			self.config.network
 		);
 
+		// Start up any runtime-dependant chain sources (e.g. Electrum)
+		self.chain_source.start(Arc::clone(&runtime)).map_err(|e| {
+			log_error!(self.logger, "Failed to start chain syncing: {}", e);
+			e
+		})?;
+
 		// Block to ensure we update our fee rate cache once on startup
 		let chain_source = Arc::clone(&self.chain_source);
 		let runtime_ref = &runtime;
@@ -277,7 +283,7 @@ impl Node {
 				loop {
 					tokio::select! {
 						_ = stop_gossip_sync.changed() => {
-							log_trace!(
+							log_debug!(
 								gossip_sync_logger,
 								"Stopping background syncing RGS gossip data.",
 							);
@@ -356,7 +362,7 @@ impl Node {
 					let peer_mgr = Arc::clone(&peer_manager_connection_handler);
 					tokio::select! {
 						_ = stop_listen.changed() => {
-							log_trace!(
+							log_debug!(
 								listening_logger,
 								"Stopping listening to inbound connections.",
 							);
@@ -397,7 +403,7 @@ impl Node {
 			loop {
 				tokio::select! {
 						_ = stop_connect.changed() => {
-							log_trace!(
+							log_debug!(
 								connect_logger,
 								"Stopping reconnecting known peers.",
 							);
@@ -462,7 +468,7 @@ impl Node {
 		let bcast_node_metrics = Arc::clone(&self.node_metrics);
 		let mut stop_bcast = self.stop_sender.subscribe();
 		let node_alias = self.config.node_alias.clone();
-		if may_announce_channel(&self.config) {
+		if may_announce_channel(&self.config).is_ok() {
 			runtime.spawn(async move {
 				// We check every 30 secs whether our last broadcast is NODE_ANN_BCAST_INTERVAL away.
 				#[cfg(not(test))]
@@ -472,7 +478,7 @@ impl Node {
 				loop {
 					tokio::select! {
 						_ = stop_bcast.changed() => {
-							log_trace!(
+							log_debug!(
 								bcast_logger,
 								"Stopping broadcasting node announcements.",
 								);
@@ -505,8 +511,10 @@ impl Node {
 								continue;
 							}
 
-							let addresses = if let Some(addresses) = bcast_config.listening_addresses.clone() {
-								addresses
+							let addresses = if let Some(announcement_addresses) = bcast_config.announcement_addresses.clone() {
+								announcement_addresses
+							} else if let Some(listening_addresses) = bcast_config.listening_addresses.clone() {
+								listening_addresses
 							} else {
 								debug_assert!(false, "We checked whether the node may announce, so listening addresses should always be set");
 								continue;
@@ -545,7 +553,7 @@ impl Node {
 			loop {
 				tokio::select! {
 						_ = stop_tx_bcast.changed() => {
-							log_trace!(
+							log_debug!(
 								tx_bcast_logger,
 								"Stopping broadcasting transactions.",
 							);
@@ -573,6 +581,7 @@ impl Node {
 			Arc::clone(&self.connection_manager),
 			Arc::clone(&self.output_sweeper),
 			Arc::clone(&self.network_graph),
+			self.liquidity_source.clone(),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.runtime),
@@ -599,7 +608,7 @@ impl Node {
 			Box::pin(async move {
 				tokio::select! {
 					_ = stop.changed() => {
-						log_trace!(
+						log_debug!(
 							sleeper_logger,
 							"Stopping processing events.",
 						);
@@ -634,7 +643,7 @@ impl Node {
 				log_error!(background_error_logger, "Failed to process events: {}", e);
 				panic!("Failed to process events");
 			});
-			log_trace!(background_stop_logger, "Events processing stopped.",);
+			log_debug!(background_stop_logger, "Events processing stopped.",);
 
 			match event_handling_stopped_sender.send(()) {
 				Ok(_) => (),
@@ -657,7 +666,7 @@ impl Node {
 				loop {
 					tokio::select! {
 						_ = stop_liquidity_handler.changed() => {
-							log_trace!(
+							log_debug!(
 								liquidity_logger,
 								"Stopping processing liquidity events.",
 							);
@@ -680,8 +689,13 @@ impl Node {
 	/// After this returns most API methods will return [`Error::NotRunning`].
 	pub fn stop(&self) -> Result<(), Error> {
 		let runtime = self.runtime.write().unwrap().take().ok_or(Error::NotRunning)?;
+		#[cfg(tokio_unstable)]
+		let metrics_runtime = Arc::clone(&runtime);
 
 		log_info!(self.logger, "Shutting down LDK Node with node ID {}...", self.node_id());
+
+		// Stop any runtime-dependant chain sources.
+		self.chain_source.stop();
 
 		// Stop the runtime.
 		match self.stop_sender.send(()) {
@@ -742,7 +756,7 @@ impl Node {
 			log_trace!(
 				self.logger,
 				"Active runtime tasks left prior to shutdown: {}",
-				runtime.metrics().active_tasks_count()
+				metrics_runtime.metrics().active_tasks_count()
 			);
 		}
 
@@ -792,6 +806,9 @@ impl Node {
 	/// Will return `Some(..)` if an event is available and `None` otherwise.
 	///
 	/// **Note:** this will always return the same event until handling is confirmed via [`Node::event_handled`].
+	///
+	/// **Caution:** Users must handle events as quickly as possible to prevent a large event backlog,
+	/// which can increase the memory footprint of [`Node`].
 	pub fn next_event(&self) -> Option<Event> {
 		self.event_queue.next_event()
 	}
@@ -801,6 +818,9 @@ impl Node {
 	/// Will asynchronously poll the event queue until the next event is ready.
 	///
 	/// **Note:** this will always return the same event until handling is confirmed via [`Node::event_handled`].
+	///
+	/// **Caution:** Users must handle events as quickly as possible to prevent a large event backlog,
+	/// which can increase the memory footprint of [`Node`].
 	pub async fn next_event_async(&self) -> Event {
 		self.event_queue.next_event_async().await
 	}
@@ -810,6 +830,9 @@ impl Node {
 	/// Will block the current thread until the next event is available.
 	///
 	/// **Note:** this will always return the same event until handling is confirmed via [`Node::event_handled`].
+	///
+	/// **Caution:** Users must handle events as quickly as possible to prevent a large event backlog,
+	/// which can increase the memory footprint of [`Node`].
 	pub fn wait_next_event(&self) -> Event {
 		self.event_queue.wait_next_event()
 	}
@@ -817,15 +840,15 @@ impl Node {
 	/// Confirm the last retrieved event handled.
 	///
 	/// **Note:** This **MUST** be called after each event has been handled.
-	pub fn event_handled(&self) {
-		self.event_queue.event_handled().unwrap_or_else(|e| {
+	pub fn event_handled(&self) -> Result<(), Error> {
+		self.event_queue.event_handled().map_err(|e| {
 			log_error!(
 				self.logger,
 				"Couldn't mark event handled due to persistence failure: {}",
 				e
 			);
-			panic!("Couldn't mark event handled due to persistence failure");
-		});
+			e
+		})
 	}
 
 	/// Returns our own node id
@@ -836,6 +859,14 @@ impl Node {
 	/// Returns our own listening addresses.
 	pub fn listening_addresses(&self) -> Option<Vec<SocketAddress>> {
 		self.config.listening_addresses.clone()
+	}
+
+	/// Returns the addresses that the node will announce to the network.
+	pub fn announcement_addresses(&self) -> Option<Vec<SocketAddress>> {
+		self.config
+			.announcement_addresses
+			.clone()
+			.or_else(|| self.config.listening_addresses.clone())
 	}
 
 	/// Returns our node alias.
@@ -852,7 +883,6 @@ impl Node {
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
 			Arc::clone(&self.connection_manager),
-			Arc::clone(&self.keys_manager),
 			self.liquidity_source.clone(),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
@@ -870,7 +900,6 @@ impl Node {
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
 			Arc::clone(&self.connection_manager),
-			Arc::clone(&self.keys_manager),
 			self.liquidity_source.clone(),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
@@ -985,6 +1014,34 @@ impl Node {
 			self.bolt11_payment(),
 			self.bolt12_payment(),
 			Arc::clone(&self.config),
+			Arc::clone(&self.logger),
+		))
+	}
+
+	/// Returns a liquidity handler allowing to request channels via the [bLIP-51 / LSPS1] protocol.
+	///
+	/// [bLIP-51 / LSPS1]: https://github.com/lightning/blips/blob/master/blip-0051.md
+	#[cfg(not(feature = "uniffi"))]
+	pub fn lsps1_liquidity(&self) -> LSPS1Liquidity {
+		LSPS1Liquidity::new(
+			Arc::clone(&self.runtime),
+			Arc::clone(&self.wallet),
+			Arc::clone(&self.connection_manager),
+			self.liquidity_source.clone(),
+			Arc::clone(&self.logger),
+		)
+	}
+
+	/// Returns a liquidity handler allowing to request channels via the [bLIP-51 / LSPS1] protocol.
+	///
+	/// [bLIP-51 / LSPS1]: https://github.com/lightning/blips/blob/master/blip-0051.md
+	#[cfg(feature = "uniffi")]
+	pub fn lsps1_liquidity(&self) -> Arc<LSPS1Liquidity> {
+		Arc::new(LSPS1Liquidity::new(
+			Arc::clone(&self.runtime),
+			Arc::clone(&self.wallet),
+			Arc::clone(&self.connection_manager),
+			self.liquidity_source.clone(),
 			Arc::clone(&self.logger),
 		))
 	}
@@ -1215,19 +1272,19 @@ impl Node {
 		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
 		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
 	) -> Result<UserChannelId, Error> {
-		if may_announce_channel(&self.config) {
-			self.open_channel_inner(
-				node_id,
-				address,
-				channel_amount_sats,
-				push_to_counterparty_msat,
-				channel_config,
-				true,
-			)
-		} else {
-			log_error!(self.logger, "Failed to open announced channel as the node hasn't been sufficiently configured to act as a forwarding node. Please make sure to configure listening addreesses and node alias");
+		if let Err(err) = may_announce_channel(&self.config) {
+			log_error!(self.logger, "Failed to open announced channel as the node hasn't been sufficiently configured to act as a forwarding node: {}", err);
 			return Err(Error::ChannelCreationFailed);
 		}
+
+		self.open_channel_inner(
+			node_id,
+			address,
+			channel_amount_sats,
+			push_to_counterparty_msat,
+			channel_config,
+			true,
+		)
 	}
 
 	/// Alby: update fee estimates separately rather than doing a full sync
@@ -1258,14 +1315,13 @@ impl Node {
 	/// Manually sync the LDK and BDK wallets with the current chain state and update the fee rate
 	/// cache.
 	///
-	/// **Note:** The wallets are regularly synced in the background, which is configurable via the
-	/// respective config object, e.g., via
-	/// [`EsploraSyncConfig::onchain_wallet_sync_interval_secs`] and
-	/// [`EsploraSyncConfig::lightning_wallet_sync_interval_secs`]. Therefore, using this blocking
-	/// sync method is almost always redundant and should be avoided where possible.
+	/// **Note:** The wallets are regularly synced in the background if background syncing is enabled
+	/// via [`EsploraSyncConfig::background_sync_config`]. Therefore, using this blocking sync method
+	/// is almost always redundant when background syncing is enabled and should be avoided where possible.
+	/// However, if background syncing is disabled (i.e., `background_sync_config` is set to `None`),
+	/// this method must be called manually to keep wallets in sync with the chain state.
 	///
-	/// [`EsploraSyncConfig::onchain_wallet_sync_interval_secs`]: crate::config::EsploraSyncConfig::onchain_wallet_sync_interval_secs
-	/// [`EsploraSyncConfig::lightning_wallet_sync_interval_secs`]: crate::config::EsploraSyncConfig::lightning_wallet_sync_interval_secs
+	/// [`EsploraSyncConfig::background_sync_config`]: crate::config::EsploraSyncConfig::background_sync_config
 	/// **Note:** this is currently used by Alby (combined with disabled background syncs) to have
 	/// dynamic sync intervals.
 	pub fn sync_wallets(&self) -> Result<(), Error> {
@@ -1283,6 +1339,13 @@ impl Node {
 				async move {
 					match chain_source.as_ref() {
 						ChainSource::Esplora { .. } => {
+							chain_source.update_fee_rate_estimates().await?;
+							chain_source
+								.sync_lightning_wallet(sync_cman, sync_cmon, sync_sweeper)
+								.await?;
+							chain_source.sync_onchain_wallet().await?;
+						},
+						ChainSource::Electrum { .. } => {
 							chain_source.update_fee_rate_estimates().await?;
 							chain_source
 								.sync_lightning_wallet(sync_cman, sync_cmon, sync_sweeper)
@@ -1619,6 +1682,25 @@ impl Node {
 	/// secret key corresponding to the given public key.
 	pub fn verify_signature(&self, msg: &[u8], sig: &str, pkey: &PublicKey) -> bool {
 		self.keys_manager.verify_signature(msg, sig, pkey)
+	}
+
+	/// Exports the current state of the scorer. The result can be shared with and merged by light nodes that only have
+	/// a limited view of the network.
+	pub fn export_pathfinding_scores(&self) -> Result<Vec<u8>, Error> {
+		self.kv_store
+			.read(
+				lightning::util::persist::SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
+				lightning::util::persist::SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
+				lightning::util::persist::SCORER_PERSISTENCE_KEY,
+			)
+			.map_err(|e| {
+				log_error!(
+					self.logger,
+					"Failed to access store while exporting pathfinding scores: {}",
+					e
+				);
+				Error::PersistenceFailed
+			})
 	}
 }
 

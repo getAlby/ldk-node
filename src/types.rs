@@ -8,7 +8,8 @@
 use crate::chain::ChainSource;
 use crate::config::ChannelConfig;
 use crate::fee_estimator::OnchainFeeEstimator;
-use crate::logger::FilesystemLogger;
+use crate::gossip::RuntimeSpawner;
+use crate::logger::Logger;
 use crate::message_handler::NodeCustomMessageHandler;
 
 use lightning::chain::chainmonitor;
@@ -25,6 +26,9 @@ use lightning::sign::InMemorySigner;
 use lightning::util::persist::KVStore;
 use lightning::util::ser::{Readable, Writeable, Writer};
 use lightning::util::sweep::OutputSweeper;
+
+use lightning_block_sync::gossip::{GossipVerifier, UtxoSource};
+
 use lightning_net_tokio::SocketDescriptor;
 
 use bitcoin::secp256k1::PublicKey;
@@ -39,7 +43,7 @@ pub(crate) type ChainMonitor = chainmonitor::ChainMonitor<
 	Arc<ChainSource>,
 	Arc<Broadcaster>,
 	Arc<OnchainFeeEstimator>,
-	Arc<FilesystemLogger>,
+	Arc<Logger>,
 	Arc<DynStore>,
 >;
 
@@ -48,8 +52,8 @@ pub(crate) type PeerManager = lightning::ln::peer_handler::PeerManager<
 	Arc<ChannelManager>,
 	Arc<dyn RoutingMessageHandler + Send + Sync>,
 	Arc<OnionMessenger>,
-	Arc<FilesystemLogger>,
-	Arc<NodeCustomMessageHandler<Arc<FilesystemLogger>>>,
+	Arc<Logger>,
+	Arc<NodeCustomMessageHandler<Arc<Logger>>>,
 	Arc<KeysManager>,
 >;
 
@@ -64,61 +68,60 @@ pub(crate) type ChannelManager = lightning::ln::channelmanager::ChannelManager<
 	Arc<KeysManager>,
 	Arc<OnchainFeeEstimator>,
 	Arc<Router>,
-	Arc<FilesystemLogger>,
+	Arc<MessageRouter>,
+	Arc<Logger>,
 >;
 
-pub(crate) type Broadcaster = crate::tx_broadcaster::TransactionBroadcaster<Arc<FilesystemLogger>>;
+pub(crate) type Broadcaster = crate::tx_broadcaster::TransactionBroadcaster<Arc<Logger>>;
 
 pub(crate) type Wallet =
-	crate::wallet::Wallet<Arc<Broadcaster>, Arc<OnchainFeeEstimator>, Arc<FilesystemLogger>>;
+	crate::wallet::Wallet<Arc<Broadcaster>, Arc<OnchainFeeEstimator>, Arc<Logger>>;
 
-pub(crate) type KeysManager = crate::wallet::WalletKeysManager<
-	Arc<Broadcaster>,
-	Arc<OnchainFeeEstimator>,
-	Arc<FilesystemLogger>,
->;
+pub(crate) type KeysManager =
+	crate::wallet::WalletKeysManager<Arc<Broadcaster>, Arc<OnchainFeeEstimator>, Arc<Logger>>;
 
 pub(crate) type Router = DefaultRouter<
 	Arc<Graph>,
-	Arc<FilesystemLogger>,
+	Arc<Logger>,
 	Arc<KeysManager>,
 	Arc<Mutex<Scorer>>,
 	ProbabilisticScoringFeeParameters,
 	Scorer,
 >;
-pub(crate) type Scorer = ProbabilisticScorer<Arc<Graph>, Arc<FilesystemLogger>>;
+pub(crate) type Scorer = ProbabilisticScorer<Arc<Graph>, Arc<Logger>>;
 
-pub(crate) type Graph = gossip::NetworkGraph<Arc<FilesystemLogger>>;
+pub(crate) type Graph = gossip::NetworkGraph<Arc<Logger>>;
 
-pub(crate) type UtxoLookup = dyn lightning::routing::utxo::UtxoLookup + Send + Sync;
+pub(crate) type UtxoLookup = GossipVerifier<RuntimeSpawner, Arc<dyn UtxoSource>, Arc<Logger>>;
 
 pub(crate) type P2PGossipSync =
-	lightning::routing::gossip::P2PGossipSync<Arc<Graph>, Arc<UtxoLookup>, Arc<FilesystemLogger>>;
+	lightning::routing::gossip::P2PGossipSync<Arc<Graph>, Arc<UtxoLookup>, Arc<Logger>>;
 pub(crate) type RapidGossipSync =
-	lightning_rapid_gossip_sync::RapidGossipSync<Arc<Graph>, Arc<FilesystemLogger>>;
+	lightning_rapid_gossip_sync::RapidGossipSync<Arc<Graph>, Arc<Logger>>;
 
 pub(crate) type GossipSync = lightning_background_processor::GossipSync<
 	Arc<P2PGossipSync>,
 	Arc<RapidGossipSync>,
 	Arc<Graph>,
 	Arc<UtxoLookup>,
-	Arc<FilesystemLogger>,
+	Arc<Logger>,
 >;
 
 pub(crate) type OnionMessenger = lightning::onion_message::messenger::OnionMessenger<
 	Arc<KeysManager>,
 	Arc<KeysManager>,
-	Arc<FilesystemLogger>,
+	Arc<Logger>,
 	Arc<ChannelManager>,
 	Arc<MessageRouter>,
 	Arc<ChannelManager>,
+	IgnoringMessageHandler,
 	IgnoringMessageHandler,
 	IgnoringMessageHandler,
 >;
 
 pub(crate) type MessageRouter = lightning::onion_message::messenger::DefaultMessageRouter<
 	Arc<Graph>,
-	Arc<FilesystemLogger>,
+	Arc<Logger>,
 	Arc<KeysManager>,
 >;
 
@@ -128,16 +131,16 @@ pub(crate) type Sweeper = OutputSweeper<
 	Arc<OnchainFeeEstimator>,
 	Arc<ChainSource>,
 	Arc<DynStore>,
-	Arc<FilesystemLogger>,
+	Arc<Logger>,
 	Arc<KeysManager>,
 >;
 
 pub(crate) type BumpTransactionEventHandler =
 	lightning::events::bump_transaction::BumpTransactionEventHandler<
 		Arc<Broadcaster>,
-		Arc<lightning::events::bump_transaction::Wallet<Arc<Wallet>, Arc<FilesystemLogger>>>,
+		Arc<lightning::events::bump_transaction::Wallet<Arc<Wallet>, Arc<Logger>>>,
 		Arc<KeysManager>,
-		Arc<FilesystemLogger>,
+		Arc<Logger>,
 	>;
 
 /// A local, potentially user-provided, identifier of a channel.
@@ -190,10 +193,39 @@ pub struct ChannelDetails {
 	/// The channel's funding transaction output, if we've negotiated the funding transaction with
 	/// our counterparty already.
 	pub funding_txo: Option<OutPoint>,
-	/// The channel type as negotiated during channel opening.
+	/// The position of the funding transaction in the chain. None if the funding transaction has
+	/// not yet been confirmed and the channel fully opened.
 	///
-	/// Will be `None` until the channel negotiation has been completed.
-	pub channel_type: Option<ChannelType>,
+	/// Note that if [`inbound_scid_alias`] is set, it will be used for invoices and inbound
+	/// payments instead of this.
+	///
+	/// For channels with [`confirmations_required`] set to `Some(0)`, [`outbound_scid_alias`] may
+	/// be used in place of this in outbound routes.
+	///
+	/// [`inbound_scid_alias`]: Self::inbound_scid_alias
+	/// [`outbound_scid_alias`]: Self::outbound_scid_alias
+	/// [`confirmations_required`]: Self::confirmations_required
+	pub short_channel_id: Option<u64>,
+	/// An optional [`short_channel_id`] alias for this channel, randomly generated by us and
+	/// usable in place of [`short_channel_id`] to reference the channel in outbound routes when
+	/// the channel has not yet been confirmed (as long as [`confirmations_required`] is
+	/// `Some(0)`).
+	///
+	/// This will be `None` as long as the channel is not available for routing outbound payments.
+	///
+	/// [`short_channel_id`]: Self::short_channel_id
+	/// [`confirmations_required`]: Self::confirmations_required
+	pub outbound_scid_alias: Option<u64>,
+	/// An optional [`short_channel_id`] alias for this channel, randomly generated by our
+	/// counterparty and usable in place of [`short_channel_id`] in invoice route hints. Our
+	/// counterparty will recognize the alias provided here in place of the [`short_channel_id`]
+	/// when they see a payment to be routed to us.
+	///
+	/// Our counterparty may choose to rotate this value at any time, though will always recognize
+	/// previous values for inbound payment forwarding.
+	///
+	/// [`short_channel_id`]: Self::short_channel_id
+	pub inbound_scid_alias: Option<u64>,
 	/// The value, in satoshis, of this channel as it appears in the funding output.
 	pub channel_value_sats: u64,
 	/// The value, in satoshis, that must always be held as a reserve in the channel for us. This
@@ -313,7 +345,9 @@ impl From<LdkChannelDetails> for ChannelDetails {
 			channel_id: value.channel_id,
 			counterparty_node_id: value.counterparty.node_id,
 			funding_txo: value.funding_txo.map(|o| o.into_bitcoin_outpoint()),
-			channel_type,
+			short_channel_id: value.short_channel_id,
+			outbound_scid_alias: value.outbound_scid_alias,
+			inbound_scid_alias: value.inbound_scid_alias,
 			channel_value_sats: value.channel_value_satoshis,
 			unspendable_punishment_reserve: value.unspendable_punishment_reserve,
 			user_channel_id: UserChannelId(value.user_channel_id),
@@ -376,12 +410,11 @@ pub struct PeerDetails {
 	pub is_connected: bool,
 }
 
-/// Custom TLV entry.
+/// Custom TLV entry. (Alby version)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlvEntry {
 	/// Type number.
 	pub r#type: u64,
-
 	/// Serialized value.
 	pub value: Vec<u8>,
 }
@@ -391,7 +424,27 @@ impl_writeable_tlv_based!(TlvEntry, {
 	(1, value, required),
 });
 
-/// KeyValue from LDK node DB
+/// Custom TLV entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomTlvRecord {
+	/// Type number.
+	pub type_num: u64,
+	/// Serialized value.
+	pub value: Vec<u8>,
+}
+
+impl_writeable_tlv_based!(CustomTlvRecord, {
+	(0, type_num, required),
+	(2, value, required),
+});
+
+impl From<&(u64, Vec<u8>)> for CustomTlvRecord {
+	fn from(tlv: &(u64, Vec<u8>)) -> Self {
+		CustomTlvRecord { type_num: tlv.0, value: tlv.1.clone() }
+	}
+}
+
+/// Alby: Fetch KeyValue from LDK node DB
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyValue {
 	/// Key.

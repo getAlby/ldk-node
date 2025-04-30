@@ -9,13 +9,12 @@ use crate::hex_utils;
 use crate::io::{
 	PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
 };
-use crate::logger::{log_error, Logger};
+use crate::logger::{log_error, LdkLogger};
 use crate::types::{DynStore, TlvEntry};
 use crate::Error;
 
 use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::msgs::DecodeError;
-use lightning::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning::offers::offer::OfferId;
 use lightning::util::ser::{Readable, Writeable};
 use lightning::util::string::UntrustedString;
@@ -24,8 +23,12 @@ use lightning::{
 	impl_writeable_tlv_based_enum, write_tlv_fields,
 };
 
+use lightning_types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
+
+use bitcoin::{BlockHash, Txid};
+
+use std::collections::hash_map;
 use std::collections::HashMap;
-use std::iter::FromIterator;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -38,7 +41,16 @@ pub struct PaymentDetails {
 	/// The kind of the payment.
 	pub kind: PaymentKind,
 	/// The amount transferred.
+	///
+	/// Will be `None` for variable-amount payments until we receive them.
 	pub amount_msat: Option<u64>,
+	/// The fees that were paid for this payment.
+	///
+	/// For Lightning payments, this will only be updated for outbound payments once they
+	/// succeeded.
+	///
+	/// Will be `None` for Lightning payments made with LDK Node v0.4.x and earlier.
+	pub fee_paid_msat: Option<u64>,
 	/// The direction of the payment.
 	pub direction: PaymentDirection,
 	/// The status of the payment.
@@ -46,39 +58,166 @@ pub struct PaymentDetails {
 	/// The timestamp, in seconds since start of the UNIX epoch, when this entry was last updated.
 	pub latest_update_timestamp: u64,
 
-	/// Last update timestamp, as seconds since Unix epoch. TODO: remove and use latest_update_timestamp
+	// Old Alby fields - duplicates of new LDK fields
+	/*/// Alby: Last update timestamp, as seconds since Unix epoch. TODO: remove and use latest_update_timestamp
 	pub last_update: u64,
-	/// Fee paid.
-	pub fee_msat: Option<u64>,
-	/// Payment creation timestamp, as seconds since Unix epoch.
+	/// Alby: Fee paid. TODO: remove and use fee_paid_msat
+	pub fee_msat: Option<u64>,*/
+	/// Alby: Payment creation timestamp, as seconds since Unix epoch.
 	pub created_at: u64,
 }
 
 impl PaymentDetails {
 	pub(crate) fn new(
-		id: PaymentId, kind: PaymentKind, amount_msat: Option<u64>, direction: PaymentDirection,
-		status: PaymentStatus,
+		id: PaymentId, kind: PaymentKind, amount_msat: Option<u64>, fee_paid_msat: Option<u64>,
+		direction: PaymentDirection, status: PaymentStatus,
 	) -> Self {
 		let latest_update_timestamp = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
 			.unwrap_or(Duration::from_secs(0))
 			.as_secs();
-
-		let last_update = 0;
-		let fee_msat = None;
 		let created_at = 0;
-
 		Self {
 			id,
 			kind,
 			amount_msat,
+			fee_paid_msat,
 			direction,
 			status,
 			latest_update_timestamp,
-			last_update,
-			fee_msat,
 			created_at,
 		}
+	}
+
+	pub(crate) fn update(&mut self, update: &PaymentDetailsUpdate) -> bool {
+		debug_assert_eq!(
+			self.id, update.id,
+			"We should only ever override payment data for the same payment id"
+		);
+
+		let mut updated = false;
+
+		macro_rules! update_if_necessary {
+			($val: expr, $update: expr) => {
+				if $val != $update {
+					$val = $update;
+					updated = true;
+				}
+			};
+		}
+
+		if let Some(hash_opt) = update.hash {
+			match self.kind {
+				PaymentKind::Bolt12Offer { ref mut hash, .. } => {
+					debug_assert_eq!(
+						self.direction,
+						PaymentDirection::Outbound,
+						"We should only ever override payment hash for outbound BOLT 12 payments"
+					);
+					debug_assert!(
+						hash.is_none() || *hash == hash_opt,
+						"We should never change a payment hash after being initially set"
+					);
+					update_if_necessary!(*hash, hash_opt);
+				},
+				PaymentKind::Bolt12Refund { ref mut hash, .. } => {
+					debug_assert_eq!(
+						self.direction,
+						PaymentDirection::Outbound,
+						"We should only ever override payment hash for outbound BOLT 12 payments"
+					);
+					debug_assert!(
+						hash.is_none() || *hash == hash_opt,
+						"We should never change a payment hash after being initially set"
+					);
+					update_if_necessary!(*hash, hash_opt);
+				},
+				_ => {
+					// We can omit updating the hash for BOLT11 payments as the payment hash
+					// will always be known from the beginning.
+				},
+			}
+		}
+		if let Some(preimage_opt) = update.preimage {
+			match self.kind {
+				PaymentKind::Bolt11 { ref mut preimage, .. } => {
+					update_if_necessary!(*preimage, preimage_opt)
+				},
+				PaymentKind::Bolt11Jit { ref mut preimage, .. } => {
+					update_if_necessary!(*preimage, preimage_opt)
+				},
+				PaymentKind::Bolt12Offer { ref mut preimage, .. } => {
+					update_if_necessary!(*preimage, preimage_opt)
+				},
+				PaymentKind::Bolt12Refund { ref mut preimage, .. } => {
+					update_if_necessary!(*preimage, preimage_opt)
+				},
+				PaymentKind::Spontaneous { ref mut preimage, .. } => {
+					update_if_necessary!(*preimage, preimage_opt)
+				},
+				_ => {},
+			}
+		}
+
+		if let Some(secret_opt) = update.secret {
+			match self.kind {
+				PaymentKind::Bolt11 { ref mut secret, .. } => {
+					update_if_necessary!(*secret, secret_opt)
+				},
+				PaymentKind::Bolt11Jit { ref mut secret, .. } => {
+					update_if_necessary!(*secret, secret_opt)
+				},
+				PaymentKind::Bolt12Offer { ref mut secret, .. } => {
+					update_if_necessary!(*secret, secret_opt)
+				},
+				PaymentKind::Bolt12Refund { ref mut secret, .. } => {
+					update_if_necessary!(*secret, secret_opt)
+				},
+				_ => {},
+			}
+		}
+
+		if let Some(amount_opt) = update.amount_msat {
+			update_if_necessary!(self.amount_msat, amount_opt);
+		}
+
+		if let Some(fee_paid_msat_opt) = update.fee_paid_msat {
+			update_if_necessary!(self.fee_paid_msat, fee_paid_msat_opt);
+		}
+
+		if let Some(skimmed_fee_msat) = update.counterparty_skimmed_fee_msat {
+			match self.kind {
+				PaymentKind::Bolt11Jit { ref mut counterparty_skimmed_fee_msat, .. } => {
+					update_if_necessary!(*counterparty_skimmed_fee_msat, skimmed_fee_msat);
+				},
+				_ => debug_assert!(
+					false,
+					"We should only ever override counterparty_skimmed_fee_msat for JIT payments"
+				),
+			}
+		}
+
+		if let Some(status) = update.status {
+			update_if_necessary!(self.status, status);
+		}
+
+		if let Some(confirmation_status) = update.confirmation_status {
+			match self.kind {
+				PaymentKind::Onchain { ref mut status, .. } => {
+					update_if_necessary!(*status, confirmation_status);
+				},
+				_ => {},
+			}
+		}
+
+		if updated {
+			self.latest_update_timestamp = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.unwrap_or(Duration::from_secs(0))
+				.as_secs();
+		}
+
+		updated
 	}
 }
 
@@ -96,10 +235,11 @@ impl Writeable for PaymentDetails {
 			(4, None::<Option<PaymentSecret>>, required),
 			(5, self.latest_update_timestamp, required),
 			(6, self.amount_msat, required),
+			(7, self.fee_paid_msat, option),
 			(8, self.direction, required),
 			(10, self.status, required),
-			(131074, Some(self.last_update), option),
-			(131076, self.fee_msat, option),
+			//(131074, Some(self.last_update), option),
+			//(131076, self.fee_msat, option),
 			(131078, Some(self.created_at), option),
 		});
 		Ok(())
@@ -120,10 +260,11 @@ impl Readable for PaymentDetails {
 			(4, secret, required),
 			(5, latest_update_timestamp, (default_value, unix_time_secs)),
 			(6, amount_msat, required),
+			(7, fee_paid_msat, option),
 			(8, direction, required),
 			(10, status, required),
-			(131074, last_update, option),
-			(131076, fee_msat, option),
+			//(131074, last_update, option),
+			//(131076, fee_msat, option),
 			(131078, created_at, option),
 		});
 
@@ -156,7 +297,14 @@ impl Readable for PaymentDetails {
 
 			if secret.is_some() {
 				if let Some(lsp_fee_limits) = lsp_fee_limits {
-					PaymentKind::Bolt11Jit { hash, preimage, secret, lsp_fee_limits }
+					let counterparty_skimmed_fee_msat = None;
+					PaymentKind::Bolt11Jit {
+						hash,
+						preimage,
+						secret,
+						counterparty_skimmed_fee_msat,
+						lsp_fee_limits,
+					}
 				} else {
 					PaymentKind::Bolt11 { hash, preimage, secret, bolt11_invoice: None }
 				}
@@ -169,11 +317,10 @@ impl Readable for PaymentDetails {
 			id,
 			kind,
 			amount_msat,
+			fee_paid_msat,
 			direction,
 			status,
 			latest_update_timestamp,
-			last_update,
-			fee_msat,
 			created_at,
 		})
 	}
@@ -214,7 +361,17 @@ impl_writeable_tlv_based_enum!(PaymentStatus,
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaymentKind {
 	/// An on-chain payment.
-	Onchain,
+	///
+	/// Payments of this kind will be considered pending until the respective transaction has
+	/// reached [`ANTI_REORG_DELAY`] confirmations on-chain.
+	///
+	/// [`ANTI_REORG_DELAY`]: lightning::chain::channelmonitor::ANTI_REORG_DELAY
+	Onchain {
+		/// The transaction identifier of this payment.
+		txid: Txid,
+		/// The confirmation status of this payment.
+		status: ConfirmationStatus,
+	},
 	/// A [BOLT 11] payment.
 	///
 	/// [BOLT 11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
@@ -228,10 +385,10 @@ pub enum PaymentKind {
 		/// The invoice that was paid.
 		bolt11_invoice: Option<String>,
 	},
-	/// A [BOLT 11] payment intended to open an [LSPS 2] just-in-time channel.
+	/// A [BOLT 11] payment intended to open an [bLIP-52 / LSPS 2] just-in-time channel.
 	///
 	/// [BOLT 11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
-	/// [LSPS 2]: https://github.com/BitcoinAndLightningLayerSpecs/lsp/blob/main/LSPS2/README.md
+	/// [bLIP-52 / LSPS2]: https://github.com/lightning/blips/blob/master/blip-0052.md
 	Bolt11Jit {
 		/// The payment hash, i.e., the hash of the `preimage`.
 		hash: PaymentHash,
@@ -239,6 +396,12 @@ pub enum PaymentKind {
 		preimage: Option<PaymentPreimage>,
 		/// The secret used by the payment.
 		secret: Option<PaymentSecret>,
+		/// The value, in thousands of a satoshi, that was deducted from this payment as an extra
+		/// fee taken by our channel counterparty.
+		///
+		/// Will only be `Some` once we received the payment. Will always be `None` for LDK Node
+		/// v0.4 and prior.
+		counterparty_skimmed_fee_msat: Option<u64>,
 		/// Limits applying to how much fee we allow an LSP to deduct from the payment amount.
 		///
 		/// Allowing them to deduct this fee from the first inbound payment will pay for the LSP's
@@ -307,7 +470,10 @@ pub enum PaymentKind {
 }
 
 impl_writeable_tlv_based_enum!(PaymentKind,
-	(0, Onchain) => {},
+	(0, Onchain) => {
+		(0, txid, required),
+		(2, status, required),
+	},
 	(2, Bolt11) => {
 		(0, hash, required),
 		(2, preimage, option),
@@ -316,6 +482,7 @@ impl_writeable_tlv_based_enum!(PaymentKind,
 	},
 	(4, Bolt11Jit) => {
 		(0, hash, required),
+		(1, counterparty_skimmed_fee_msat, option),
 		(2, preimage, option),
 		(4, secret, option),
 		(6, lsp_fee_limits, required),
@@ -340,6 +507,31 @@ impl_writeable_tlv_based_enum!(PaymentKind,
 		(3, quantity, option),
 		(4, secret, option),
 	}
+);
+
+/// Represents the confirmation status of a transaction.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ConfirmationStatus {
+	/// The transaction is confirmed in the best chain.
+	Confirmed {
+		/// The hash of the block in which the transaction was confirmed.
+		block_hash: BlockHash,
+		/// The height under which the block was confirmed.
+		height: u32,
+		/// The timestamp, in seconds since start of the UNIX epoch, when this entry was last updated.
+		timestamp: u64,
+	},
+	/// The transaction is unconfirmed.
+	Unconfirmed,
+}
+
+impl_writeable_tlv_based_enum!(ConfirmationStatus,
+	(0, Confirmed) => {
+		(0, block_hash, required),
+		(2, height, required),
+		(4, timestamp, required),
+	},
+	(2, Unconfirmed) => {},
 );
 
 /// Limits applying to how much fee we allow an LSP to deduct from the payment amount.
@@ -369,9 +561,12 @@ pub(crate) struct PaymentDetailsUpdate {
 	pub preimage: Option<Option<PaymentPreimage>>,
 	pub secret: Option<Option<PaymentSecret>>,
 	pub amount_msat: Option<Option<u64>>,
+	pub fee_paid_msat: Option<Option<u64>>,
+	pub counterparty_skimmed_fee_msat: Option<Option<u64>>,
 	pub direction: Option<PaymentDirection>,
 	pub status: Option<PaymentStatus>,
-	pub fee_msat: Option<Option<u64>>,
+	//pub fee_msat: Option<Option<u64>>, // old Alby field
+	pub confirmation_status: Option<ConfirmationStatus>,
 }
 
 impl PaymentDetailsUpdate {
@@ -382,16 +577,63 @@ impl PaymentDetailsUpdate {
 			preimage: None,
 			secret: None,
 			amount_msat: None,
+			fee_paid_msat: None,
+			counterparty_skimmed_fee_msat: None,
 			direction: None,
 			status: None,
-			fee_msat: None,
+			confirmation_status: None,
 		}
 	}
 }
 
+impl From<&PaymentDetails> for PaymentDetailsUpdate {
+	fn from(value: &PaymentDetails) -> Self {
+		let (hash, preimage, secret) = match value.kind {
+			PaymentKind::Bolt11 { hash, preimage, secret, .. } => (Some(hash), preimage, secret),
+			PaymentKind::Bolt11Jit { hash, preimage, secret, .. } => (Some(hash), preimage, secret),
+			PaymentKind::Bolt12Offer { hash, preimage, secret, .. } => (hash, preimage, secret),
+			PaymentKind::Bolt12Refund { hash, preimage, secret, .. } => (hash, preimage, secret),
+			PaymentKind::Spontaneous { hash, preimage, .. } => (Some(hash), preimage, None),
+			_ => (None, None, None),
+		};
+
+		let confirmation_status = match value.kind {
+			PaymentKind::Onchain { status, .. } => Some(status),
+			_ => None,
+		};
+
+		let counterparty_skimmed_fee_msat = match value.kind {
+			PaymentKind::Bolt11Jit { counterparty_skimmed_fee_msat, .. } => {
+				Some(counterparty_skimmed_fee_msat)
+			},
+			_ => None,
+		};
+
+		Self {
+			id: value.id,
+			hash: Some(hash),
+			preimage: Some(preimage),
+			secret: Some(secret),
+			amount_msat: Some(value.amount_msat),
+			fee_paid_msat: Some(value.fee_paid_msat),
+			counterparty_skimmed_fee_msat,
+			direction: Some(value.direction),
+			status: Some(value.status),
+			confirmation_status,
+		}
+	}
+}
+
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub(crate) enum PaymentStoreUpdateResult {
+	Updated,
+	Unchanged,
+	NotFound,
+}
+
 pub(crate) struct PaymentStore<L: Deref>
 where
-	L::Target: Logger,
+	L::Target: LdkLogger,
 {
 	payments: Mutex<HashMap<PaymentId, PaymentDetails>>,
 	kv_store: Arc<DynStore>,
@@ -400,7 +642,7 @@ where
 
 impl<L: Deref> PaymentStore<L>
 where
-	L::Target: Logger,
+	L::Target: LdkLogger,
 {
 	pub(crate) fn new(payments: Vec<PaymentDetails>, kv_store: Arc<DynStore>, logger: L) -> Self {
 		let payments = Mutex::new(HashMap::from_iter(
@@ -425,114 +667,80 @@ where
 		Ok(updated)
 	}
 
+	pub(crate) fn insert_or_update(&self, payment: &PaymentDetails) -> Result<bool, Error> {
+		let mut locked_payments = self.payments.lock().unwrap();
+
+		let updated;
+		match locked_payments.entry(payment.id) {
+			hash_map::Entry::Occupied(mut e) => {
+				let update = payment.into();
+				updated = e.get_mut().update(&update);
+				if updated {
+					self.persist_info(&payment.id, e.get())?;
+				}
+			},
+			hash_map::Entry::Vacant(e) => {
+				e.insert(payment.clone());
+				self.persist_info(&payment.id, payment)?;
+				updated = true;
+			},
+		}
+
+		Ok(updated)
+	}
+
 	pub(crate) fn remove(&self, id: &PaymentId) -> Result<(), Error> {
-		let store_key = hex_utils::to_string(&id.0);
-		self.kv_store
-			.remove(
-				PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
-				PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
-				&store_key,
-				false,
-			)
-			.map_err(|e| {
-				log_error!(
-					self.logger,
-					"Removing payment data for key {}/{}/{} failed due to: {}",
+		let removed = self.payments.lock().unwrap().remove(id).is_some();
+		if removed {
+			let store_key = hex_utils::to_string(&id.0);
+			self.kv_store
+				.remove(
 					PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
 					PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
-					store_key,
-					e
-				);
-				Error::PersistenceFailed
-			})
+					&store_key,
+					false,
+				)
+				.map_err(|e| {
+					log_error!(
+						self.logger,
+						"Removing payment data for key {}/{}/{} failed due to: {}",
+						PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+						PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+						store_key,
+						e
+					);
+					Error::PersistenceFailed
+				})?;
+		}
+		Ok(())
 	}
 
 	pub(crate) fn get(&self, id: &PaymentId) -> Option<PaymentDetails> {
 		self.payments.lock().unwrap().get(id).cloned()
 	}
 
-	pub(crate) fn update(&self, update: &PaymentDetailsUpdate) -> Result<bool, Error> {
-		let mut updated = false;
+	pub(crate) fn update(
+		&self, update: &PaymentDetailsUpdate,
+	) -> Result<PaymentStoreUpdateResult, Error> {
 		let mut locked_payments = self.payments.lock().unwrap();
 
 		if let Some(payment) = locked_payments.get_mut(&update.id) {
-			if let Some(hash_opt) = update.hash {
-				match payment.kind {
-					PaymentKind::Bolt12Offer { ref mut hash, .. } => {
-						debug_assert_eq!(payment.direction, PaymentDirection::Outbound,
-							"We should only ever override payment hash for outbound BOLT 12 payments");
-						*hash = hash_opt
-					},
-					PaymentKind::Bolt12Refund { ref mut hash, .. } => {
-						debug_assert_eq!(payment.direction, PaymentDirection::Outbound,
-							"We should only ever override payment hash for outbound BOLT 12 payments");
-						*hash = hash_opt
-					},
-					_ => {
-						// We can omit updating the hash for BOLT11 payments as the payment hash
-						// will always be known from the beginning.
-					},
-				}
+			let updated = payment.update(update);
+			if updated {
+				self.persist_info(&update.id, payment)?;
+				Ok(PaymentStoreUpdateResult::Updated)
+			} else {
+				Ok(PaymentStoreUpdateResult::Unchanged)
 			}
-			if let Some(preimage_opt) = update.preimage {
-				match payment.kind {
-					PaymentKind::Bolt11 { ref mut preimage, .. } => *preimage = preimage_opt,
-					PaymentKind::Bolt11Jit { ref mut preimage, .. } => *preimage = preimage_opt,
-					PaymentKind::Bolt12Offer { ref mut preimage, .. } => *preimage = preimage_opt,
-					PaymentKind::Bolt12Refund { ref mut preimage, .. } => *preimage = preimage_opt,
-					PaymentKind::Spontaneous { ref mut preimage, .. } => *preimage = preimage_opt,
-					_ => {},
-				}
-			}
-
-			if let Some(secret_opt) = update.secret {
-				match payment.kind {
-					PaymentKind::Bolt11 { ref mut secret, .. } => *secret = secret_opt,
-					PaymentKind::Bolt11Jit { ref mut secret, .. } => *secret = secret_opt,
-					PaymentKind::Bolt12Offer { ref mut secret, .. } => *secret = secret_opt,
-					PaymentKind::Bolt12Refund { ref mut secret, .. } => *secret = secret_opt,
-					_ => {},
-				}
-			}
-
-			if let Some(amount_opt) = update.amount_msat {
-				payment.amount_msat = amount_opt;
-			}
-
-			if let Some(status) = update.status {
-				payment.status = status;
-			}
-
-			if let Some(fee_msat) = update.fee_msat {
-				payment.fee_msat = fee_msat;
-			}
-
-			// TODO: remove
-			payment.last_update =
-				SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs();
-
-			payment.latest_update_timestamp = SystemTime::now()
-				.duration_since(UNIX_EPOCH)
-				.unwrap_or(Duration::from_secs(0))
-				.as_secs();
-
-			self.persist_info(&update.id, payment)?;
-			updated = true;
+		} else {
+			Ok(PaymentStoreUpdateResult::NotFound)
 		}
-		Ok(updated)
 	}
 
 	pub(crate) fn list_filter<F: FnMut(&&PaymentDetails) -> bool>(
 		&self, f: F,
 	) -> Vec<PaymentDetails> {
-		self.payments
-			.lock()
-			.unwrap()
-			.iter()
-			.map(|(_, p)| p)
-			.filter(f)
-			.cloned()
-			.collect::<Vec<PaymentDetails>>()
+		self.payments.lock().unwrap().values().filter(f).cloned().collect::<Vec<PaymentDetails>>()
 	}
 
 	fn persist_info(&self, id: &PaymentId, payment: &PaymentDetails) -> Result<(), Error> {
@@ -613,8 +821,14 @@ mod tests {
 			.is_err());
 
 		let kind = PaymentKind::Bolt11 { hash, preimage: None, secret: None, bolt11_invoice: None };
-		let payment =
-			PaymentDetails::new(id, kind, None, PaymentDirection::Inbound, PaymentStatus::Pending);
+		let payment = PaymentDetails::new(
+			id,
+			kind,
+			None,
+			None,
+			PaymentDirection::Inbound,
+			PaymentStatus::Pending,
+		);
 
 		assert_eq!(Ok(false), payment_store.insert(payment.clone()));
 		assert!(payment_store.get(&id).is_some());
@@ -629,9 +843,22 @@ mod tests {
 		assert_eq!(Ok(true), payment_store.insert(payment));
 		assert!(payment_store.get(&id).is_some());
 
+		// Check update returns `Updated`
 		let mut update = PaymentDetailsUpdate::new(id);
 		update.status = Some(PaymentStatus::Succeeded);
-		assert_eq!(Ok(true), payment_store.update(&update));
+		assert_eq!(Ok(PaymentStoreUpdateResult::Updated), payment_store.update(&update));
+
+		// Check no-op update yields `Unchanged`
+		let mut update = PaymentDetailsUpdate::new(id);
+		update.status = Some(PaymentStatus::Succeeded);
+		assert_eq!(Ok(PaymentStoreUpdateResult::Unchanged), payment_store.update(&update));
+
+		// Check bogus update yields `NotFound`
+		let bogus_id = PaymentId([84u8; 32]);
+		let mut update = PaymentDetailsUpdate::new(bogus_id);
+		update.status = Some(PaymentStatus::Succeeded);
+		assert_eq!(Ok(PaymentStoreUpdateResult::NotFound), payment_store.update(&update));
+
 		assert!(payment_store.get(&id).is_some());
 
 		assert_eq!(PaymentStatus::Succeeded, payment_store.get(&id).unwrap().status);
@@ -716,10 +943,17 @@ mod tests {
 			);
 
 			match bolt11_jit_decoded.kind {
-				PaymentKind::Bolt11Jit { hash: h, preimage: p, secret: s, lsp_fee_limits: l } => {
+				PaymentKind::Bolt11Jit {
+					hash: h,
+					preimage: p,
+					secret: s,
+					counterparty_skimmed_fee_msat: c,
+					lsp_fee_limits: l,
+				} => {
 					assert_eq!(hash, h);
 					assert_eq!(preimage, p);
 					assert_eq!(secret, s);
+					assert_eq!(None, c);
 					assert_eq!(lsp_fee_limits, Some(l));
 				},
 				_ => {
