@@ -456,9 +456,6 @@ dictionary PaymentDetails {
 	u64? fee_paid_msat;
 	PaymentDirection direction;
 	PaymentStatus status;
-	// TODO: remove - use latest_update_timestamp
-	u64 last_update;
-	u64? fee_msat;
 	u64 created_at;
 	u64 latest_update_timestamp;
 };
@@ -548,11 +545,6 @@ typedef string Network;
 dictionary OutPoint {
 	Txid txid;
 	u32 vout;
-};
-
-enum ChannelType {
-	"StaticRemoteKey",
-	"Anchors",
 };
 
 dictionary ChannelDetails {
