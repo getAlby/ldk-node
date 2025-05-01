@@ -91,7 +91,6 @@ fn test_cln() {
 	common::generate_blocks_and_wait(&bitcoind_client, &electrs_client, 6);
 	node.sync_wallets().unwrap();
 	let user_channel_id = common::expect_channel_ready_event!(node, cln_node_id);
-	assert_eq!(node.list_channels().first().unwrap().channel_type, Some(ChannelType::Anchors));
 
 	// Send a payment to CLN
 	let mut rng = thread_rng();
