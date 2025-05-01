@@ -9,12 +9,31 @@
 
 use crate::config::Config;
 use crate::error::Error;
-use crate::logger::{log_error, log_info, FilesystemLogger, Logger};
+use crate::logger::{log_info, LdkLogger, Logger};
 use crate::types::{ChannelManager, Wallet};
+use crate::wallet::OnchainSendAmount;
 
-use bitcoin::{Address, Amount, Txid};
+use bitcoin::{Address, Txid};
 
 use std::sync::{Arc, RwLock};
+
+#[cfg(not(feature = "uniffi"))]
+type FeeRate = bitcoin::FeeRate;
+#[cfg(feature = "uniffi")]
+type FeeRate = Arc<bitcoin::FeeRate>;
+
+macro_rules! maybe_map_fee_rate_opt {
+	($fee_rate_opt: expr) => {{
+		#[cfg(not(feature = "uniffi"))]
+		{
+			$fee_rate_opt
+		}
+		#[cfg(feature = "uniffi")]
+		{
+			$fee_rate_opt.map(|f| *f)
+		}
+	}};
+}
 
 /// A payment handler allowing to send and receive on-chain payments.
 ///
@@ -26,13 +45,13 @@ pub struct OnchainPayment {
 	wallet: Arc<Wallet>,
 	channel_manager: Arc<ChannelManager>,
 	config: Arc<Config>,
-	logger: Arc<FilesystemLogger>,
+	logger: Arc<Logger>,
 }
 
 impl OnchainPayment {
 	pub(crate) fn new(
 		runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>, wallet: Arc<Wallet>,
-		channel_manager: Arc<ChannelManager>, config: Arc<Config>, logger: Arc<FilesystemLogger>,
+		channel_manager: Arc<ChannelManager>, config: Arc<Config>, logger: Arc<Logger>,
 	) -> Self {
 		Self { runtime, wallet, channel_manager, config, logger }
 	}
@@ -49,9 +68,12 @@ impl OnchainPayment {
 	/// This will respect any on-chain reserve we need to keep, i.e., won't allow to cut into
 	/// [`BalanceDetails::total_anchor_channels_reserve_sats`].
 	///
+	/// If `fee_rate` is set it will be used on the resulting transaction. Otherwise we'll retrieve
+	/// a reasonable estimate from the configured chain source.
+	///
 	/// [`BalanceDetails::total_anchor_channels_reserve_sats`]: crate::BalanceDetails::total_anchor_channels_reserve_sats
 	pub fn send_to_address(
-		&self, address: &bitcoin::Address, amount_sats: u64,
+		&self, address: &bitcoin::Address, amount_sats: u64, fee_rate: Option<FeeRate>,
 	) -> Result<Txid, Error> {
 		let rt_lock = self.runtime.read().unwrap();
 		if rt_lock.is_none() {
@@ -60,35 +82,44 @@ impl OnchainPayment {
 
 		let cur_anchor_reserve_sats =
 			crate::total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
-		let spendable_amount_sats =
-			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
-
-		if spendable_amount_sats < amount_sats {
-			log_error!(self.logger,
-				"Unable to send payment due to insufficient funds. Available: {}sats, Required: {}sats",
-				spendable_amount_sats, amount_sats
-			);
-			return Err(Error::InsufficientFunds);
-		}
-
-		let amount = Amount::from_sat(amount_sats);
-		self.wallet.send_to_address(address, Some(amount))
+		let send_amount =
+			OnchainSendAmount::ExactRetainingReserve { amount_sats, cur_anchor_reserve_sats };
+		let fee_rate_opt = maybe_map_fee_rate_opt!(fee_rate);
+		self.wallet.send_to_address(address, send_amount, fee_rate_opt)
 	}
 
-	/// Send an on-chain payment to the given address, draining all the available funds.
+	/// Send an on-chain payment to the given address, draining the available funds.
 	///
 	/// This is useful if you have closed all channels and want to migrate funds to another
 	/// on-chain wallet.
 	///
-	/// Please note that this will **not** retain any on-chain reserves, which might be potentially
+	/// Please note that if `retain_reserves` is set to `false` this will **not** retain any on-chain reserves, which might be potentially
 	/// dangerous if you have open Anchor channels for which you can't trust the counterparty to
-	/// spend the Anchor output after channel closure.
-	pub fn send_all_to_address(&self, address: &bitcoin::Address) -> Result<Txid, Error> {
+	/// spend the Anchor output after channel closure. If `retain_reserves` is set to `true`, this
+	/// will try to send all spendable onchain funds, i.e.,
+	/// [`BalanceDetails::spendable_onchain_balance_sats`].
+	///
+	/// If `fee_rate` is set it will be used on the resulting transaction. Otherwise a reasonable
+	/// we'll retrieve an estimate from the configured chain source.
+	///
+	/// [`BalanceDetails::spendable_onchain_balance_sats`]: crate::balance::BalanceDetails::spendable_onchain_balance_sats
+	pub fn send_all_to_address(
+		&self, address: &bitcoin::Address, retain_reserves: bool, fee_rate: Option<FeeRate>,
+	) -> Result<Txid, Error> {
 		let rt_lock = self.runtime.read().unwrap();
 		if rt_lock.is_none() {
 			return Err(Error::NotRunning);
 		}
 
-		self.wallet.send_to_address(address, None)
+		let send_amount = if retain_reserves {
+			let cur_anchor_reserve_sats =
+				crate::total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+			OnchainSendAmount::AllRetainingReserve { cur_anchor_reserve_sats }
+		} else {
+			OnchainSendAmount::AllDrainingReserve
+		};
+
+		let fee_rate_opt = maybe_map_fee_rate_opt!(fee_rate);
+		self.wallet.send_to_address(address, send_amount, fee_rate_opt)
 	}
 }

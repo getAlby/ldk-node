@@ -50,27 +50,43 @@ def mine_and_wait(esplora_endpoint, blocks):
 
 def wait_for_block(esplora_endpoint, block_hash):
     url = esplora_endpoint + "/block/" + block_hash + "/status"
-    esplora_picked_up_block = False
-    while not esplora_picked_up_block:
-        res = requests.get(url)
+    attempts = 0
+    max_attempts = 30
+
+    while attempts < max_attempts:
         try:
+            res = requests.get(url, timeout=10)
             json = res.json()
-            esplora_picked_up_block = json['in_best_chain']
-        except:
-            pass
-        time.sleep(1)
+            if json.get('in_best_chain'):
+                return
+
+        except Exception as e:
+            print(f"Error: {e}")
+
+        attempts += 1
+        time.sleep(0.5)
+
+    raise Exception(f"Failed to confirm block {block_hash} after {max_attempts} attempts")
 
 def wait_for_tx(esplora_endpoint, txid):
     url = esplora_endpoint + "/tx/" + txid
-    esplora_picked_up_tx = False
-    while not esplora_picked_up_tx:
-        res = requests.get(url)
+    attempts = 0
+    max_attempts = 30
+
+    while attempts < max_attempts:
         try:
+            res = requests.get(url, timeout=10)
             json = res.json()
-            esplora_picked_up_tx = json['txid'] == txid
-        except:
-            pass
-        time.sleep(1)
+            if json.get('txid') == txid:
+                return
+
+        except Exception as e:
+            print(f"Error: {e}")
+
+        attempts += 1
+        time.sleep(0.5)
+
+    raise Exception(f"Failed to confirm transaction {txid} after {max_attempts} attempts")
 
 def send_to_address(address, amount_sats):
     amount_btc = amount_sats/100000000.0
@@ -185,7 +201,8 @@ class TestLdkNode(unittest.TestCase):
         print("EVENT:", channel_ready_event_2)
         node_2.event_handled()
 
-        invoice = node_2.bolt11_payment().receive(2500000, "asdf", 9217)
+        description = Bolt11InvoiceDescription.DIRECT("asdf")
+        invoice = node_2.bolt11_payment().receive(2500000, description, 9217)
         node_1.bolt11_payment().send(invoice, None)
 
         payment_successful_event_1 = node_1.wait_next_event()

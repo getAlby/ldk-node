@@ -6,7 +6,10 @@
 // accordance with one or both of these licenses.
 
 use crate::chain::{ChainSource, DEFAULT_ESPLORA_SERVER_URL};
-use crate::config::{default_user_config, Config, EsploraSyncConfig, WALLET_KEYS_SEED_LEN};
+use crate::config::{
+	default_user_config, may_announce_channel, AnnounceError, Config, ElectrumSyncConfig,
+	EsploraSyncConfig, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL, WALLET_KEYS_SEED_LEN,
+};
 
 use crate::connection::ConnectionManager;
 use crate::event::EventQueue;
@@ -20,8 +23,10 @@ use crate::io::{
 	PEER_INFO_PERSISTENCE_KEY, PEER_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
 	PEER_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
 };
-use crate::liquidity::LiquiditySource;
-use crate::logger::{log_error, log_info, FilesystemLogger, Logger};
+use crate::liquidity::{
+	LSPS1ClientConfig, LSPS2ClientConfig, LSPS2ServiceConfig, LiquiditySourceBuilder,
+};
+use crate::logger::{log_error, log_info, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
 use crate::payment::store::PaymentStore;
 use crate::peer_store::PeerStore;
@@ -32,8 +37,7 @@ use crate::types::{
 };
 use crate::wallet::persist::KVStoreWalletPersister;
 use crate::wallet::Wallet;
-use crate::{io, NodeMetrics};
-use crate::{LogLevel, Node};
+use crate::{io, Node, NodeMetrics};
 use lightning::util::persist::KVStore;
 
 use chrono::Local;
@@ -62,9 +66,6 @@ use lightning::util::sweep::OutputSweeper;
 
 use lightning_persister::fs_store::FilesystemStore;
 
-use lightning_liquidity::lsps2::client::LSPS2ClientConfig;
-use lightning_liquidity::{LiquidityClientConfig, LiquidityManager};
-
 use bdk_wallet::template::Bip84;
 use bdk_wallet::KeychainKind;
 use bdk_wallet::Wallet as BdkWallet;
@@ -86,9 +87,14 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 use vss_client::headers::{FixedHeaders, LnurlAuthToJwtProvider, VssHeaderProvider};
 
+const VSS_HARDENED_CHILD_INDEX: u32 = 877;
+const VSS_LNURL_AUTH_HARDENED_CHILD_INDEX: u32 = 138;
+const LSPS_HARDENED_CHILD_INDEX: u32 = 577;
+
 #[derive(Debug, Clone)]
 enum ChainDataSourceConfig {
 	Esplora { server_url: String, sync_config: Option<EsploraSyncConfig> },
+	Electrum { server_url: String, sync_config: Option<ElectrumSyncConfig> },
 	BitcoindRpc { rpc_host: String, rpc_port: u16, rpc_user: String, rpc_password: String },
 }
 
@@ -105,15 +111,36 @@ enum GossipSourceConfig {
 	RapidGossipSync(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct LiquiditySourceConfig {
-	// LSPS2 service's (address, node_id, token)
-	lsps2_service: Option<(SocketAddress, PublicKey, Option<String>)>,
+	// Act as an LSPS1 client connecting to the given service.
+	lsps1_client: Option<LSPS1ClientConfig>,
+	// Act as an LSPS2 client connecting to the given service.
+	lsps2_client: Option<LSPS2ClientConfig>,
+	// Act as an LSPS2 service.
+	lsps2_service: Option<LSPS2ServiceConfig>,
 }
 
-impl Default for LiquiditySourceConfig {
-	fn default() -> Self {
-		Self { lsps2_service: None }
+#[derive(Clone)]
+enum LogWriterConfig {
+	File { log_file_path: Option<String>, max_log_level: Option<LogLevel> },
+	Log,
+	Custom(Arc<dyn LogWriter>),
+}
+
+impl std::fmt::Debug for LogWriterConfig {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			LogWriterConfig::File { max_log_level, log_file_path } => f
+				.debug_struct("LogWriterConfig")
+				.field("max_log_level", max_log_level)
+				.field("log_file_path", log_file_path)
+				.finish(),
+			LogWriterConfig::Log => write!(f, "LogWriterConfig::Log"),
+			LogWriterConfig::Custom(_) => {
+				f.debug_tuple("Custom").field(&"<config internal to custom log writer>").finish()
+			},
+		}
 	}
 }
 
@@ -132,6 +159,8 @@ pub enum BuildError {
 	InvalidChannelMonitor,
 	/// The given listening addresses are invalid, e.g. too many were passed.
 	InvalidListeningAddresses,
+	/// The given announcement addresses are invalid, e.g. too many were passed.
+	InvalidAnnouncementAddresses,
 	/// The provided alias is invalid.
 	InvalidNodeAlias,
 	/// We failed to read data from the [`KVStore`].
@@ -152,6 +181,8 @@ pub enum BuildError {
 	WalletSetupFailed,
 	/// We failed to setup the logger.
 	LoggerSetupFailed,
+	/// The given network does not match the node's previously configured network.
+	NetworkMismatch,
 }
 
 impl fmt::Display for BuildError {
@@ -166,6 +197,9 @@ impl fmt::Display for BuildError {
 				write!(f, "Failed to watch a deserialized ChannelMonitor")
 			},
 			Self::InvalidListeningAddresses => write!(f, "Given listening addresses are invalid."),
+			Self::InvalidAnnouncementAddresses => {
+				write!(f, "Given announcement addresses are invalid.")
+			},
 			Self::ReadFailed => write!(f, "Failed to read from store."),
 			Self::WriteFailed => write!(f, "Failed to write to store."),
 			Self::StoragePathAccessFailed => write!(f, "Failed to access the given storage path."),
@@ -173,6 +207,9 @@ impl fmt::Display for BuildError {
 			Self::WalletSetupFailed => write!(f, "Failed to setup onchain wallet."),
 			Self::LoggerSetupFailed => write!(f, "Failed to setup the logger."),
 			Self::InvalidNodeAlias => write!(f, "Given node alias is invalid."),
+			Self::NetworkMismatch => {
+				write!(f, "Given network does not match the node's previously configured network.")
+			},
 		}
 	}
 }
@@ -196,6 +233,7 @@ pub struct NodeBuilder {
 	monitors_to_restore: Option<Vec<KeyValue>>,
 	reset_state: Option<ResetState>,
 	migrate_storage: Option<MigrateStorage>,
+	log_writer_config: Option<LogWriterConfig>,
 }
 
 impl NodeBuilder {
@@ -214,6 +252,7 @@ impl NodeBuilder {
 		let monitors_to_restore = None;
 		let reset_state = None;
 		let migrate_storage = None;
+		let log_writer_config = None;
 		Self {
 			config,
 			entropy_source_config,
@@ -223,6 +262,7 @@ impl NodeBuilder {
 			monitors_to_restore,
 			reset_state,
 			migrate_storage,
+			log_writer_config,
 		}
 	}
 
@@ -253,15 +293,11 @@ impl NodeBuilder {
 		self
 	}
 
-	/// Configures the [`Node`] instance to source its wallet entropy from the given 64 seed bytes.
-	pub fn set_entropy_seed_bytes(&mut self, seed_bytes: Vec<u8>) -> Result<&mut Self, BuildError> {
-		if seed_bytes.len() != WALLET_KEYS_SEED_LEN {
-			return Err(BuildError::InvalidSeedBytes);
-		}
-		let mut bytes = [0u8; WALLET_KEYS_SEED_LEN];
-		bytes.copy_from_slice(&seed_bytes);
-		self.entropy_source_config = Some(EntropySourceConfig::SeedBytes(bytes));
-		Ok(self)
+	/// Configures the [`Node`] instance to source its wallet entropy from the given
+	/// [`WALLET_KEYS_SEED_LEN`] seed bytes.
+	pub fn set_entropy_seed_bytes(&mut self, seed_bytes: [u8; WALLET_KEYS_SEED_LEN]) -> &mut Self {
+		self.entropy_source_config = Some(EntropySourceConfig::SeedBytes(seed_bytes));
+		self
 	}
 
 	/// Configures the [`Node`] instance to source its wallet entropy from a [BIP 39] mnemonic.
@@ -284,6 +320,18 @@ impl NodeBuilder {
 	) -> &mut Self {
 		self.chain_data_source_config =
 			Some(ChainDataSourceConfig::Esplora { server_url, sync_config });
+		self
+	}
+
+	/// Configures the [`Node`] instance to source its chain data from the given Electrum server.
+	///
+	/// If no `sync_config` is given, default values are used. See [`ElectrumSyncConfig`] for more
+	/// information.
+	pub fn set_chain_source_electrum(
+		&mut self, server_url: String, sync_config: Option<ElectrumSyncConfig>,
+	) -> &mut Self {
+		self.chain_data_source_config =
+			Some(ChainDataSourceConfig::Electrum { server_url, sync_config });
 		self
 	}
 
@@ -311,22 +359,60 @@ impl NodeBuilder {
 		self
 	}
 
-	/// Configures the [`Node`] instance to source its inbound liquidity from the given
-	/// [LSPS2](https://github.com/BitcoinAndLightningLayerSpecs/lsp/blob/main/LSPS2/README.md)
-	/// service.
+	/// Configures the [`Node`] instance to source inbound liquidity from the given
+	/// [bLIP-51 / LSPS1] service.
 	///
 	/// Will mark the LSP as trusted for 0-confirmation channels, see [`Config::trusted_peers_0conf`].
 	///
 	/// The given `token` will be used by the LSP to authenticate the user.
-	pub fn set_liquidity_source_lsps2(
-		&mut self, address: SocketAddress, node_id: PublicKey, token: Option<String>,
+	///
+	/// [bLIP-51 / LSPS1]: https://github.com/lightning/blips/blob/master/blip-0051.md
+	pub fn set_liquidity_source_lsps1(
+		&mut self, node_id: PublicKey, address: SocketAddress, token: Option<String>,
 	) -> &mut Self {
 		// Mark the LSP as trusted for 0conf
 		self.config.trusted_peers_0conf.push(node_id.clone());
 
 		let liquidity_source_config =
 			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
-		liquidity_source_config.lsps2_service = Some((address, node_id, token));
+		let lsps1_client_config = LSPS1ClientConfig { node_id, address, token };
+		liquidity_source_config.lsps1_client = Some(lsps1_client_config);
+		self
+	}
+
+	/// Configures the [`Node`] instance to source just-in-time inbound liquidity from the given
+	/// [bLIP-52 / LSPS2] service.
+	///
+	/// Will mark the LSP as trusted for 0-confirmation channels, see [`Config::trusted_peers_0conf`].
+	///
+	/// The given `token` will be used by the LSP to authenticate the user.
+	///
+	/// [bLIP-52 / LSPS2]: https://github.com/lightning/blips/blob/master/blip-0052.md
+	pub fn set_liquidity_source_lsps2(
+		&mut self, node_id: PublicKey, address: SocketAddress, token: Option<String>,
+	) -> &mut Self {
+		// Mark the LSP as trusted for 0conf
+		self.config.trusted_peers_0conf.push(node_id.clone());
+
+		let liquidity_source_config =
+			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
+		let lsps2_client_config = LSPS2ClientConfig { node_id, address, token };
+		liquidity_source_config.lsps2_client = Some(lsps2_client_config);
+		self
+	}
+
+	/// Configures the [`Node`] instance to provide an [LSPS2] service, issuing just-in-time
+	/// channels to clients.
+	///
+	/// **Caution**: LSP service support is in **alpha** and is considered an experimental feature.
+	///
+	/// [LSPS2]: https://github.com/BitcoinAndLightningLayerSpecs/lsp/blob/main/LSPS2/README.md
+	pub fn set_liquidity_provider_lsps2(
+		&mut self, service_config: LSPS2ServiceConfig,
+	) -> &mut Self {
+		let liquidity_source_config =
+			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
+		liquidity_source_config.lsps2_service = Some(service_config);
 		self
 	}
 
@@ -336,9 +422,31 @@ impl NodeBuilder {
 		self
 	}
 
-	/// Sets the log dir path if logs need to live separate from the storage directory path.
-	pub fn set_log_dir_path(&mut self, log_dir_path: String) -> &mut Self {
-		self.config.log_dir_path = Some(log_dir_path);
+	/// Configures the [`Node`] instance to write logs to the filesystem.
+	///
+	/// The `log_file_path` defaults to [`DEFAULT_LOG_FILENAME`] in the configured
+	/// [`Config::storage_dir_path`] if set to `None`.
+	///
+	/// If set, the `max_log_level` sets the maximum log level. Otherwise, the latter defaults to
+	/// [`DEFAULT_LOG_LEVEL`].
+	///
+	/// [`DEFAULT_LOG_FILENAME`]: crate::config::DEFAULT_LOG_FILENAME
+	pub fn set_filesystem_logger(
+		&mut self, log_file_path: Option<String>, max_log_level: Option<LogLevel>,
+	) -> &mut Self {
+		self.log_writer_config = Some(LogWriterConfig::File { log_file_path, max_log_level });
+		self
+	}
+
+	/// Configures the [`Node`] instance to write logs to the [`log`](https://crates.io/crates/log) facade.
+	pub fn set_log_facade_logger(&mut self) -> &mut Self {
+		self.log_writer_config = Some(LogWriterConfig::Log);
+		self
+	}
+
+	/// Configures the [`Node`] instance to write logs to the provided custom [`LogWriter`].
+	pub fn set_custom_logger(&mut self, log_writer: Arc<dyn LogWriter>) -> &mut Self {
+		self.log_writer_config = Some(LogWriterConfig::Custom(log_writer));
 		self
 	}
 
@@ -360,6 +468,22 @@ impl NodeBuilder {
 		Ok(self)
 	}
 
+	/// Sets the IP address and TCP port which [`Node`] will announce to the gossip network that it accepts connections on.
+	///
+	/// **Note**: If unset, the [`listening_addresses`] will be used as the list of addresses to announce.
+	///
+	/// [`listening_addresses`]: Self::set_listening_addresses
+	pub fn set_announcement_addresses(
+		&mut self, announcement_addresses: Vec<SocketAddress>,
+	) -> Result<&mut Self, BuildError> {
+		if announcement_addresses.len() > 100 {
+			return Err(BuildError::InvalidAnnouncementAddresses);
+		}
+
+		self.config.announcement_addresses = Some(announcement_addresses);
+		Ok(self)
+	}
+
 	/// Sets the node alias that will be used when broadcasting announcements to the gossip
 	/// network.
 	///
@@ -369,12 +493,6 @@ impl NodeBuilder {
 
 		self.config.node_alias = Some(node_alias);
 		Ok(self)
-	}
-
-	/// Sets the level at which [`Node`] will log messages.
-	pub fn set_log_level(&mut self, level: LogLevel) -> &mut Self {
-		self.config.log_level = level;
-		self
 	}
 
 	/// Builds a [`Node`] instance with a [`SqliteStore`] backend and according to the options
@@ -433,7 +551,7 @@ impl NodeBuilder {
 	) -> Result<Node, BuildError> {
 		use bitcoin::key::Secp256k1;
 
-		let logger = setup_logger(&self.config)?;
+		let logger = setup_logger(&self.log_writer_config, &self.config)?;
 
 		let seed_bytes = seed_bytes_from_config(
 			&self.config,
@@ -443,10 +561,14 @@ impl NodeBuilder {
 
 		let config = Arc::new(self.config.clone());
 
-		let vss_xprv = derive_vss_xprv(config, &seed_bytes, Arc::clone(&logger))?;
+		let vss_xprv =
+			derive_xprv(config, &seed_bytes, VSS_HARDENED_CHILD_INDEX, Arc::clone(&logger))?;
 
 		let lnurl_auth_xprv = vss_xprv
-			.derive_priv(&Secp256k1::new(), &[ChildNumber::Hardened { index: 138 }])
+			.derive_priv(
+				&Secp256k1::new(),
+				&[ChildNumber::Hardened { index: VSS_LNURL_AUTH_HARDENED_CHILD_INDEX }],
+			)
 			.map_err(|e| {
 				log_error!(logger, "Failed to derive VSS secret: {}", e);
 				BuildError::KVStoreSetupFailed
@@ -498,7 +620,7 @@ impl NodeBuilder {
 	pub fn build_with_vss_store_and_header_provider(
 		&self, vss_url: String, store_id: String, header_provider: Arc<dyn VssHeaderProvider>,
 	) -> Result<Node, BuildError> {
-		let logger = setup_logger(&self.config)?;
+		let logger = setup_logger(&self.log_writer_config, &self.config)?;
 
 		let seed_bytes = seed_bytes_from_config(
 			&self.config,
@@ -508,7 +630,12 @@ impl NodeBuilder {
 
 		let config = Arc::new(self.config.clone());
 
-		let vss_xprv = derive_vss_xprv(config.clone(), &seed_bytes, Arc::clone(&logger))?;
+		let vss_xprv = derive_xprv(
+			config.clone(),
+			&seed_bytes,
+			VSS_HARDENED_CHILD_INDEX,
+			Arc::clone(&logger),
+		)?;
 
 		let vss_seed_bytes: [u8; 32] = vss_xprv.private_key.secret_bytes();
 
@@ -656,7 +783,8 @@ impl NodeBuilder {
 
 	/// Builds a [`Node`] instance according to the options previously configured.
 	pub fn build_with_store(&self, kv_store: Arc<DynStore>) -> Result<Node, BuildError> {
-		let logger = setup_logger(&self.config)?;
+		let logger = setup_logger(&self.log_writer_config, &self.config)?;
+
 		let seed_bytes = seed_bytes_from_config(
 			&self.config,
 			self.entropy_source_config.as_ref(),
@@ -738,11 +866,20 @@ impl ArcedNodeBuilder {
 		self.inner.write().unwrap().set_entropy_seed_path(seed_path);
 	}
 
-	/// Configures the [`Node`] instance to source its wallet entropy from the given 64 seed bytes.
+	/// Configures the [`Node`] instance to source its wallet entropy from the given
+	/// [`WALLET_KEYS_SEED_LEN`] seed bytes.
 	///
-	/// **Note:** Panics if the length of the given `seed_bytes` differs from 64.
+	/// **Note:** Will return an error if the length of the given `seed_bytes` differs from
+	/// [`WALLET_KEYS_SEED_LEN`].
 	pub fn set_entropy_seed_bytes(&self, seed_bytes: Vec<u8>) -> Result<(), BuildError> {
-		self.inner.write().unwrap().set_entropy_seed_bytes(seed_bytes).map(|_| ())
+		if seed_bytes.len() != WALLET_KEYS_SEED_LEN {
+			return Err(BuildError::InvalidSeedBytes);
+		}
+		let mut bytes = [0u8; WALLET_KEYS_SEED_LEN];
+		bytes.copy_from_slice(&seed_bytes);
+
+		self.inner.write().unwrap().set_entropy_seed_bytes(bytes);
+		Ok(())
 	}
 
 	/// Configures the [`Node`] instance to source its wallet entropy from a [BIP 39] mnemonic.
@@ -760,6 +897,16 @@ impl ArcedNodeBuilder {
 		&self, server_url: String, sync_config: Option<EsploraSyncConfig>,
 	) {
 		self.inner.write().unwrap().set_chain_source_esplora(server_url, sync_config);
+	}
+
+	/// Configures the [`Node`] instance to source its chain data from the given Electrum server.
+	///
+	/// If no `sync_config` is given, default values are used. See [`ElectrumSyncConfig`] for more
+	/// information.
+	pub fn set_chain_source_electrum(
+		&self, server_url: String, sync_config: Option<ElectrumSyncConfig>,
+	) {
+		self.inner.write().unwrap().set_chain_source_electrum(server_url, sync_config);
 	}
 
 	/// Configures the [`Node`] instance to source its chain data from the given Bitcoin Core RPC
@@ -787,17 +934,42 @@ impl ArcedNodeBuilder {
 		self.inner.write().unwrap().set_gossip_source_rgs(rgs_server_url);
 	}
 
-	/// Configures the [`Node`] instance to source its inbound liquidity from the given
-	/// [LSPS2](https://github.com/BitcoinAndLightningLayerSpecs/lsp/blob/main/LSPS2/README.md)
-	/// service.
+	/// Configures the [`Node`] instance to source inbound liquidity from the given
+	/// [bLIP-51 / LSPS1] service.
 	///
 	/// Will mark the LSP as trusted for 0-confirmation channels, see [`Config::trusted_peers_0conf`].
 	///
 	/// The given `token` will be used by the LSP to authenticate the user.
-	pub fn set_liquidity_source_lsps2(
-		&self, address: SocketAddress, node_id: PublicKey, token: Option<String>,
+	///
+	/// [bLIP-51 / LSPS1]: https://github.com/lightning/blips/blob/master/blip-0051.md
+	pub fn set_liquidity_source_lsps1(
+		&self, node_id: PublicKey, address: SocketAddress, token: Option<String>,
 	) {
-		self.inner.write().unwrap().set_liquidity_source_lsps2(address, node_id, token);
+		self.inner.write().unwrap().set_liquidity_source_lsps1(node_id, address, token);
+	}
+
+	/// Configures the [`Node`] instance to source just-in-time inbound liquidity from the given
+	/// [bLIP-52 / LSPS2] service.
+	///
+	/// Will mark the LSP as trusted for 0-confirmation channels, see [`Config::trusted_peers_0conf`].
+	///
+	/// The given `token` will be used by the LSP to authenticate the user.
+	///
+	/// [bLIP-52 / LSPS2]: https://github.com/lightning/blips/blob/master/blip-0052.md
+	pub fn set_liquidity_source_lsps2(
+		&self, node_id: PublicKey, address: SocketAddress, token: Option<String>,
+	) {
+		self.inner.write().unwrap().set_liquidity_source_lsps2(node_id, address, token);
+	}
+
+	/// Configures the [`Node`] instance to provide an [LSPS2] service, issuing just-in-time
+	/// channels to clients.
+	///
+	/// **Caution**: LSP service support is in **alpha** and is considered an experimental feature.
+	///
+	/// [LSPS2]: https://github.com/BitcoinAndLightningLayerSpecs/lsp/blob/main/LSPS2/README.md
+	pub fn set_liquidity_provider_lsps2(&self, service_config: LSPS2ServiceConfig) {
+		self.inner.write().unwrap().set_liquidity_provider_lsps2(service_config);
 	}
 
 	/// Sets the used storage directory path.
@@ -805,9 +977,29 @@ impl ArcedNodeBuilder {
 		self.inner.write().unwrap().set_storage_dir_path(storage_dir_path);
 	}
 
-	/// Sets the log dir path if logs need to live separate from the storage directory path.
-	pub fn set_log_dir_path(&self, log_dir_path: String) {
-		self.inner.write().unwrap().set_log_dir_path(log_dir_path);
+	/// Configures the [`Node`] instance to write logs to the filesystem.
+	///
+	/// The `log_file_path` defaults to [`DEFAULT_LOG_FILENAME`] in the configured
+	/// [`Config::storage_dir_path`] if set to `None`.
+	///
+	/// If set, the `max_log_level` sets the maximum log level. Otherwise, the latter defaults to
+	/// [`DEFAULT_LOG_LEVEL`].
+	///
+	/// [`DEFAULT_LOG_FILENAME`]: crate::config::DEFAULT_LOG_FILENAME
+	pub fn set_filesystem_logger(
+		&self, log_file_path: Option<String>, log_level: Option<LogLevel>,
+	) {
+		self.inner.write().unwrap().set_filesystem_logger(log_file_path, log_level);
+	}
+
+	/// Configures the [`Node`] instance to write logs to the [`log`](https://crates.io/crates/log) facade.
+	pub fn set_log_facade_logger(&self) {
+		self.inner.write().unwrap().set_log_facade_logger();
+	}
+
+	/// Configures the [`Node`] instance to write logs to the provided custom [`LogWriter`].
+	pub fn set_custom_logger(&self, log_writer: Arc<dyn LogWriter>) {
+		self.inner.write().unwrap().set_custom_logger(log_writer);
 	}
 
 	/// Sets the Bitcoin network used.
@@ -822,17 +1014,23 @@ impl ArcedNodeBuilder {
 		self.inner.write().unwrap().set_listening_addresses(listening_addresses).map(|_| ())
 	}
 
+	/// Sets the IP address and TCP port which [`Node`] will announce to the gossip network that it accepts connections on.
+	///
+	/// **Note**: If unset, the [`listening_addresses`] will be used as the list of addresses to announce.
+	///
+	/// [`listening_addresses`]: Self::set_listening_addresses
+	pub fn set_announcement_addresses(
+		&self, announcement_addresses: Vec<SocketAddress>,
+	) -> Result<(), BuildError> {
+		self.inner.write().unwrap().set_announcement_addresses(announcement_addresses).map(|_| ())
+	}
+
 	/// Sets the node alias that will be used when broadcasting announcements to the gossip
 	/// network.
 	///
 	/// The provided alias must be a valid UTF-8 string and no longer than 32 bytes in total.
 	pub fn set_node_alias(&self, node_alias: String) -> Result<(), BuildError> {
 		self.inner.write().unwrap().set_node_alias(node_alias).map(|_| ())
-	}
-
-	/// Sets the level at which [`Node`] will log messages.
-	pub fn set_log_level(&self, level: LogLevel) {
-		self.inner.write().unwrap().set_log_level(level);
 	}
 
 	/// Builds a [`Node`] instance with a [`SqliteStore`] backend and according to the options
@@ -929,11 +1127,27 @@ fn build_with_store_internal(
 	config: Arc<Config>, chain_data_source_config: Option<&ChainDataSourceConfig>,
 	gossip_source_config: Option<&GossipSourceConfig>,
 	liquidity_source_config: Option<&LiquiditySourceConfig>, seed_bytes: [u8; 64],
-	logger: Arc<FilesystemLogger>, kv_store: Arc<DynStore>, reset_state: Option<ResetState>,
+	logger: Arc<Logger>, kv_store: Arc<DynStore>, reset_state: Option<ResetState>,
 ) -> Result<Node, BuildError> {
 	// Alby: reset persistent state if requested.
 	if let Some(what) = reset_state {
 		reset_persistent_state(logger.clone(), kv_store.clone(), what);
+	}
+	if let Err(err) = may_announce_channel(&config) {
+		if config.announcement_addresses.is_some() {
+			log_error!(logger, "Announcement addresses were set but some required configuration options for node announcement are missing: {}", err);
+			let build_error = if matches!(err, AnnounceError::MissingNodeAlias) {
+				BuildError::InvalidNodeAlias
+			} else {
+				BuildError::InvalidListeningAddresses
+			};
+			return Err(build_error);
+		}
+
+		if config.node_alias.is_some() {
+			log_error!(logger, "Node alias was set but some required configuration options for node announcement are missing: {}", err);
+			return Err(BuildError::InvalidListeningAddresses);
+		}
 	}
 
 	// Initialize the status fields.
@@ -965,9 +1179,25 @@ fn build_with_store_internal(
 		.extract_keys()
 		.check_network(config.network)
 		.load_wallet(&mut wallet_persister)
-		.map_err(|e| {
-			log_error!(logger, "Failed to set up wallet: {}", e);
-			BuildError::WalletSetupFailed
+		.map_err(|e| match e {
+			bdk_wallet::LoadWithPersistError::InvalidChangeSet(
+				bdk_wallet::LoadError::Mismatch(bdk_wallet::LoadMismatch::Network {
+					loaded,
+					expected,
+				}),
+			) => {
+				log_error!(
+					logger,
+					"Failed to setup wallet: Networks do not match. Expected {} but got {}",
+					expected,
+					loaded
+				);
+				BuildError::NetworkMismatch
+			},
+			_ => {
+				log_error!(logger, "Failed to set up wallet: {}", e);
+				BuildError::WalletSetupFailed
+			},
 		})?;
 	let bdk_wallet = match wallet_opt {
 		Some(wallet) => wallet,
@@ -982,11 +1212,22 @@ fn build_with_store_internal(
 
 	let tx_broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
 	let fee_estimator = Arc::new(OnchainFeeEstimator::new());
+
+	let payment_store = match io::utils::read_payments(Arc::clone(&kv_store), Arc::clone(&logger)) {
+		Ok(payments) => {
+			Arc::new(PaymentStore::new(payments, Arc::clone(&kv_store), Arc::clone(&logger)))
+		},
+		Err(_) => {
+			return Err(BuildError::ReadFailed);
+		},
+	};
+
 	let wallet = Arc::new(Wallet::new(
 		bdk_wallet,
 		wallet_persister,
 		Arc::clone(&tx_broadcaster),
 		Arc::clone(&fee_estimator),
+		Arc::clone(&payment_store),
 		Arc::clone(&logger),
 	));
 
@@ -995,6 +1236,20 @@ fn build_with_store_internal(
 			log_info!(logger, "Using esplora server: {}", server_url);
 			let sync_config = sync_config.unwrap_or(EsploraSyncConfig::default());
 			Arc::new(ChainSource::new_esplora(
+				server_url.clone(),
+				sync_config,
+				Arc::clone(&wallet),
+				Arc::clone(&fee_estimator),
+				Arc::clone(&tx_broadcaster),
+				Arc::clone(&kv_store),
+				Arc::clone(&config),
+				Arc::clone(&logger),
+				Arc::clone(&node_metrics),
+			))
+		},
+		Some(ChainDataSourceConfig::Electrum { server_url, sync_config }) => {
+			let sync_config = sync_config.unwrap_or(ElectrumSyncConfig::default());
+			Arc::new(ChainSource::new_electrum(
 				server_url.clone(),
 				sync_config,
 				Arc::clone(&wallet),
@@ -1117,7 +1372,7 @@ fn build_with_store_internal(
 	));
 
 	// Read ChannelMonitor state from store
-	let mut channel_monitors = match read_channel_monitors(
+	let channel_monitors = match read_channel_monitors(
 		Arc::clone(&kv_store),
 		Arc::clone(&keys_manager),
 		Arc::clone(&keys_manager),
@@ -1134,7 +1389,7 @@ fn build_with_store_internal(
 	};
 
 	let mut user_config = default_user_config(&config);
-	if liquidity_source_config.and_then(|lsc| lsc.lsps2_service.as_ref()).is_some() {
+	if liquidity_source_config.and_then(|lsc| lsc.lsps2_client.as_ref()).is_some() {
 		// Generally allow claiming underpaying HTLCs as the LSP will skim off some fee. We'll
 		// check that they don't take too much before claiming.
 		user_config.channel_config.accept_underpaying_htlcs = true;
@@ -1146,6 +1401,23 @@ fn build_with_store_internal(
 			100;
 	}
 
+	if liquidity_source_config.and_then(|lsc| lsc.lsps2_service.as_ref()).is_some() {
+		// If we act as an LSPS2 service, we need to to be able to intercept HTLCs and forward the
+		// information to the service handler.
+		user_config.accept_intercept_htlcs = true;
+
+		// If we act as an LSPS2 service, we allow forwarding to unnannounced channels.
+		user_config.accept_forwards_to_priv_channels = true;
+
+		// If we act as an LSPS2 service, set the HTLC-value-in-flight to 100% of the channel value
+		// to ensure we can forward the initial payment.
+		user_config.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel =
+			100;
+	}
+
+	let message_router =
+		Arc::new(MessageRouter::new(Arc::clone(&network_graph), Arc::clone(&keys_manager)));
+
 	// Initialize the ChannelManager
 	let channel_manager = {
 		if let Ok(res) = kv_store.read(
@@ -1155,7 +1427,7 @@ fn build_with_store_internal(
 		) {
 			let mut reader = Cursor::new(res);
 			let channel_monitor_references =
-				channel_monitors.iter_mut().map(|(_, chanmon)| chanmon).collect();
+				channel_monitors.iter().map(|(_, chanmon)| chanmon).collect();
 			let read_args = ChannelManagerReadArgs::new(
 				Arc::clone(&keys_manager),
 				Arc::clone(&keys_manager),
@@ -1164,6 +1436,7 @@ fn build_with_store_internal(
 				Arc::clone(&chain_monitor),
 				Arc::clone(&tx_broadcaster),
 				Arc::clone(&router),
+				Arc::clone(&message_router),
 				Arc::clone(&logger),
 				user_config,
 				channel_monitor_references,
@@ -1188,6 +1461,7 @@ fn build_with_store_internal(
 				Arc::clone(&chain_monitor),
 				Arc::clone(&tx_broadcaster),
 				Arc::clone(&router),
+				Arc::clone(&message_router),
 				Arc::clone(&logger),
 				Arc::clone(&keys_manager),
 				Arc::clone(&keys_manager),
@@ -1210,16 +1484,15 @@ fn build_with_store_internal(
 		})?;
 	}
 
-	let message_router = MessageRouter::new(Arc::clone(&network_graph), Arc::clone(&keys_manager));
-
 	// Initialize the PeerManager
 	let onion_messenger: Arc<OnionMessenger> = Arc::new(OnionMessenger::new(
 		Arc::clone(&keys_manager),
 		Arc::clone(&keys_manager),
 		Arc::clone(&logger),
 		Arc::clone(&channel_manager),
-		Arc::new(message_router),
+		message_router,
 		Arc::clone(&channel_manager),
+		IgnoringMessageHandler {},
 		IgnoringMessageHandler {},
 		IgnoringMessageHandler {},
 	));
@@ -1278,36 +1551,53 @@ fn build_with_store_internal(
 		},
 	};
 
-	let liquidity_source = liquidity_source_config.as_ref().and_then(|lsc| {
-		lsc.lsps2_service.as_ref().map(|(address, node_id, token)| {
-			let lsps2_client_config = Some(LSPS2ClientConfig {});
-			let liquidity_client_config = Some(LiquidityClientConfig { lsps2_client_config });
-			let liquidity_manager = Arc::new(LiquidityManager::new(
-				Arc::clone(&keys_manager),
-				Arc::clone(&channel_manager),
-				Some(Arc::clone(&chain_source)),
-				None,
-				None,
-				liquidity_client_config,
-			));
-			Arc::new(LiquiditySource::new_lsps2(
-				address.clone(),
-				*node_id,
-				token.clone(),
+	let (liquidity_source, custom_message_handler) =
+		if let Some(lsc) = liquidity_source_config.as_ref() {
+			let mut liquidity_source_builder = LiquiditySourceBuilder::new(
+				Arc::clone(&wallet),
 				Arc::clone(&channel_manager),
 				Arc::clone(&keys_manager),
-				liquidity_manager,
+				Arc::clone(&chain_source),
 				Arc::clone(&config),
 				Arc::clone(&logger),
-			))
-		})
-	});
+			);
 
-	let custom_message_handler = if let Some(liquidity_source) = liquidity_source.as_ref() {
-		Arc::new(NodeCustomMessageHandler::new_liquidity(Arc::clone(&liquidity_source)))
-	} else {
-		Arc::new(NodeCustomMessageHandler::new_ignoring())
-	};
+			lsc.lsps1_client.as_ref().map(|config| {
+				liquidity_source_builder.lsps1_client(
+					config.node_id,
+					config.address.clone(),
+					config.token.clone(),
+				)
+			});
+
+			lsc.lsps2_client.as_ref().map(|config| {
+				liquidity_source_builder.lsps2_client(
+					config.node_id,
+					config.address.clone(),
+					config.token.clone(),
+				)
+			});
+
+			let promise_secret = {
+				let lsps_xpriv = derive_xprv(
+					Arc::clone(&config),
+					&seed_bytes,
+					LSPS_HARDENED_CHILD_INDEX,
+					Arc::clone(&logger),
+				)?;
+				lsps_xpriv.private_key.secret_bytes()
+			};
+			lsc.lsps2_service.as_ref().map(|config| {
+				liquidity_source_builder.lsps2_service(promise_secret, config.clone())
+			});
+
+			let liquidity_source = Arc::new(liquidity_source_builder.build());
+			let custom_message_handler =
+				Arc::new(NodeCustomMessageHandler::new_liquidity(Arc::clone(&liquidity_source)));
+			(Some(liquidity_source), custom_message_handler)
+		} else {
+			(None, Arc::new(NodeCustomMessageHandler::new_ignoring()))
+		};
 
 	let msg_handler = match gossip_source.as_gossip_sync() {
 		GossipSync::P2P(p2p_gossip_sync) => MessageHandler {
@@ -1346,6 +1636,12 @@ fn build_with_store_internal(
 	));
 
 	liquidity_source.as_ref().map(|l| l.set_peer_manager(Arc::clone(&peer_manager)));
+
+	gossip_source.set_gossip_verifier(
+		Arc::clone(&chain_source),
+		Arc::clone(&peer_manager),
+		Arc::clone(&runtime),
+	);
 
 	let connection_manager =
 		Arc::new(ConnectionManager::new(Arc::clone(&peer_manager), Arc::clone(&logger)));
@@ -1390,16 +1686,6 @@ fn build_with_store_internal(
 			return Err(BuildError::ReadFailed);
 		},
 	}
-
-	// Init payment info storage
-	let payment_store = match io::utils::read_payments(Arc::clone(&kv_store), Arc::clone(&logger)) {
-		Ok(payments) => {
-			Arc::new(PaymentStore::new(payments, Arc::clone(&kv_store), Arc::clone(&logger)))
-		},
-		Err(_) => {
-			return Err(BuildError::ReadFailed);
-		},
-	};
 
 	let event_queue = match io::utils::read_event_queue(Arc::clone(&kv_store), Arc::clone(&logger))
 	{
@@ -1457,21 +1743,39 @@ fn build_with_store_internal(
 	})
 }
 
-fn setup_logger(config: &Config) -> Result<Arc<FilesystemLogger>, BuildError> {
-	let log_dir = match &config.log_dir_path {
-		Some(log_dir) => String::from(log_dir),
-		None => config.storage_dir_path.clone() + "/logs",
+/// Sets up the node logger.
+fn setup_logger(
+	log_writer_config: &Option<LogWriterConfig>, config: &Config,
+) -> Result<Arc<Logger>, BuildError> {
+	let logger = match log_writer_config {
+		Some(LogWriterConfig::File { log_file_path, max_log_level }) => {
+			let log_file_path = log_file_path
+				.clone()
+				.unwrap_or_else(|| format!("{}/{}", config.storage_dir_path, DEFAULT_LOG_FILENAME));
+			let max_log_level = max_log_level.unwrap_or_else(|| DEFAULT_LOG_LEVEL);
+
+			Logger::new_fs_writer(log_file_path, max_log_level)
+				.map_err(|_| BuildError::LoggerSetupFailed)?
+		},
+		Some(LogWriterConfig::Log) => Logger::new_log_facade(),
+
+		Some(LogWriterConfig::Custom(custom_log_writer)) => {
+			Logger::new_custom_writer(Arc::clone(&custom_log_writer))
+		},
+		None => {
+			// Default to use `FileWriter`
+			let log_file_path = format!("{}/{}", config.storage_dir_path, DEFAULT_LOG_FILENAME);
+			let log_level = DEFAULT_LOG_LEVEL;
+			Logger::new_fs_writer(log_file_path, log_level)
+				.map_err(|_| BuildError::LoggerSetupFailed)?
+		},
 	};
 
-	Ok(Arc::new(
-		FilesystemLogger::new(log_dir, config.log_level)
-			.map_err(|_| BuildError::LoggerSetupFailed)?,
-	))
+	Ok(Arc::new(logger))
 }
 
 fn seed_bytes_from_config(
-	config: &Config, entropy_source_config: Option<&EntropySourceConfig>,
-	logger: Arc<FilesystemLogger>,
+	config: &Config, entropy_source_config: Option<&EntropySourceConfig>, logger: Arc<Logger>,
 ) -> Result<[u8; 64], BuildError> {
 	match entropy_source_config {
 		Some(EntropySourceConfig::SeedBytes(bytes)) => Ok(bytes.clone()),
@@ -1492,8 +1796,8 @@ fn seed_bytes_from_config(
 	}
 }
 
-fn derive_vss_xprv(
-	config: Arc<Config>, seed_bytes: &[u8; 64], logger: Arc<FilesystemLogger>,
+fn derive_xprv(
+	config: Arc<Config>, seed_bytes: &[u8; 64], hardened_child_index: u32, logger: Arc<Logger>,
 ) -> Result<Xpriv, BuildError> {
 	use bitcoin::key::Secp256k1;
 
@@ -1502,15 +1806,14 @@ fn derive_vss_xprv(
 		BuildError::InvalidSeedBytes
 	})?;
 
-	xprv.derive_priv(&Secp256k1::new(), &[ChildNumber::Hardened { index: 877 }]).map_err(|e| {
-		log_error!(logger, "Failed to derive VSS secret: {}", e);
-		BuildError::KVStoreSetupFailed
-	})
+	xprv.derive_priv(&Secp256k1::new(), &[ChildNumber::Hardened { index: hardened_child_index }])
+		.map_err(|e| {
+			log_error!(logger, "Failed to derive hardened child secret: {}", e);
+			BuildError::InvalidSeedBytes
+		})
 }
 
-fn reset_persistent_state(
-	logger: Arc<FilesystemLogger>, kv_store: Arc<DynStore>, what: ResetState,
-) {
+fn reset_persistent_state(logger: Arc<Logger>, kv_store: Arc<DynStore>, what: ResetState) {
 	let (node_metrics, scorer, network_graph) = match what {
 		ResetState::NodeMetrics => (true, false, false),
 		ResetState::Scorer => (false, true, false),

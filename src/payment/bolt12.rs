@@ -11,7 +11,7 @@
 
 use crate::config::LDK_PAYMENT_RETRY_TIMEOUT;
 use crate::error::Error;
-use crate::logger::{log_error, log_info, FilesystemLogger, Logger};
+use crate::logger::{log_error, log_info, LdkLogger, Logger};
 use crate::payment::store::{
 	PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus, PaymentStore,
 };
@@ -39,15 +39,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub struct Bolt12Payment {
 	runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>,
 	channel_manager: Arc<ChannelManager>,
-	payment_store: Arc<PaymentStore<Arc<FilesystemLogger>>>,
-	logger: Arc<FilesystemLogger>,
+	payment_store: Arc<PaymentStore<Arc<Logger>>>,
+	logger: Arc<Logger>,
 }
 
 impl Bolt12Payment {
 	pub(crate) fn new(
 		runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>,
-		channel_manager: Arc<ChannelManager>,
-		payment_store: Arc<PaymentStore<Arc<FilesystemLogger>>>, logger: Arc<FilesystemLogger>,
+		channel_manager: Arc<ChannelManager>, payment_store: Arc<PaymentStore<Arc<Logger>>>,
+		logger: Arc<Logger>,
 	) -> Self {
 		Self { runtime, channel_manager, payment_store, logger }
 	}
@@ -93,7 +93,7 @@ impl Bolt12Payment {
 			max_total_routing_fee_msat,
 		) {
 			Ok(()) => {
-				let payee_pubkey = offer.signing_pubkey();
+				let payee_pubkey = offer.issuer_signing_pubkey();
 				log_info!(
 					self.logger,
 					"Initiated sending {}msat to {:?}",
@@ -113,6 +113,7 @@ impl Bolt12Payment {
 					payment_id,
 					kind,
 					Some(offer_amount_msat),
+					None,
 					PaymentDirection::Outbound,
 					PaymentStatus::Pending,
 				);
@@ -137,6 +138,7 @@ impl Bolt12Payment {
 							payment_id,
 							kind,
 							Some(offer_amount_msat),
+							None,
 							PaymentDirection::Outbound,
 							PaymentStatus::Failed,
 						);
@@ -197,7 +199,7 @@ impl Bolt12Payment {
 			max_total_routing_fee_msat,
 		) {
 			Ok(()) => {
-				let payee_pubkey = offer.signing_pubkey();
+				let payee_pubkey = offer.issuer_signing_pubkey();
 				log_info!(
 					self.logger,
 					"Initiated sending {}msat to {:?}",
@@ -217,6 +219,7 @@ impl Bolt12Payment {
 					payment_id,
 					kind,
 					Some(amount_msat),
+					None,
 					PaymentDirection::Outbound,
 					PaymentStatus::Pending,
 				);
@@ -241,6 +244,7 @@ impl Bolt12Payment {
 							payment_id,
 							kind,
 							Some(amount_msat),
+							None,
 							PaymentDirection::Outbound,
 							PaymentStatus::Failed,
 						);
@@ -338,6 +342,7 @@ impl Bolt12Payment {
 			payment_id,
 			kind,
 			Some(refund.amount_msats()),
+			None,
 			PaymentDirection::Inbound,
 			PaymentStatus::Pending,
 		);
@@ -402,6 +407,7 @@ impl Bolt12Payment {
 			payment_id,
 			kind,
 			Some(amount_msat),
+			None,
 			PaymentDirection::Outbound,
 			PaymentStatus::Pending,
 		);

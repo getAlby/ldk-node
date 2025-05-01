@@ -7,6 +7,7 @@
 
 use bdk_chain::bitcoin::psbt::ExtractTxError as BdkExtractTxError;
 use bdk_chain::local_chain::CannotConnectError as BdkChainConnectionError;
+use bdk_chain::tx_graph::CalculateFeeError as BdkChainCalculateFeeError;
 use bdk_wallet::error::CreateTxError as BdkCreateTxError;
 use bdk_wallet::signer::SignerError as BdkSignerError;
 
@@ -33,6 +34,8 @@ pub enum Error {
 	RefundCreationFailed,
 	/// Sending a payment has failed.
 	PaymentSendingFailed,
+	/// Sending of spontaneous payment with custom TLVs failed.
+	InvalidCustomTlvs,
 	/// Sending a payment probe has failed.
 	ProbeSendingFailed,
 	/// A channel could not be opened.
@@ -105,6 +108,10 @@ pub enum Error {
 	InvalidQuantity,
 	/// The given node alias is invalid.
 	InvalidNodeAlias,
+	/// The given date time is invalid.
+	InvalidDateTime,
+	/// The given fee rate is invalid.
+	InvalidFeeRate,
 	/// A payment with the given hash has already been initiated.
 	DuplicatePayment,
 	/// The provided offer was denonminated in an unsupported currency.
@@ -131,6 +138,7 @@ impl fmt::Display for Error {
 			Self::OfferCreationFailed => write!(f, "Failed to create offer."),
 			Self::RefundCreationFailed => write!(f, "Failed to create refund."),
 			Self::PaymentSendingFailed => write!(f, "Failed to send the given payment."),
+			Self::InvalidCustomTlvs => write!(f, "Failed to construct payment with custom TLVs."),
 			Self::ProbeSendingFailed => write!(f, "Failed to send the given payment probe."),
 			Self::ChannelCreationFailed => write!(f, "Failed to create channel."),
 			Self::ChannelClosingFailed => write!(f, "Failed to close channel."),
@@ -171,6 +179,8 @@ impl fmt::Display for Error {
 			Self::InvalidUri => write!(f, "The given URI is invalid."),
 			Self::InvalidQuantity => write!(f, "The given quantity is invalid."),
 			Self::InvalidNodeAlias => write!(f, "The given node alias is invalid."),
+			Self::InvalidDateTime => write!(f, "The given date time is invalid."),
+			Self::InvalidFeeRate => write!(f, "The given fee rate is invalid."),
 			Self::DuplicatePayment => {
 				write!(f, "A payment with the given hash has already been initiated.")
 			},
@@ -199,8 +209,11 @@ impl From<BdkSignerError> for Error {
 }
 
 impl From<BdkCreateTxError> for Error {
-	fn from(_: BdkCreateTxError) -> Self {
-		Self::OnchainTxCreationFailed
+	fn from(e: BdkCreateTxError) -> Self {
+		match e {
+			BdkCreateTxError::CoinSelection(_) => Self::InsufficientFunds,
+			_ => Self::OnchainTxCreationFailed,
+		}
 	}
 }
 
@@ -212,6 +225,12 @@ impl From<BdkExtractTxError> for Error {
 
 impl From<BdkChainConnectionError> for Error {
 	fn from(_: BdkChainConnectionError) -> Self {
+		Self::WalletOperationFailed
+	}
+}
+
+impl From<BdkChainCalculateFeeError> for Error {
+	fn from(_: BdkChainCalculateFeeError) -> Self {
 		Self::WalletOperationFailed
 	}
 }
