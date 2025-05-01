@@ -238,8 +238,8 @@ impl Writeable for PaymentDetails {
 			(7, self.fee_paid_msat, option),
 			(8, self.direction, required),
 			(10, self.status, required),
-			//(131074, Some(self.last_update), option),
-			//(131076, self.fee_msat, option),
+			//(131074, Some(self.last_update), option), // old alby field
+			//(131076, self.fee_msat, option), // old alby field
 			(131078, Some(self.created_at), option),
 		});
 		Ok(())
@@ -263,8 +263,8 @@ impl Readable for PaymentDetails {
 			(7, fee_paid_msat, option),
 			(8, direction, required),
 			(10, status, required),
-			//(131074, last_update, option),
-			//(131076, fee_msat, option),
+			(131074, last_update_unused, option),
+			(131076, fee_msat_unused, option),
 			(131078, created_at, option),
 		});
 
@@ -276,8 +276,11 @@ impl Readable for PaymentDetails {
 		let amount_msat: Option<u64> = amount_msat.0.ok_or(DecodeError::InvalidValue)?;
 		let direction: PaymentDirection = direction.0.ok_or(DecodeError::InvalidValue)?;
 		let status: PaymentStatus = status.0.ok_or(DecodeError::InvalidValue)?;
-		//let last_update: u64 = last_update.unwrap_or(0);
 		let created_at: u64 = created_at.unwrap_or(0);
+
+		// these must still be read otherwise the read breaks (why?)
+		let _last_update_unused: u64 = last_update_unused.unwrap_or(0);
+		let _fee_msat_unused: u64 = fee_msat_unused.unwrap_or(0);
 
 		let kind = if let Some(kind) = kind_opt {
 			// If we serialized the payment kind, use it.
