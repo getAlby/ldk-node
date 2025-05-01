@@ -17,7 +17,6 @@ use ldk_node::io::sqlite_store::SqliteStore;
 use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{
 	Builder, CustomTlvRecord, Event, LightningBalance, Node, NodeError, PendingSweepBalance,
-	TlvEntry,
 };
 
 use lightning::ln::msgs::SocketAddress;
@@ -858,23 +857,24 @@ pub(crate) fn do_channel_full_cycle<E: ElectrumApi>(
 	println!("\nA send_spontaneous_payment");
 	let keysend_amount_msat = 2500_000;
 	// Alby: test spontaneous payment with custom preimage
-	let tlv1 = TlvEntry { r#type: 131073, value: vec![0x00, 0x11, 0x22, 0x33] };
-	let tlv2 = TlvEntry { r#type: 131075, value: vec![0xaa, 0xbb] };
-	let keysend_payment_id = node_a
-		.spontaneous_payment()
-		.send_with_tlvs_and_preimage(
-			keysend_amount_msat,
-			node_b.node_id(),
-			None,
-			vec![tlv1, tlv2],
-			None,
-		)
-		.unwrap();
-	/*let custom_tlvs = vec![CustomTlvRecord { type_num: 13377331, value: vec![1, 2, 3] }];
+	// TODO: re-enable test or wait for LDK-node to add custom preimage support
+	// let tlv1 = TlvEntry { r#type: 131073, value: vec![0x00, 0x11, 0x22, 0x33] };
+	// let tlv2 = TlvEntry { r#type: 131075, value: vec![0xaa, 0xbb] };
+	// let keysend_payment_id = node_a
+	// 	.spontaneous_payment()
+	// 	.send_with_tlvs_and_preimage(
+	// 		keysend_amount_msat,
+	// 		node_b.node_id(),
+	// 		None,
+	// 		vec![tlv1, tlv2],
+	// 		None,
+	// 	)
+	// 	.unwrap();
+	let custom_tlvs = vec![CustomTlvRecord { type_num: 13377331, value: vec![1, 2, 3] }];
 	let keysend_payment_id = node_a
 		.spontaneous_payment()
 		.send_with_custom_tlvs(keysend_amount_msat, node_b.node_id(), None, custom_tlvs.clone())
-		.unwrap();*/
+		.unwrap();
 
 	expect_event!(node_a, PaymentSuccessful);
 	let next_event = node_b.wait_next_event();
