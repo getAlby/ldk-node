@@ -31,12 +31,12 @@ default = []
 # This should be removed once we merge upstream LDK updates:
 # - https://github.com/lightningdevkit/rust-lightning/issues/3424
 # - https://github.com/lightningdevkit/rust-lightning/pull/3431
-max_level_off = []
-max_level_error = []
-max_level_warn = []
-max_level_info = []
-max_level_debug = []
-max_level_trace = []
+# max_level_off = []
+# max_level_error = []
+# max_level_warn = []
+# max_level_info = []
+# max_level_debug = []
+# max_level_trace = []
 
 [dependencies]
 lightning = { version = "0.1.3", features = ["std"] }
