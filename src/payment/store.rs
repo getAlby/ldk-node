@@ -683,7 +683,11 @@ where
 				}
 			},
 			hash_map::Entry::Vacant(e) => {
-				e.insert(payment.clone());
+				let created_at = SystemTime::now()
+					.duration_since(UNIX_EPOCH)
+					.unwrap_or(Duration::ZERO)
+					.as_secs();
+				e.insert(PaymentDetails { created_at, ..payment.clone() });
 				self.persist_info(&payment.id, payment)?;
 				updated = true;
 			},
