@@ -50,6 +50,9 @@ lightning-block-sync = { version = "0.1.0", features = ["rpc-client", "tokio"] }
 lightning-transaction-sync = { version = "0.1.0", features = ["esplora-async-https", "time", "electrum"] }
 lightning-liquidity = { version = "0.1.0", features = ["std"] }
 
+# Alby: see https://aws.github.io/aws-lc-rs/platform_support.html
+aws-lc-rs = { version = "1", features = ["bindgen"] }
+
 #lightning = { git = "https://github.com/lightningdevkit/rust-lightning", branch = "main", features = ["std"] }
 #lightning-types = { git = "https://github.com/lightningdevkit/rust-lightning", branch = "main" }
 #lightning-invoice = { git = "https://github.com/lightningdevkit/rust-lightning", branch = "main", features = ["std"] }
