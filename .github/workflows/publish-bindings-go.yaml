@@ -61,7 +61,7 @@ jobs:
           git config --global user.name "github-actions"
           git config --global push.autoSetupRemote true
 
-          git add ldk_node/ldk_node.go ldk_node/ldk_node.h ldk_node/ldk_node.c
+          git add ldk_node/ldk_node.go ldk_node/ldk_node.h
           git add ldk_node/x86_64-unknown-linux-gnu/libldk_node.so
           git add ldk_node/aarch64-unknown-linux-gnu/libldk_node.so
           git add ldk_node/arm-unknown-linux-gnueabihf/libldk_node.so
