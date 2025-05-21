@@ -1415,6 +1415,9 @@ fn build_with_store_internal(
 			100;
 	}
 
+	// Alby: always allow receiving 100% of channel size.
+	user_config.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
+
 	let message_router =
 		Arc::new(MessageRouter::new(Arc::clone(&network_graph), Arc::clone(&keys_manager)));
 
