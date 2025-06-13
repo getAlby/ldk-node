@@ -807,7 +807,7 @@ where
 							custom_tlvs,
 						};
 
-						let mut payment = PaymentDetails::new(
+						let payment = PaymentDetails::new(
 							payment_id,
 							kind,
 							Some(amount_msat),

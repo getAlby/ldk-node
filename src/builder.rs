@@ -20,6 +20,7 @@ use crate::io::utils::{read_node_metrics, write_node_metrics};
 use crate::io::vss_store::VssStore;
 use crate::io::{
 	self, NODE_METRICS_KEY, NODE_METRICS_PRIMARY_NAMESPACE, NODE_METRICS_SECONDARY_NAMESPACE,
+	PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
 	PEER_INFO_PERSISTENCE_KEY, PEER_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
 	PEER_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
 };
@@ -31,8 +32,8 @@ use crate::message_handler::NodeCustomMessageHandler;
 use crate::peer_store::PeerStore;
 use crate::tx_broadcaster::TransactionBroadcaster;
 use crate::types::{
-	ChainMonitor, ChannelManager, DynStore, GossipSync, Graph, KeysManager, MessageRouter,
-	OnionMessenger, PaymentStore, PeerManager,
+	ChainMonitor, ChannelManager, DynStore, GossipSync, Graph, KeyValue, KeysManager,
+	MessageRouter, MigrateStorage, OnionMessenger, PaymentStore, PeerManager, ResetState,
 };
 use crate::wallet::persist::KVStoreWalletPersister;
 use crate::wallet::Wallet;
@@ -52,7 +53,7 @@ use lightning::routing::scoring::{
 use lightning::sign::EntropySource;
 
 use lightning::util::persist::{
-	read_channel_monitors, CHANNEL_MANAGER_PERSISTENCE_KEY,
+	read_channel_monitors, KVStore, CHANNEL_MANAGER_PERSISTENCE_KEY,
 	CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE, CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
 	CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE, CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
 	NETWORK_GRAPH_PERSISTENCE_KEY, NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,

@@ -5,13 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-/*use crate::hex_utils;
-use crate::io::{
-	PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
-};
-use crate::logger::{log_error, LdkLogger};
-use crate::types::{DynStore, TlvEntry};
-use crate::Error;*/
+use crate::types::TlvEntry;
 
 use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::msgs::DecodeError;
