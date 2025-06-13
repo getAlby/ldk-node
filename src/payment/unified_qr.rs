@@ -13,7 +13,7 @@
 //! [BOLT 12]: https://github.com/lightning/bolts/blob/master/12-offer-encoding.md
 use crate::error::Error;
 use crate::logger::{log_error, LdkLogger, Logger};
-use crate::payment::{Bolt11Payment, Bolt12Payment, OnchainPayment};
+use crate::payment::{bolt11::maybe_wrap_invoice, Bolt11Payment, Bolt12Payment, OnchainPayment};
 use crate::Config;
 
 use lightning::ln::channelmanager::PaymentId;
@@ -68,6 +68,10 @@ impl UnifiedQrPayment {
 	/// can always pay using the provided on-chain address, while newer wallets will
 	/// typically opt to use the provided BOLT11 invoice or BOLT12 offer.
 	///
+	/// The URI will always include an on-chain address. A BOLT11 invoice will be included
+	/// unless invoice generation fails, while a BOLT12 offer will only be included when
+	/// the node has suitable channels for routing.
+	///
 	/// # Parameters
 	/// - `amount_sats`: The amount to be received, specified in satoshis.
 	/// - `description`: A description or note associated with the payment.
@@ -75,9 +79,9 @@ impl UnifiedQrPayment {
 	/// - `expiry_sec`: The expiration time for the payment, specified in seconds.
 	///
 	/// Returns a payable URI that can be used to request and receive a payment of the amount
-	/// given. In case of an error, the function returns `Error::WalletOperationFailed`for on-chain
-	/// address issues, `Error::InvoiceCreationFailed` for BOLT11 invoice issues, or
-	/// `Error::OfferCreationFailed` for BOLT12 offer issues.
+	/// given. Failure to generate the on-chain address will result in an error return
+	/// (`Error::WalletOperationFailed`), while failures in invoice or offer generation will
+	/// result in those components being omitted from the URI.
 	///
 	/// The generated URI can then be given to a QR code library.
 	///
@@ -95,7 +99,7 @@ impl UnifiedQrPayment {
 			Ok(offer) => Some(offer),
 			Err(e) => {
 				log_error!(self.logger, "Failed to create offer: {}", e);
-				return Err(Error::OfferCreationFailed);
+				None
 			},
 		};
 
@@ -111,7 +115,7 @@ impl UnifiedQrPayment {
 			Ok(invoice) => Some(invoice),
 			Err(e) => {
 				log_error!(self.logger, "Failed to create invoice {}", e);
-				return Err(Error::InvoiceCreationFailed);
+				None
 			},
 		};
 
@@ -149,6 +153,7 @@ impl UnifiedQrPayment {
 		}
 
 		if let Some(invoice) = uri_network_checked.extras.bolt11_invoice {
+			let invoice = maybe_wrap_invoice(invoice);
 			match self.bolt11_invoice.send(&invoice, None) {
 				Ok(payment_id) => return Ok(QrPaymentResult::Bolt11 { payment_id }),
 				Err(e) => log_error!(self.logger, "Failed to send BOLT11 invoice: {:?}. This is part of a unified QR code payment. Falling back to the on-chain transaction.", e),

@@ -19,7 +19,8 @@ use crate::io::sqlite_store::{SqliteStore, SqliteStoreConfig};
 use crate::io::utils::{read_node_metrics, write_node_metrics};
 use crate::io::vss_store::VssStore;
 use crate::io::{
-	NODE_METRICS_KEY, NODE_METRICS_PRIMARY_NAMESPACE, NODE_METRICS_SECONDARY_NAMESPACE,
+	self, NODE_METRICS_KEY, NODE_METRICS_PRIMARY_NAMESPACE, NODE_METRICS_SECONDARY_NAMESPACE,
+	PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
 	PEER_INFO_PERSISTENCE_KEY, PEER_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
 	PEER_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
 };
@@ -28,17 +29,15 @@ use crate::liquidity::{
 };
 use crate::logger::{log_error, log_info, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
-use crate::payment::store::PaymentStore;
 use crate::peer_store::PeerStore;
 use crate::tx_broadcaster::TransactionBroadcaster;
 use crate::types::{
 	ChainMonitor, ChannelManager, DynStore, GossipSync, Graph, KeyValue, KeysManager,
-	MessageRouter, MigrateStorage, OnionMessenger, PeerManager, ResetState,
+	MessageRouter, MigrateStorage, OnionMessenger, PaymentStore, PeerManager, ResetState,
 };
 use crate::wallet::persist::KVStoreWalletPersister;
 use crate::wallet::Wallet;
-use crate::{io, Node, NodeMetrics};
-use lightning::util::persist::KVStore;
+use crate::{Node, NodeMetrics};
 
 use chrono::Local;
 use lightning::chain::{chainmonitor, BestBlock, Watch};
@@ -54,7 +53,7 @@ use lightning::routing::scoring::{
 use lightning::sign::EntropySource;
 
 use lightning::util::persist::{
-	read_channel_monitors, CHANNEL_MANAGER_PERSISTENCE_KEY,
+	read_channel_monitors, KVStore, CHANNEL_MANAGER_PERSISTENCE_KEY,
 	CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE, CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
 	CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE, CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
 	NETWORK_GRAPH_PERSISTENCE_KEY, NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
@@ -1214,9 +1213,13 @@ fn build_with_store_internal(
 	let fee_estimator = Arc::new(OnchainFeeEstimator::new());
 
 	let payment_store = match io::utils::read_payments(Arc::clone(&kv_store), Arc::clone(&logger)) {
-		Ok(payments) => {
-			Arc::new(PaymentStore::new(payments, Arc::clone(&kv_store), Arc::clone(&logger)))
-		},
+		Ok(payments) => Arc::new(PaymentStore::new(
+			payments,
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			Arc::clone(&kv_store),
+			Arc::clone(&logger),
+		)),
 		Err(_) => {
 			return Err(BuildError::ReadFailed);
 		},
@@ -1228,6 +1231,7 @@ fn build_with_store_internal(
 		Arc::clone(&tx_broadcaster),
 		Arc::clone(&fee_estimator),
 		Arc::clone(&payment_store),
+		Arc::clone(&config),
 		Arc::clone(&logger),
 	));
 
