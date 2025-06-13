@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use crate::types::{CustomTlvRecord, DynStore, Sweeper, Wallet};
+use crate::types::{CustomTlvRecord, DynStore, PaymentStore, Sweeper, Wallet};
 
 use crate::{
 	hex_utils, BumpTransactionEventHandler, ChannelManager, Error, Graph, PeerInfo, PeerStore,
@@ -14,13 +14,13 @@ use crate::{
 
 use crate::config::{may_announce_channel, Config};
 use crate::connection::ConnectionManager;
+use crate::data_store::DataStoreUpdateResult;
 use crate::fee_estimator::ConfirmationTarget;
 use crate::liquidity::LiquiditySource;
 use crate::logger::Logger;
 
 use crate::payment::store::{
 	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
-	PaymentStore, PaymentStoreUpdateResult,
 };
 
 use crate::io::{
@@ -450,7 +450,7 @@ where
 	output_sweeper: Arc<Sweeper>,
 	network_graph: Arc<Graph>,
 	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
-	payment_store: Arc<PaymentStore<L>>,
+	payment_store: Arc<PaymentStore>,
 	peer_store: Arc<PeerStore<L>>,
 	runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>,
 	logger: L,
@@ -467,7 +467,7 @@ where
 		channel_manager: Arc<ChannelManager>, connection_manager: Arc<ConnectionManager<L>>,
 		output_sweeper: Arc<Sweeper>, network_graph: Arc<Graph>,
 		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
-		payment_store: Arc<PaymentStore<L>>, peer_store: Arc<PeerStore<L>>,
+		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<L>>,
 		runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>, logger: L, config: Arc<Config>,
 	) -> Self {
 		Self {
@@ -816,17 +816,6 @@ where
 							PaymentStatus::Pending,
 						);
 
-						// TODO: remove (use latest_update_timestamp)
-						// payment.last_update = SystemTime::now()
-						// 	.duration_since(UNIX_EPOCH)
-						// 	.unwrap_or(Duration::ZERO)
-						// 	.as_secs();
-
-						// // TODO: is this still needed?
-						// payment.fee_msat = None;
-						// TODO: move to PaymentDetails::new ?
-						payment.created_at = 0;
-
 						match self.payment_store.insert(payment) {
 							Ok(false) => (),
 							Ok(true) => {
@@ -936,12 +925,11 @@ where
 				};
 
 				match self.payment_store.update(&update) {
-					Ok(PaymentStoreUpdateResult::Updated)
-					| Ok(PaymentStoreUpdateResult::Unchanged) => (
+					Ok(DataStoreUpdateResult::Updated) | Ok(DataStoreUpdateResult::Unchanged) => (
 						// No need to do anything if the idempotent update was applied, which might
 						// be the result of a replayed event.
 					),
-					Ok(PaymentStoreUpdateResult::NotFound) => {
+					Ok(DataStoreUpdateResult::NotFound) => {
 						log_error!(
 							self.logger,
 							"Claimed payment with ID {} couldn't be found in store",
@@ -1154,8 +1142,10 @@ where
 						if spendable_amount_sats < required_amount_sats {
 							log_error!(
 								self.logger,
-								"Rejecting inbound Anchor channel from peer {} due to insufficient available on-chain reserves.",
+								"Rejecting inbound Anchor channel from peer {} due to insufficient available on-chain reserves. Available: {}/{}sats",
 								counterparty_node_id,
+								spendable_amount_sats,
+								required_amount_sats,
 							);
 							self.channel_manager
 								.force_close_without_broadcasting_txn(
