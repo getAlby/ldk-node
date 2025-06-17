@@ -30,11 +30,13 @@ use lightning::util::persist::KVStore;
 
 use lightning_invoice::{Bolt11InvoiceDescription, Description};
 
+use bitcoin::address::NetworkUnchecked;
 use bitcoin::hashes::Hash;
+use bitcoin::Address;
 use bitcoin::Amount;
-
 use log::LevelFilter;
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 #[test]
@@ -302,6 +304,10 @@ fn onchain_send_receive() {
 
 	let addr_a = node_a.onchain_payment().new_address().unwrap();
 	let addr_b = node_b.onchain_payment().new_address().unwrap();
+	// This is a Bitcoin Testnet address. Sending funds to this address from the Regtest network will fail
+	let static_address = "tb1q0d40e5rta4fty63z64gztf8c3v20cvet6v2jdh";
+	let unchecked_address = Address::<NetworkUnchecked>::from_str(static_address).unwrap();
+	let addr_c = unchecked_address.assume_checked();
 
 	let premine_amount_sat = 1_100_000;
 	premine_and_distribute_funds(
@@ -364,6 +370,16 @@ fn onchain_send_receive() {
 	assert_eq!(
 		Err(NodeError::InsufficientFunds),
 		node_a.onchain_payment().send_to_address(&addr_b, expected_node_a_balance + 1, None)
+	);
+
+	assert_eq!(
+		Err(NodeError::InvalidAddress),
+		node_a.onchain_payment().send_to_address(&addr_c, expected_node_a_balance + 1, None)
+	);
+
+	assert_eq!(
+		Err(NodeError::InvalidAddress),
+		node_a.onchain_payment().send_all_to_address(&addr_c, true, None)
 	);
 
 	let amount_to_send_sats = 54321;
@@ -478,6 +494,89 @@ fn onchain_send_receive() {
 	let node_b_payments =
 		node_b.list_payments_with_filter(|p| matches!(p.kind, PaymentKind::Onchain { .. }));
 	assert_eq!(node_b_payments.len(), 5);
+}
+
+#[test]
+fn onchain_send_all_retains_reserve() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true, false);
+
+	// Setup nodes
+	let addr_a = node_a.onchain_payment().new_address().unwrap();
+	let addr_b = node_b.onchain_payment().new_address().unwrap();
+
+	let premine_amount_sat = 1_000_000;
+	let reserve_amount_sat = 25_000;
+	let onchain_fee_buffer_sat = 1000;
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![addr_a.clone(), addr_b.clone()],
+		Amount::from_sat(premine_amount_sat),
+	);
+
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
+	assert_eq!(node_b.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
+
+	// Send all over, with 0 reserve as we don't have any channels open.
+	let txid = node_a.onchain_payment().send_all_to_address(&addr_b, true, None).unwrap();
+
+	wait_for_tx(&electrsd.client, txid);
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6);
+
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	// Check node a sent all and node b received it
+	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, 0);
+	assert!(((premine_amount_sat * 2 - onchain_fee_buffer_sat)..=(premine_amount_sat * 2))
+		.contains(&node_b.list_balances().spendable_onchain_balance_sats));
+
+	// Refill to make sure we have enough reserve for the channel open.
+	let txid = bitcoind
+		.client
+		.send_to_address(&addr_a, Amount::from_sat(reserve_amount_sat))
+		.unwrap()
+		.0
+		.parse()
+		.unwrap();
+	wait_for_tx(&electrsd.client, txid);
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6);
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, reserve_amount_sat);
+
+	// Open a channel.
+	open_channel(&node_b, &node_a, premine_amount_sat, false, &electrsd);
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6);
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_event!(node_b, node_a.node_id());
+
+	// Check node a sent all and node b received it
+	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, 0);
+	assert!(((premine_amount_sat - reserve_amount_sat - onchain_fee_buffer_sat)
+		..=premine_amount_sat)
+		.contains(&node_b.list_balances().spendable_onchain_balance_sats));
+
+	// Send all over again, this time ensuring the reserve is accounted for
+	let txid = node_b.onchain_payment().send_all_to_address(&addr_a, true, None).unwrap();
+
+	wait_for_tx(&electrsd.client, txid);
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6);
+
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	// Check node b sent all and node a received it
+	assert_eq!(node_b.list_balances().total_onchain_balance_sats, reserve_amount_sat);
+	assert_eq!(node_b.list_balances().spendable_onchain_balance_sats, 0);
+	assert!(((premine_amount_sat - reserve_amount_sat - onchain_fee_buffer_sat)
+		..=premine_amount_sat)
+		.contains(&node_a.list_balances().spendable_onchain_balance_sats));
 }
 
 #[test]
@@ -984,6 +1083,21 @@ fn generate_bip21_uri() {
 	let address_a = node_a.onchain_payment().new_address().unwrap();
 	let premined_sats = 5_000_000;
 
+	let expected_amount_sats = 100_000;
+	let expiry_sec = 4_000;
+
+	// Test 1: Verify URI generation (on-chain + BOLT11) works
+	// even before any channels are opened. This checks the graceful fallback behavior.
+	let initial_uqr_payment = node_b
+		.unified_qr_payment()
+		.receive(expected_amount_sats, "asdf", expiry_sec)
+		.expect("Failed to generate URI");
+	println!("Initial URI (no channels): {}", initial_uqr_payment);
+
+	assert!(initial_uqr_payment.contains("bitcoin:"));
+	assert!(initial_uqr_payment.contains("lightning="));
+	assert!(!initial_uqr_payment.contains("lno=")); // BOLT12 requires channels
+
 	premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
@@ -1001,20 +1115,16 @@ fn generate_bip21_uri() {
 	expect_channel_ready_event!(node_a, node_b.node_id());
 	expect_channel_ready_event!(node_b, node_a.node_id());
 
-	let expected_amount_sats = 100_000;
-	let expiry_sec = 4_000;
+	// Test 2: Verify URI generation (on-chain + BOLT11 + BOLT12) works after channels are established.
+	let uqr_payment = node_b
+		.unified_qr_payment()
+		.receive(expected_amount_sats, "asdf", expiry_sec)
+		.expect("Failed to generate URI");
 
-	let uqr_payment = node_b.unified_qr_payment().receive(expected_amount_sats, "asdf", expiry_sec);
-
-	match uqr_payment.clone() {
-		Ok(ref uri) => {
-			println!("Generated URI: {}", uri);
-			assert!(uri.contains("bitcoin:"));
-			assert!(uri.contains("lightning="));
-			assert!(uri.contains("lno="));
-		},
-		Err(e) => panic!("Failed to generate URI: {:?}", e),
-	}
+	println!("Generated URI: {}", uqr_payment);
+	assert!(uqr_payment.contains("bitcoin:"));
+	assert!(uqr_payment.contains("lightning="));
+	assert!(uqr_payment.contains("lno="));
 }
 
 #[test]

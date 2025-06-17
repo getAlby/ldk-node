@@ -7,11 +7,13 @@
 
 use persist::KVStoreWalletPersister;
 
-use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
+use crate::config::Config;
+use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger};
 
 use crate::fee_estimator::{ConfirmationTarget, FeeEstimator};
-use crate::payment::store::{ConfirmationStatus, PaymentStore};
+use crate::payment::store::ConfirmationStatus;
 use crate::payment::{PaymentDetails, PaymentDirection, PaymentStatus};
+use crate::types::PaymentStore;
 use crate::Error;
 
 use lightning::chain::chaininterface::BroadcasterInterface;
@@ -34,6 +36,7 @@ use lightning_invoice::RawBolt11Invoice;
 use bdk_chain::spk_client::{FullScanRequest, SyncRequest};
 use bdk_wallet::{Balance, KeychainKind, PersistedWallet, SignOptions, Update};
 
+use bitcoin::address::NetworkUnchecked;
 use bitcoin::blockdata::constants::WITNESS_SCALE_FACTOR;
 use bitcoin::blockdata::locktime::absolute::LockTime;
 use bitcoin::hashes::Hash;
@@ -43,11 +46,12 @@ use bitcoin::secp256k1::ecdh::SharedSecret;
 use bitcoin::secp256k1::ecdsa::{RecoverableSignature, Signature};
 use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey, Signing};
 use bitcoin::{
-	Amount, FeeRate, ScriptBuf, Transaction, TxOut, Txid, WPubkeyHash, WitnessProgram,
-	WitnessVersion,
+	Address, Amount, FeeRate, Network, ScriptBuf, Transaction, TxOut, Txid, WPubkeyHash,
+	WitnessProgram, WitnessVersion,
 };
 
 use std::ops::Deref;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 pub(crate) enum OnchainSendAmount {
@@ -70,7 +74,8 @@ where
 	persister: Mutex<KVStoreWalletPersister>,
 	broadcaster: B,
 	fee_estimator: E,
-	payment_store: Arc<PaymentStore<Arc<Logger>>>,
+	payment_store: Arc<PaymentStore>,
+	config: Arc<Config>,
 	logger: L,
 }
 
@@ -83,11 +88,11 @@ where
 	pub(crate) fn new(
 		wallet: bdk_wallet::PersistedWallet<KVStoreWalletPersister>,
 		wallet_persister: KVStoreWalletPersister, broadcaster: B, fee_estimator: E,
-		payment_store: Arc<PaymentStore<Arc<Logger>>>, logger: L,
+		payment_store: Arc<PaymentStore>, config: Arc<Config>, logger: L,
 	) -> Self {
 		let inner = Mutex::new(wallet);
 		let persister = Mutex::new(wallet_persister);
-		Self { inner, persister, broadcaster, fee_estimator, payment_store, logger }
+		Self { inner, persister, broadcaster, fee_estimator, payment_store, config, logger }
 	}
 
 	pub(crate) fn get_full_scan_request(&self) -> FullScanRequest<KeychainKind> {
@@ -100,6 +105,16 @@ where
 
 	pub(crate) fn get_cached_txs(&self) -> Vec<Arc<Transaction>> {
 		self.inner.lock().unwrap().tx_graph().full_txs().map(|tx_node| tx_node.tx).collect()
+	}
+
+	pub(crate) fn get_unconfirmed_txids(&self) -> Vec<Txid> {
+		self.inner
+			.lock()
+			.unwrap()
+			.transactions()
+			.filter(|t| t.chain_position.is_unconfirmed())
+			.map(|t| t.tx_node.txid)
+			.collect()
 	}
 
 	pub(crate) fn current_best_block(&self) -> BestBlock {
@@ -131,11 +146,12 @@ where
 		}
 	}
 
-	pub(crate) fn apply_unconfirmed_txs(
-		&self, unconfirmed_txs: Vec<(Transaction, u64)>,
+	pub(crate) fn apply_mempool_txs(
+		&self, unconfirmed_txs: Vec<(Transaction, u64)>, evicted_txids: Vec<(Txid, u64)>,
 	) -> Result<(), Error> {
 		let mut locked_wallet = self.inner.lock().unwrap();
 		locked_wallet.apply_unconfirmed_txs(unconfirmed_txs);
+		locked_wallet.apply_evicted_txs(evicted_txids);
 
 		let mut locked_persister = self.persister.lock().unwrap();
 		locked_wallet.persist(&mut locked_persister).map_err(|e| {
@@ -214,7 +230,7 @@ where
 				payment_status,
 			);
 
-			self.payment_store.insert_or_update(&payment)?;
+			self.payment_store.insert_or_update(payment)?;
 		}
 
 		Ok(())
@@ -327,10 +343,21 @@ where
 		self.get_balances(total_anchor_channels_reserve_sats).map(|(_, s)| s)
 	}
 
+	fn parse_and_validate_address(
+		&self, network: Network, address: &Address,
+	) -> Result<Address, Error> {
+		Address::<NetworkUnchecked>::from_str(address.to_string().as_str())
+			.map_err(|_| Error::InvalidAddress)?
+			.require_network(network)
+			.map_err(|_| Error::InvalidAddress)
+	}
+
 	pub(crate) fn send_to_address(
 		&self, address: &bitcoin::Address, send_amount: OnchainSendAmount,
 		fee_rate: Option<FeeRate>,
 	) -> Result<Txid, Error> {
+		self.parse_and_validate_address(self.config.network, &address)?;
+
 		// Use the set fee_rate or default to fee estimation.
 		let confirmation_target = ConfirmationTarget::OnchainPayment;
 		let fee_rate =
@@ -340,6 +367,7 @@ where
 			let mut locked_wallet = self.inner.lock().unwrap();
 
 			// Prepare the tx_builder. We properly check the reserve requirements (again) further down.
+			const DUST_LIMIT_SATS: u64 = 546;
 			let tx_builder = match send_amount {
 				OnchainSendAmount::ExactRetainingReserve { amount_sats, .. } => {
 					let mut tx_builder = locked_wallet.build_tx();
@@ -347,7 +375,9 @@ where
 					tx_builder.add_recipient(address.script_pubkey(), amount).fee_rate(fee_rate);
 					tx_builder
 				},
-				OnchainSendAmount::AllRetainingReserve { cur_anchor_reserve_sats } => {
+				OnchainSendAmount::AllRetainingReserve { cur_anchor_reserve_sats }
+					if cur_anchor_reserve_sats > DUST_LIMIT_SATS =>
+				{
 					let change_address_info = locked_wallet.peek_address(KeychainKind::Internal, 0);
 					let balance = locked_wallet.balance();
 					let spendable_amount_sats = self
@@ -385,6 +415,10 @@ where
 						);
 						e
 					})?;
+
+					// 'cancel' the transaction to free up any used change addresses
+					locked_wallet.cancel_tx(&tmp_tx);
+
 					let estimated_spendable_amount = Amount::from_sat(
 						spendable_amount_sats.saturating_sub(estimated_tx_fee.to_sat()),
 					);
@@ -404,7 +438,8 @@ where
 						.fee_absolute(estimated_tx_fee);
 					tx_builder
 				},
-				OnchainSendAmount::AllDrainingReserve => {
+				OnchainSendAmount::AllDrainingReserve
+				| OnchainSendAmount::AllRetainingReserve { cur_anchor_reserve_sats: _ } => {
 					let mut tx_builder = locked_wallet.build_tx();
 					tx_builder.drain_wallet().drain_to(address.script_pubkey()).fee_rate(fee_rate);
 					tx_builder
