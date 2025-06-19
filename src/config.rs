@@ -30,9 +30,6 @@ const DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS: u64 = 60 * 10;
 const DEFAULT_PROBING_LIQUIDITY_LIMIT_MULTIPLIER: u64 = 3;
 const DEFAULT_ANCHOR_PER_CHANNEL_RESERVE_SATS: u64 = 25_000;
 
-// Enable background syncing of fee rates, onchain and lightning wallet
-pub(crate) const ENABLE_BACKGROUND_SYNC: bool = false;
-
 /// The default log level.
 pub const DEFAULT_LOG_LEVEL: LogLevel = LogLevel::Debug;
 
