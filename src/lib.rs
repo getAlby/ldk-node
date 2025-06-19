@@ -128,8 +128,8 @@ pub use builder::NodeBuilder as Builder;
 
 use chain::ChainSource;
 use config::{
-	default_user_config, may_announce_channel, ChannelConfig, Config, ENABLE_BACKGROUND_SYNC,
-	NODE_ANN_BCAST_INTERVAL, PEER_RECONNECTION_INTERVAL, RGS_SYNC_INTERVAL,
+	default_user_config, may_announce_channel, ChannelConfig, Config, NODE_ANN_BCAST_INTERVAL,
+	PEER_RECONNECTION_INTERVAL, RGS_SYNC_INTERVAL,
 };
 use connection::ConnectionManager;
 use event::{EventHandler, EventQueue};
@@ -255,25 +255,17 @@ impl Node {
 			runtime_ref.block_on(async move { chain_source.update_fee_rate_estimates().await })
 		})?;
 
-		// Alby: disable default background sync
-		if ENABLE_BACKGROUND_SYNC {
-			// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
-			let stop_sync_receiver = self.stop_sender.subscribe();
-			let chain_source = Arc::clone(&self.chain_source);
-			let sync_cman = Arc::clone(&self.channel_manager);
-			let sync_cmon = Arc::clone(&self.chain_monitor);
-			let sync_sweeper = Arc::clone(&self.output_sweeper);
-			runtime.spawn(async move {
-				chain_source
-					.continuously_sync_wallets(
-						stop_sync_receiver,
-						sync_cman,
-						sync_cmon,
-						sync_sweeper,
-					)
-					.await;
-			});
-		}
+		// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
+		let stop_sync_receiver = self.stop_sender.subscribe();
+		let chain_source = Arc::clone(&self.chain_source);
+		let sync_cman = Arc::clone(&self.channel_manager);
+		let sync_cmon = Arc::clone(&self.chain_monitor);
+		let sync_sweeper = Arc::clone(&self.output_sweeper);
+		runtime.spawn(async move {
+			chain_source
+				.continuously_sync_wallets(stop_sync_receiver, sync_cman, sync_cmon, sync_sweeper)
+				.await;
+		});
 
 		if self.gossip_source.is_rgs() {
 			let gossip_source = Arc::clone(&self.gossip_source);

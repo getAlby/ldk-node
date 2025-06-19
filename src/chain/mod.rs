@@ -360,8 +360,9 @@ impl ChainSource {
 	) {
 		match self {
 			Self::Esplora { sync_config, logger, .. } => {
-				if let Some(background_sync_config) = sync_config.background_sync_config.as_ref() {
-					self.start_tx_based_sync_loop(
+				if let Some(_background_sync_config) = sync_config.background_sync_config.as_ref() {
+					// Alby: background sync is disabled - sanity check
+					/*self.start_tx_based_sync_loop(
 						stop_sync_receiver,
 						channel_manager,
 						chain_monitor,
@@ -369,13 +370,18 @@ impl ChainSource {
 						background_sync_config,
 						Arc::clone(&logger),
 					)
-					.await
+					.await*/
+					log_error!(
+						logger,
+						"Alby LDK-node default background syncing should be disabled. This must not happen!",
+					);
 				} else {
 					// Background syncing is disabled
-					log_info!(
+					// Alby: expected background syncing to be disabled
+					/*log_info!(
 						logger,
 						"Background syncing is disabled. Manual syncing required for onchain wallet, lightning wallet, and fee rate updates.",
-					);
+					);*/
 					return;
 				}
 			},
