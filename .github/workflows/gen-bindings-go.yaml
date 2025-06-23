@@ -20,7 +20,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install uniffi-bindgen-go
-        run: cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.3.0+v0.28.3
+        run: cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.4.0+v0.28.3
 
       - name: Generate bindings
         run: uniffi-bindgen-go bindings/ldk_node.udl -o ffi/golang -c ./uniffi.toml
