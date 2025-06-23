@@ -88,7 +88,7 @@ Alby Go bindings are automatically built by a github workflow and published to l
 You can test locally with the following:
 
 - install a recent version of rust
-- cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.3.0+v0.28.3
+- cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.4.0+v0.28.3
 - ran cargo clean
 - run ./scripts/uniffi_bindgen_generate_go.sh
 - copied the outputs to my alby hub directory (cp ffi/golang/ldk_node ../hub -r)
