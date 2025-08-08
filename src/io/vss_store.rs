@@ -61,14 +61,7 @@ impl VssStore {
 			derive_data_encryption_and_obfuscation_keys(&vss_seed);
 		let key_obfuscator = KeyObfuscator::new(obfuscation_master_key);
 		let storable_builder = StorableBuilder::new(data_encryption_key, RandEntropySource);
-		let retry_policy: FilteredRetryPolicy<
-			JitteredRetryPolicy<
-				MaxTotalDelayRetryPolicy<
-					MaxAttemptsRetryPolicy<ExponentialBackoffRetryPolicy<VssError>>,
-				>,
-			>,
-			Box<dyn Fn(&VssError) -> bool + Send + Sync + 'static>,
-		> = ExponentialBackoffRetryPolicy::new(Duration::from_millis(10))
+		let retry_policy = ExponentialBackoffRetryPolicy::new(Duration::from_millis(10))
 			//.with_max_attempts(10)
 			.with_max_attempts(15) // Alby: account for unexpected networking errors
 			//.with_max_total_delay(Duration::from_secs(15))
