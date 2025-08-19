@@ -82,7 +82,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, Once, RwLock};
 use std::time::SystemTime;
 use vss_client::headers::{FixedHeaders, LnurlAuthToJwtProvider, VssHeaderProvider};
 
@@ -1128,10 +1128,13 @@ fn build_with_store_internal(
 	liquidity_source_config: Option<&LiquiditySourceConfig>, seed_bytes: [u8; 64],
 	logger: Arc<Logger>, kv_store: Arc<DynStore>, reset_state: Option<ResetState>,
 ) -> Result<Node, BuildError> {
+	optionally_install_rustls_cryptoprovider();
+
 	// Alby: reset persistent state if requested.
 	if let Some(what) = reset_state {
 		reset_persistent_state(logger.clone(), kv_store.clone(), what);
 	}
+
 	if let Err(err) = may_announce_channel(&config) {
 		if config.announcement_addresses.is_some() {
 			log_error!(logger, "Announcement addresses were set but some required configuration options for node announcement are missing: {}", err);
@@ -1718,12 +1721,16 @@ fn build_with_store_internal(
 	};
 
 	let (stop_sender, _) = tokio::sync::watch::channel(());
-	let (event_handling_stopped_sender, _) = tokio::sync::watch::channel(());
+	let background_processor_task = Mutex::new(None);
+	let background_tasks = Mutex::new(None);
+	let cancellable_background_tasks = Mutex::new(None);
 
 	Ok(Node {
 		runtime,
 		stop_sender,
-		event_handling_stopped_sender,
+		background_processor_task,
+		background_tasks,
+		cancellable_background_tasks,
 		config,
 		wallet,
 		chain_source,
@@ -1748,6 +1755,25 @@ fn build_with_store_internal(
 		is_listening,
 		node_metrics,
 	})
+}
+
+fn optionally_install_rustls_cryptoprovider() {
+	// Acquire a global Mutex, ensuring that only one process at a time install the provider. This
+	// is mostly required for running tests concurrently.
+	static INIT_CRYPTO: Once = Once::new();
+
+	INIT_CRYPTO.call_once(|| {
+		// Ensure we always install a `CryptoProvider` for `rustls` if it was somehow not previously installed by now.
+		if rustls::crypto::CryptoProvider::get_default().is_none() {
+			let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+		}
+
+		// Refuse to startup without TLS support. Better to catch it now than even later at runtime.
+		assert!(
+			rustls::crypto::CryptoProvider::get_default().is_some(),
+			"We need to have a CryptoProvider"
+		);
+	});
 }
 
 /// Sets up the node logger.
