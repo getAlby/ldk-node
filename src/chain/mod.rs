@@ -23,7 +23,7 @@ use crate::fee_estimator::{
 	ConfirmationTarget, OnchainFeeEstimator,
 };
 use crate::io::utils::write_node_metrics;
-use crate::logger::{log_bytes, log_error, log_info, log_trace, LdkLogger, Logger};
+use crate::logger::{log_bytes, log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use crate::types::{Broadcaster, ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, NodeMetrics};
 
@@ -857,6 +857,7 @@ impl ChainSource {
 					&*sync_sweeper as &(dyn Confirm + Sync + Send),
 				];
 
+				log_debug!(logger, "Acquiring lightning wallet sync lock");
 				let receiver_res = {
 					let mut status_lock = lightning_wallet_sync_status.lock().unwrap();
 					status_lock.register_or_subscribe_pending_sync()
@@ -890,14 +891,17 @@ impl ChainSource {
 									.ok()
 									.map(|d| d.as_secs());
 								{
+									log_debug!(logger, "Acquiring node metrics lock");
 									let mut locked_node_metrics = node_metrics.write().unwrap();
 									locked_node_metrics.latest_lightning_wallet_sync_timestamp =
 										unix_time_secs_opt;
+									log_debug!(logger, "Writing node metrics");
 									write_node_metrics(
 										&*locked_node_metrics,
 										Arc::clone(&kv_store),
 										Arc::clone(&logger),
 									)?;
+									log_debug!(logger, "Updated node metrics");
 								}
 
 								periodically_archive_fully_resolved_monitors(
@@ -1235,13 +1239,16 @@ impl ChainSource {
 				let unix_time_secs_opt =
 					SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
 				{
+					log_debug!(logger, "Acquiring node metrics lock");
 					let mut locked_node_metrics = node_metrics.write().unwrap();
 					locked_node_metrics.latest_fee_rate_cache_update_timestamp = unix_time_secs_opt;
+					log_debug!(logger, "Writing node metrics");
 					write_node_metrics(
 						&*locked_node_metrics,
 						Arc::clone(&kv_store),
 						Arc::clone(&logger),
 					)?;
+					log_debug!(logger, "Updated node metrics");
 				}
 
 				Ok(())
