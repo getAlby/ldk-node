@@ -67,13 +67,13 @@ pub(crate) const NODE_ANN_BCAST_INTERVAL: Duration = Duration::from_secs(60 * 60
 pub(crate) const WALLET_SYNC_INTERVAL_MINIMUM_SECS: u64 = 10;
 
 // The timeout after which we abort a wallet syncing operation.
-pub(crate) const BDK_WALLET_SYNC_TIMEOUT_SECS: u64 = 20; // Alby: originally 90
+pub(crate) const BDK_WALLET_SYNC_TIMEOUT_SECS: u64 = 40; //20; // Alby: originally 90
 
 // The timeout after which we abort a wallet syncing operation.
-pub(crate) const LDK_WALLET_SYNC_TIMEOUT_SECS: u64 = 10; // Alby: originally 90
+pub(crate) const LDK_WALLET_SYNC_TIMEOUT_SECS: u64 = 20; //10; // Alby: originally 90
 
 // The timeout after which we give up waiting on LDK's event handler to exit on shutdown.
-pub(crate) const LDK_EVENT_HANDLER_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
+pub(crate) const LDK_EVENT_HANDLER_SHUTDOWN_TIMEOUT_SECS: u64 = 60; // 30;
 
 // The timeout after which we give up waiting on a background task to exit on shutdown.
 pub(crate) const BACKGROUND_TASK_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
