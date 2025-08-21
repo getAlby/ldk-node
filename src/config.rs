@@ -76,7 +76,7 @@ pub(crate) const LDK_WALLET_SYNC_TIMEOUT_SECS: u64 = 20; //10; // Alby: original
 pub(crate) const LDK_EVENT_HANDLER_SHUTDOWN_TIMEOUT_SECS: u64 = 60; // 30;
 
 // The timeout after which we give up waiting on a background task to exit on shutdown.
-pub(crate) const BACKGROUND_TASK_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
+pub(crate) const BACKGROUND_TASK_SHUTDOWN_TIMEOUT_SECS: u64 = 20; //5;
 
 // The timeout after which we abort a fee rate cache update operation.
 pub(crate) const FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS: u64 = 10; //5;
