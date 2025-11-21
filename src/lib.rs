@@ -127,8 +127,14 @@ use chain::ChainSource;
 use config::{
 	//default_user_config, may_announce_channel, ChannelConfig, Config,
 	//BACKGROUND_TASK_SHUTDOWN_TIMEOUT_SECS, LDK_EVENT_HANDLER_SHUTDOWN_TIMEOUT_SECS,
-	default_user_config, may_announce_channel, AsyncPaymentsRole, ChannelConfig, Config,
-	NODE_ANN_BCAST_INTERVAL, PEER_RECONNECTION_INTERVAL, RGS_SYNC_INTERVAL,
+	default_user_config,
+	may_announce_channel,
+	AsyncPaymentsRole,
+	ChannelConfig,
+	Config,
+	NODE_ANN_BCAST_INTERVAL,
+	PEER_RECONNECTION_INTERVAL,
+	RGS_SYNC_INTERVAL,
 };
 use connection::ConnectionManager;
 pub use error::Error as NodeError;
@@ -342,7 +348,7 @@ impl Node {
 						}
 					}
 				}
-			}, runtime_handle);
+			});
 		}
 
 		if let Some(pathfinding_scores_sync_url) = self.pathfinding_scores_sync_url.as_ref() {
@@ -507,7 +513,7 @@ impl Node {
 						}
 				}
 			}
-		}, runtime_handle);
+		});
 
 		// Regularly broadcast node announcements.
 		let bcast_cm = Arc::clone(&self.channel_manager);
@@ -590,7 +596,7 @@ impl Node {
 						}
 					}
 				}
-			}, runtime_handle);
+			});
 		}
 
 		let stop_tx_bcast = self.stop_sender.subscribe();
@@ -709,9 +715,7 @@ impl Node {
 						}
 					}
 				}
-			},
-				runtime_handle,
-			);
+			});
 		}
 
 		log_info!(self.logger, "Startup complete.");
@@ -1538,6 +1542,7 @@ impl Node {
 				},
 			)
 		});
+	}
 
 	/// Manually sync the LDK and BDK wallets with the current chain state and update the fee rate
 	/// cache.

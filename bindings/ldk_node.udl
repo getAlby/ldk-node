@@ -245,7 +245,7 @@ interface Bolt12Payment {
 interface SpontaneousPayment {
 	// Alby: custom TLV & preimage (TODO: update to use send_with_preimage_and_custom_tlvs)
 	[Throws=NodeError]
-	PaymentId send_with_tlvs_and_preimage(u64 amount_msat, PublicKey node_id, SendingParameters? sending_parameters, sequence<TlvEntry> custom_tlvs, PaymentPreimage? preimage);
+	PaymentId send_with_tlvs_and_preimage(u64 amount_msat, PublicKey node_id, RouteParametersConfig? route_parameters, sequence<TlvEntry> custom_tlvs, PaymentPreimage? preimage);
 	//PaymentId send(u64 amount_msat, PublicKey node_id, RouteParametersConfig? route_parameters);
 	//[Throws=NodeError]
 	//PaymentId send_with_custom_tlvs(u64 amount_msat, PublicKey node_id, RouteParametersConfig? route_parameters, sequence<CustomTlvRecord> custom_tlvs);
