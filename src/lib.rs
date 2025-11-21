@@ -1704,9 +1704,9 @@ impl Node {
 
 	/// Alby: Return encoded channel monitors for a recovery of last resort
 	pub fn get_encoded_channel_monitors(&self) -> Result<Vec<KeyValue>, Error> {
-		let channel_monitor_store = Arc::clone(&self.kv_store);
+		let channel_monitor_store: &dyn KVStoreSync = &*self.kv_store;
 		let channel_monitor_logger = Arc::clone(&self.logger);
-		let keys = channel_monitor_store.list("monitors", "").map_err(|e| {
+		let keys = KVStoreSync::list(channel_monitor_store, "monitors", "").map_err(|e| {
 			log_error!(channel_monitor_logger, "Failed to get monitor keys: {}", e);
 			Error::ConnectionFailed
 		})?;
@@ -1714,10 +1714,11 @@ impl Node {
 		let mut entries = Vec::new();
 
 		for key in keys {
-			let value = channel_monitor_store.read("monitors", "", &key).map_err(|e| {
-				log_error!(channel_monitor_logger, "Failed to get monitor value: {}", e);
-				Error::ConnectionFailed
-			})?;
+			let value =
+				KVStoreSync::read(channel_monitor_store, "monitors", "", &key).map_err(|e| {
+					log_error!(channel_monitor_logger, "Failed to get monitor value: {}", e);
+					Error::ConnectionFailed
+				})?;
 			entries.push(KeyValue { key, value })
 		}
 
@@ -1739,12 +1740,13 @@ impl Node {
 
 		let mut total_lightning_balance_sats = 0;
 		let mut lightning_balances = Vec::new();
-		for channel_id in self.chain_monitor.list_monitors() {
+		for (channel_id) in self.chain_monitor.list_monitors() {
 			match self.chain_monitor.get_monitor(channel_id) {
 				Ok(monitor) => {
 					funding_txo_by_channel_id.insert(channel_id, funding_txo);
 
 					let counterparty_node_id = monitor.get_counterparty_node_id();
+					let funding_txo = monitor.get_funding_txo();
 					for ldk_balance in monitor.get_claimable_balances() {
 						total_lightning_balance_sats += ldk_balance.claimable_amount_satoshis();
 						lightning_balances.push(LightningBalance::from_ldk_balance(
@@ -1770,9 +1772,9 @@ impl Node {
 				// by LDK for a while (4032 blocks since balances become empty), so we can still try to access it.
 				// See [`periodically_archive_fully_resolved_monitors`] for details.
 				let funding_txo =
-					out.channel_id.and_then(|c| funding_txo_by_channel_id.get(&c)).cloned();
+					out.channel_id.and_then(|c| funding_txo_by_channel_id.get(&c).cloned());
 				let chmon = funding_txo.and_then(|txo| self.chain_monitor.get_monitor(txo).ok());
-				let counterparty_node_id = chmon.and_then(|m| m.get_counterparty_node_id());
+				let counterparty_node_id = chmon.and_then(|m| Some(m.get_counterparty_node_id()));
 				PendingSweepBalance::from_tracked_spendable_output(
 					out,
 					counterparty_node_id,
