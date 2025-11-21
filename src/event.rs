@@ -11,10 +11,6 @@ use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
-/*use crate::{
-	hex_utils, BumpTransactionEventHandler, ChannelManager, Error, Graph, PeerInfo, PeerStore,
-	TlvEntry, UserChannelId,
-};*/
 use bitcoin::blockdata::locktime::absolute::LockTime;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Amount, OutPoint};

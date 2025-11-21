@@ -113,7 +113,8 @@ impl SqliteStore {
 
 		if config.transient_graph {
 			// Drop existing network graph if it has been persisted before.
-			ret.inner.remove_internal(
+			KVStoreSync::remove(
+				&ret,
 				NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
 				NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
 				NETWORK_GRAPH_PERSISTENCE_KEY,

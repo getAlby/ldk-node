@@ -86,14 +86,14 @@ pub struct VssStore {
 	internal_runtime: Option<tokio::runtime::Runtime>,
 	// Alby: secondary kv store for saving the network graph as it's large and shouldn't be saved to VSS
 	// NOTE: for Alby Cloud we use a transient network graph (saved in memory and rebuilt on startup)
-	secondary_kv_store: Arc<dyn KVStore + Send + Sync>,
+	secondary_kv_store: Arc<crate::types::DynStore>,
 }
 
 impl VssStore {
 	pub(crate) fn new(
 		base_url: String, store_id: String, vss_seed: [u8; 32],
 		header_provider: Arc<dyn VssHeaderProvider>,
-		secondary_kv_store: Arc<dyn KVStore + Send + Sync>,
+		secondary_kv_store: Arc<crate::types::DynStore>,
 	) -> io::Result<Self> {
 		let next_version = AtomicU64::new(1);
 		let internal_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -189,7 +189,12 @@ impl KVStoreSync for VssStore {
 			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
 			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
 		{
-			return self.secondary_kv_store.read(primary_namespace, secondary_namespace, key);
+			return lightning::util::persist::KVStoreSync::read(
+				&*self.secondary_kv_store,
+				primary_namespace,
+				secondary_namespace,
+				key,
+			);
 		}
 
 		let internal_runtime = self.internal_runtime.as_ref().ok_or_else(|| {
@@ -217,7 +222,13 @@ impl KVStoreSync for VssStore {
 			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
 			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
 		{
-			return self.secondary_kv_store.write(primary_namespace, secondary_namespace, key, buf);
+			return lightning::util::persist::KVStoreSync::write(
+				&*self.secondary_kv_store,
+				primary_namespace,
+				secondary_namespace,
+				key,
+				buf,
+			);
 		}
 		let internal_runtime = self.internal_runtime.as_ref().ok_or_else(|| {
 			debug_assert!(false, "Failed to access internal runtime");
@@ -255,7 +266,8 @@ impl KVStoreSync for VssStore {
 			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
 			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
 		{
-			return self.secondary_kv_store.remove(
+			return lightning::util::persist::KVStoreSync::remove(
+				&*self.secondary_kv_store,
 				primary_namespace,
 				secondary_namespace,
 				key,
@@ -327,7 +339,12 @@ impl KVStore for VssStore {
 			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
 			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
 		{
-			return self.secondary_kv_store.read(primary_namespace, secondary_namespace, key);
+			return lightning::util::persist::KVStore::read(
+				&*self.secondary_kv_store,
+				primary_namespace,
+				secondary_namespace,
+				key,
+			);
 		}
 		let primary_namespace = primary_namespace.to_string();
 		let secondary_namespace = secondary_namespace.to_string();
@@ -347,7 +364,13 @@ impl KVStore for VssStore {
 			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
 			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
 		{
-			return self.secondary_kv_store.write(primary_namespace, secondary_namespace, key, buf);
+			return lightning::util::persist::KVStore::write(
+				&*self.secondary_kv_store,
+				primary_namespace,
+				secondary_namespace,
+				key,
+				buf,
+			);
 		}
 		let locking_key = self.build_locking_key(primary_namespace, secondary_namespace, key);
 		let (inner_lock_ref, version) = self.get_new_version_and_lock_ref(locking_key.clone());
@@ -378,7 +401,8 @@ impl KVStore for VssStore {
 			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
 			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
 		{
-			return self.secondary_kv_store.remove(
+			return lightning::util::persist::KVStore::remove(
+				&*self.secondary_kv_store,
 				primary_namespace,
 				secondary_namespace,
 				key,

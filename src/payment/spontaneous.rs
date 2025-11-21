@@ -19,7 +19,7 @@ use crate::config::{Config, LDK_PAYMENT_RETRY_TIMEOUT};
 use crate::error::Error;
 use crate::logger::{log_error, log_info, LdkLogger, Logger};
 use crate::payment::store::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
-use crate::types::{ChannelManager, CustomTlvRecord, KeysManager, PaymentStore, TlvEntry};
+use crate::types::{ChannelManager, CustomTlvRecord, KeysManager, PaymentStore};
 
 // The default `final_cltv_expiry_delta` we apply when not set.
 const LDK_DEFAULT_FINAL_CLTV_EXPIRY_DELTA: u32 = 144;
@@ -45,118 +45,6 @@ impl SpontaneousPayment {
 		logger: Arc<Logger>,
 	) -> Self {
 		Self { channel_manager, keys_manager, payment_store, config, is_running, logger }
-	}
-
-	// Alby: send a keysend payment with TLVs and preimage
-	///
-	/// If `sending_parameters` are provided they will override the default as well as the
-	/// node-wide parameters configured via [`Config::sending_parameters`] on a per-field basis.
-	pub fn send_with_tlvs_and_preimage(
-		&self, amount_msat: u64, node_id: PublicKey,
-		route_parameters: Option<RouteParametersConfig>, custom_tlvs: Vec<TlvEntry>,
-		preimage: Option<PaymentPreimage>,
-	) -> Result<PaymentId, Error> {
-		let rt_lock = self.runtime.read().unwrap();
-		if rt_lock.is_none() {
-			return Err(Error::NotRunning);
-		}
-
-		let payment_preimage = preimage
-			.unwrap_or_else(|| PaymentPreimage(self.keys_manager.get_secure_random_bytes()));
-		let payment_hash = PaymentHash::from(payment_preimage);
-		let payment_id = PaymentId(payment_hash.0);
-
-		if let Some(payment) = self.payment_store.get(&payment_id) {
-			if payment.status == PaymentStatus::Pending
-				|| payment.status == PaymentStatus::Succeeded
-			{
-				log_error!(self.logger, "Payment error: must not send duplicate payments.");
-				return Err(Error::DuplicatePayment);
-			}
-		}
-
-		let mut route_params = RouteParameters::from_payment_params_and_value(
-			PaymentParameters::from_node_id(node_id, LDK_DEFAULT_FINAL_CLTV_EXPIRY_DELTA),
-			amount_msat,
-		);
-
-		let override_params = route_parameters.as_ref().or(self.config.route_parameters.as_ref());
-		if let Some(override_params) = override_params {
-			override_params
-				.max_total_routing_fee_msat
-				.map(|f| route_params.max_total_routing_fee_msat = f.into());
-			override_params
-				.max_total_cltv_expiry_delta
-				.map(|d| route_params.payment_params.max_total_cltv_expiry_delta = d);
-			override_params.max_path_count.map(|p| route_params.payment_params.max_path_count = p);
-			override_params
-				.max_channel_saturation_power_of_half
-				.map(|s| route_params.payment_params.max_channel_saturation_power_of_half = s);
-		};
-
-		let recipient_fields = RecipientOnionFields::spontaneous_empty()
-			.with_custom_tlvs(
-				custom_tlvs.iter().map(|tlv| (tlv.r#type, tlv.value.clone())).collect(),
-			)
-			.map_err(|_| {
-				log_error!(self.logger, "Payment error: invalid custom TLVs.");
-				Error::InvalidCustomTlv
-			})?;
-
-		match self.channel_manager.send_spontaneous_payment(
-			Some(payment_preimage),
-			recipient_fields,
-			PaymentId(payment_hash.0),
-			route_params,
-			Retry::Timeout(LDK_PAYMENT_RETRY_TIMEOUT),
-		) {
-			Ok(_hash) => {
-				log_info!(self.logger, "Initiated sending {}msat to {}.", amount_msat, node_id);
-
-				let kind = PaymentKind::Spontaneous {
-					hash: payment_hash,
-					preimage: Some(payment_preimage),
-					custom_tlvs,
-				};
-				let payment = PaymentDetails::new(
-					payment_id,
-					kind,
-					Some(amount_msat),
-					None,
-					PaymentDirection::Outbound,
-					PaymentStatus::Pending,
-				);
-
-				self.payment_store.insert(payment)?;
-
-				Ok(payment_id)
-			},
-			Err(e) => {
-				log_error!(self.logger, "Failed to send payment: {:?}", e);
-
-				match e {
-					RetryableSendFailure::DuplicatePayment => Err(Error::DuplicatePayment),
-					_ => {
-						let kind = PaymentKind::Spontaneous {
-							hash: payment_hash,
-							preimage: Some(payment_preimage),
-							custom_tlvs,
-						};
-						let payment = PaymentDetails::new(
-							payment_id,
-							kind,
-							Some(amount_msat),
-							None,
-							PaymentDirection::Outbound,
-							PaymentStatus::Failed,
-						);
-
-						self.payment_store.insert(payment)?;
-						Err(Error::PaymentSendingFailed)
-					},
-				}
-			},
-		}
 	}
 
 	/// Send a spontaneous aka. "keysend", payment.

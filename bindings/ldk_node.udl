@@ -243,16 +243,13 @@ interface Bolt12Payment {
 };
 
 interface SpontaneousPayment {
-	// Alby: custom TLV & preimage (TODO: update to use send_with_preimage_and_custom_tlvs)
+	PaymentId send(u64 amount_msat, PublicKey node_id, RouteParametersConfig? route_parameters);
 	[Throws=NodeError]
-	PaymentId send_with_tlvs_and_preimage(u64 amount_msat, PublicKey node_id, RouteParametersConfig? route_parameters, sequence<TlvEntry> custom_tlvs, PaymentPreimage? preimage);
-	//PaymentId send(u64 amount_msat, PublicKey node_id, RouteParametersConfig? route_parameters);
-	//[Throws=NodeError]
-	//PaymentId send_with_custom_tlvs(u64 amount_msat, PublicKey node_id, RouteParametersConfig? route_parameters, sequence<CustomTlvRecord> custom_tlvs);
-	//[Throws=NodeError]
-	//PaymentId send_with_preimage(u64 amount_msat, PublicKey node_id, PaymentPreimage preimage, RouteParametersConfig? route_parameters);
-	//[Throws=NodeError]
-	//PaymentId send_with_preimage_and_custom_tlvs(u64 amount_msat, PublicKey node_id, sequence<CustomTlvRecord> custom_tlvs, PaymentPreimage preimage, RouteParametersConfig? route_parameters);
+	PaymentId send_with_custom_tlvs(u64 amount_msat, PublicKey node_id, RouteParametersConfig? route_parameters, sequence<CustomTlvRecord> custom_tlvs);
+	[Throws=NodeError]
+	PaymentId send_with_preimage(u64 amount_msat, PublicKey node_id, PaymentPreimage preimage, RouteParametersConfig? route_parameters);
+	[Throws=NodeError]
+	PaymentId send_with_preimage_and_custom_tlvs(u64 amount_msat, PublicKey node_id, sequence<CustomTlvRecord> custom_tlvs, PaymentPreimage preimage, RouteParametersConfig? route_parameters);
 	[Throws=NodeError]
 	void send_probes(u64 amount_msat, PublicKey node_id);
 };
@@ -626,7 +623,7 @@ interface LightningBalance {
 		ChannelId channel_id,
 		PublicKey counterparty_node_id,
 		Txid funding_tx_id,
-		u16 funding_tx_index,
+		u32 funding_tx_index,
 		u64 amount_satoshis,
 		u64 transaction_fee_satoshis,
 		u64 outbound_payment_htlc_rounded_msat,
@@ -638,7 +635,7 @@ interface LightningBalance {
 		ChannelId channel_id,
 		PublicKey counterparty_node_id,
 		Txid funding_tx_id,
-		u16 funding_tx_index,
+		u32 funding_tx_index,
 		u64 amount_satoshis,
 		u32 confirmation_height,
 		BalanceSource source
@@ -647,7 +644,7 @@ interface LightningBalance {
 		ChannelId channel_id,
 		PublicKey counterparty_node_id,
 		Txid funding_tx_id,
-		u16 funding_tx_index,
+		u32 funding_tx_index,
 		u64 amount_satoshis,
 		u32 timeout_height,
 		PaymentHash payment_hash,
@@ -657,7 +654,7 @@ interface LightningBalance {
 		ChannelId channel_id,
 		PublicKey counterparty_node_id,
 		Txid funding_tx_id,
-		u16 funding_tx_index,
+		u32 funding_tx_index,
 		u64 amount_satoshis,
 		u32 claimable_height,
 		PaymentHash payment_hash,
@@ -667,7 +664,7 @@ interface LightningBalance {
 		ChannelId channel_id,
 		PublicKey counterparty_node_id,
 		Txid funding_tx_id,
-		u16 funding_tx_index,
+		u32 funding_tx_index,
 		u64 amount_satoshis,
 		u32 expiry_height,
 		PaymentHash payment_hash
@@ -676,7 +673,7 @@ interface LightningBalance {
 		ChannelId channel_id,
 		PublicKey counterparty_node_id,
 		Txid funding_tx_id,
-		u16 funding_tx_index,
+		u32 funding_tx_index,
 		u64 amount_satoshis
 	);
 };
@@ -695,7 +692,7 @@ interface PendingSweepBalance {
 		u64 amount_satoshis,
 		PublicKey? counterparty_node_id,
 		Txid? funding_tx_id,
-		u16? funding_tx_index
+		u32? funding_tx_index
 	);
 	BroadcastAwaitingConfirmation (
 		ChannelId? channel_id,
@@ -704,7 +701,7 @@ interface PendingSweepBalance {
 		u64 amount_satoshis,
 		PublicKey? counterparty_node_id,
 		Txid? funding_tx_id,
-		u16? funding_tx_index
+		u32? funding_tx_index
 	);
 	AwaitingThresholdConfirmations (
 		ChannelId? channel_id,
@@ -714,7 +711,7 @@ interface PendingSweepBalance {
 		u64 amount_satoshis,
 		PublicKey? counterparty_node_id,
 		Txid? funding_tx_id,
-		u16? funding_tx_index
+		u32? funding_tx_index
 	);
 };
 

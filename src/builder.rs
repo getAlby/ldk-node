@@ -943,7 +943,13 @@ impl NodeBuilder {
 		if self.monitors_to_restore.is_some() {
 			let monitors = self.monitors_to_restore.clone().unwrap();
 			for monitor in monitors {
-				let result = &*kv_store.write("monitors", "", &monitor.key, &monitor.value);
+				let result = KVStoreSync::write(
+					&*kv_store,
+					"monitors",
+					"",
+					&monitor.key,
+					monitor.value.clone(),
+				);
 				if result.is_err() {
 					log_error!(logger, "Failed to restore monitor: {}", result.unwrap_err());
 				}
@@ -2222,7 +2228,8 @@ fn reset_persistent_state(logger: Arc<Logger>, kv_store: Arc<DynStore>, what: Re
 	};
 
 	if node_metrics {
-		let result = kv_store.remove(
+		let result = KVStoreSync::remove(
+			&*kv_store,
 			NODE_METRICS_PRIMARY_NAMESPACE,
 			NODE_METRICS_SECONDARY_NAMESPACE,
 			NODE_METRICS_KEY,
@@ -2234,7 +2241,8 @@ fn reset_persistent_state(logger: Arc<Logger>, kv_store: Arc<DynStore>, what: Re
 	}
 
 	if scorer {
-		let result = kv_store.remove(
+		let result = KVStoreSync::remove(
+			&*kv_store,
 			SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
 			SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
 			SCORER_PERSISTENCE_KEY,
@@ -2246,7 +2254,8 @@ fn reset_persistent_state(logger: Arc<Logger>, kv_store: Arc<DynStore>, what: Re
 	}
 
 	if network_graph {
-		let result = kv_store.remove(
+		let result = KVStoreSync::remove(
+			&*kv_store,
 			NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
 			NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
 			NETWORK_GRAPH_PERSISTENCE_KEY,

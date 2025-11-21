@@ -102,14 +102,6 @@ mod tx_broadcaster;
 mod types;
 mod wallet;
 
-/*pub use bip39;
-pub use bitcoin;
-pub use lightning;
-pub use lightning_invoice;
-pub use lightning_liquidity;
-pub use lightning_types;
-
-pub use vss_client;*/
 use std::collections::HashMap;
 use std::default::Default;
 use std::net::ToSocketAddrs;
@@ -169,27 +161,6 @@ use payment::{
 	UnifiedQrPayment,
 };
 use peer_store::{PeerInfo, PeerStore};
-/*use types::{
-	Broadcaster, BumpTransactionEventHandler, ChainMonitor, ChannelManager, DynStore, Graph,
-	KeysManager, OnionMessenger, PaymentStore, PeerManager, Router, Scorer, Sweeper, Wallet,
-};
-pub use types::{ChannelDetails, CustomTlvRecord, KeyValue, PeerDetails, TlvEntry, UserChannelId};
-#[cfg(feature = "uniffi")]
-use types::{MigrateStorage, ResetState};
-
-use logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
-
-use lightning::chain::BestBlock;
-use lightning::events::bump_transaction::Wallet as LdkWallet;
-use lightning::impl_writeable_tlv_based;
-use lightning::ln::channel_state::ChannelShutdownState;
-use lightning::ln::channelmanager::PaymentId;
-use lightning::ln::msgs::SocketAddress;
-use lightning::routing::gossip::NodeAlias;
-
-use lightning_background_processor::process_events_async;
-
-use bitcoin::secp256k1::PublicKey;*/
 
 use rand::Rng;
 use runtime::Runtime;
