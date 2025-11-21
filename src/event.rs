@@ -5,29 +5,46 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use crate::types::{CustomTlvRecord, DynStore, PaymentStore, Sweeper, Wallet};
+use core::future::Future;
+use core::task::{Poll, Waker};
+use std::collections::VecDeque;
+use std::ops::Deref;
+use std::sync::{Arc, Mutex};
 
-use crate::{
+/*use crate::{
 	hex_utils, BumpTransactionEventHandler, ChannelManager, Error, Graph, PeerInfo, PeerStore,
 	TlvEntry, UserChannelId,
+};*/
+use bitcoin::blockdata::locktime::absolute::LockTime;
+use bitcoin::secp256k1::PublicKey;
+use bitcoin::{Amount, OutPoint};
+use lightning::events::bump_transaction::BumpTransactionEvent;
+use lightning::events::{
+	ClosureReason, Event as LdkEvent, PaymentFailureReason, PaymentPurpose, ReplayEvent,
 };
+use lightning::impl_writeable_tlv_based_enum;
+use lightning::ln::channelmanager::PaymentId;
+use lightning::ln::types::ChannelId;
+use lightning::routing::gossip::NodeId;
+use lightning::util::config::{
+	ChannelConfigOverrides, ChannelConfigUpdate, ChannelHandshakeConfigUpdate,
+};
+use lightning::util::errors::APIError;
+use lightning::util::persist::KVStore;
+use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
+use lightning_liquidity::lsps2::utils::compute_opening_fee;
+use lightning_types::payment::{PaymentHash, PaymentPreimage};
+use rand::{rng, Rng};
 
 use crate::config::{may_announce_channel, Config};
 use crate::connection::ConnectionManager;
 use crate::data_store::DataStoreUpdateResult;
 use crate::fee_estimator::ConfirmationTarget;
-use crate::liquidity::LiquiditySource;
-use crate::logger::Logger;
-
-use crate::payment::store::{
-	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
-};
-
 use crate::io::{
 	EVENT_QUEUE_PERSISTENCE_KEY, EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
 	EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
 };
-use crate::logger::{log_debug, log_error, log_info, LdkLogger};
+/*use crate::logger::{log_debug, log_error, log_info, LdkLogger};
 
 use lightning::events::bump_transaction::BumpTransactionEvent;
 use lightning::events::{ClosureReason, PaymentPurpose, ReplayEvent};
@@ -55,7 +72,20 @@ use std::collections::VecDeque;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::Duration;
+use std::time::Duration;*/
+use crate::liquidity::LiquiditySource;
+use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
+use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
+use crate::payment::asynchronous::static_invoice_store::StaticInvoiceStore;
+use crate::payment::store::{
+	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
+};
+use crate::runtime::Runtime;
+use crate::types::{CustomTlvRecord, DynStore, OnionMessenger, PaymentStore, Sweeper, Wallet};
+use crate::{
+	hex_utils, BumpTransactionEventHandler, ChannelManager, Error, Graph, PeerInfo, PeerStore,
+	UserChannelId,
+};
 
 /// An event emitted by [`Node`], which should be handled by the user.
 ///
@@ -202,6 +232,10 @@ pub enum Event {
 		funding_txo: OutPoint,
 	},
 	/// A channel is ready to be used.
+	///
+	/// This event is emitted when:
+	/// - A new channel has been established and is ready for use
+	/// - An existing channel has been spliced and is ready with the new funding output
 	ChannelReady {
 		/// The `channel_id` of the channel.
 		channel_id: ChannelId,
@@ -211,6 +245,14 @@ pub enum Event {
 		///
 		/// This will be `None` for events serialized by LDK Node v0.1.0 and prior.
 		counterparty_node_id: Option<PublicKey>,
+		/// The outpoint of the channel's funding transaction.
+		///
+		/// This represents the channel's current funding output, which may change when the
+		/// channel is spliced. For spliced channels, this will contain the new funding output
+		/// from the confirmed splice transaction.
+		///
+		/// This will be `None` for events serialized by LDK Node v0.6.0 and prior.
+		funding_txo: Option<OutPoint>,
 	},
 	/// A channel has been closed.
 	ChannelClosed {
@@ -224,6 +266,28 @@ pub enum Event {
 		counterparty_node_id: Option<PublicKey>,
 		/// This will be `None` for events serialized by LDK Node v0.2.1 and prior.
 		reason: Option<ClosureReason>,
+	},
+	/// A channel splice is pending confirmation on-chain.
+	SplicePending {
+		/// The `channel_id` of the channel.
+		channel_id: ChannelId,
+		/// The `user_channel_id` of the channel.
+		user_channel_id: UserChannelId,
+		/// The `node_id` of the channel counterparty.
+		counterparty_node_id: PublicKey,
+		/// The outpoint of the channel's splice funding transaction.
+		new_funding_txo: OutPoint,
+	},
+	/// A channel splice has failed.
+	SpliceFailed {
+		/// The `channel_id` of the channel.
+		channel_id: ChannelId,
+		/// The `user_channel_id` of the channel.
+		user_channel_id: UserChannelId,
+		/// The `node_id` of the channel counterparty.
+		counterparty_node_id: PublicKey,
+		/// The outpoint of the channel's splice funding transaction, if one was created.
+		abandoned_funding_txo: Option<OutPoint>,
 	},
 }
 
@@ -249,6 +313,7 @@ impl_writeable_tlv_based_enum!(Event,
 		(0, channel_id, required),
 		(1, counterparty_node_id, option),
 		(2, user_channel_id, required),
+		(3, funding_txo, option),
 	},
 	(4, ChannelPending) => {
 		(0, channel_id, required),
@@ -281,7 +346,19 @@ impl_writeable_tlv_based_enum!(Event,
 		(10, skimmed_fee_msat, option),
 		(12, claim_from_onchain_tx, required),
 		(14, outbound_amount_forwarded_msat, option),
-	}
+	},
+	(8, SplicePending) => {
+		(1, channel_id, required),
+		(3, counterparty_node_id, required),
+		(5, user_channel_id, required),
+		(7, new_funding_txo, required),
+	},
+	(9, SpliceFailed) => {
+		(1, channel_id, required),
+		(3, counterparty_node_id, required),
+		(5, user_channel_id, required),
+		(7, abandoned_funding_txo, option),
+	},
 );
 
 pub struct EventQueue<L: Deref>
@@ -290,7 +367,6 @@ where
 {
 	queue: Arc<Mutex<VecDeque<Event>>>,
 	waker: Arc<Mutex<Option<Waker>>>,
-	notifier: Condvar,
 	kv_store: Arc<DynStore>,
 	logger: L,
 }
@@ -302,18 +378,17 @@ where
 	pub(crate) fn new(kv_store: Arc<DynStore>, logger: L) -> Self {
 		let queue = Arc::new(Mutex::new(VecDeque::new()));
 		let waker = Arc::new(Mutex::new(None));
-		let notifier = Condvar::new();
-		Self { queue, waker, notifier, kv_store, logger }
+		Self { queue, waker, kv_store, logger }
 	}
 
-	pub(crate) fn add_event(&self, event: Event) -> Result<(), Error> {
-		{
+	pub(crate) async fn add_event(&self, event: Event) -> Result<(), Error> {
+		let data = {
 			let mut locked_queue = self.queue.lock().unwrap();
 			locked_queue.push_back(event);
-			self.persist_queue(&locked_queue)?;
-		}
+			EventQueueSerWrapper(&locked_queue).encode()
+		};
 
-		self.notifier.notify_one();
+		self.persist_queue(data).await?;
 
 		if let Some(waker) = self.waker.lock().unwrap().take() {
 			waker.wake();
@@ -330,19 +405,14 @@ where
 		EventFuture { event_queue: Arc::clone(&self.queue), waker: Arc::clone(&self.waker) }.await
 	}
 
-	pub(crate) fn wait_next_event(&self) -> Event {
-		let locked_queue =
-			self.notifier.wait_while(self.queue.lock().unwrap(), |queue| queue.is_empty()).unwrap();
-		locked_queue.front().unwrap().clone()
-	}
-
-	pub(crate) fn event_handled(&self) -> Result<(), Error> {
-		{
+	pub(crate) async fn event_handled(&self) -> Result<(), Error> {
+		let data = {
 			let mut locked_queue = self.queue.lock().unwrap();
 			locked_queue.pop_front();
-			self.persist_queue(&locked_queue)?;
-		}
-		self.notifier.notify_one();
+			EventQueueSerWrapper(&locked_queue).encode()
+		};
+
+		self.persist_queue(data).await?;
 
 		if let Some(waker) = self.waker.lock().unwrap().take() {
 			waker.wake();
@@ -350,26 +420,26 @@ where
 		Ok(())
 	}
 
-	fn persist_queue(&self, locked_queue: &VecDeque<Event>) -> Result<(), Error> {
-		let data = EventQueueSerWrapper(locked_queue).encode();
-		self.kv_store
-			.write(
+	async fn persist_queue(&self, encoded_queue: Vec<u8>) -> Result<(), Error> {
+		KVStore::write(
+			&*self.kv_store,
+			EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_KEY,
+			encoded_queue,
+		)
+		.await
+		.map_err(|e| {
+			log_error!(
+				self.logger,
+				"Write for key {}/{}/{} failed due to: {}",
 				EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
 				EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
 				EVENT_QUEUE_PERSISTENCE_KEY,
-				&data,
-			)
-			.map_err(|e| {
-				log_error!(
-					self.logger,
-					"Write for key {}/{}/{} failed due to: {}",
-					EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
-					EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
-					EVENT_QUEUE_PERSISTENCE_KEY,
-					e
-				);
-				Error::PersistenceFailed
-			})?;
+				e
+			);
+			Error::PersistenceFailed
+		})?;
 		Ok(())
 	}
 }
@@ -386,8 +456,7 @@ where
 		let read_queue: EventQueueDeserWrapper = Readable::read(reader)?;
 		let queue = Arc::new(Mutex::new(read_queue.0));
 		let waker = Arc::new(Mutex::new(None));
-		let notifier = Condvar::new();
-		Ok(Self { queue, waker, notifier, kv_store, logger })
+		Ok(Self { queue, waker, kv_store, logger })
 	}
 }
 
@@ -452,9 +521,12 @@ where
 	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 	payment_store: Arc<PaymentStore>,
 	peer_store: Arc<PeerStore<L>>,
-	runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>,
+	runtime: Arc<Runtime>,
 	logger: L,
 	config: Arc<Config>,
+	static_invoice_store: Option<StaticInvoiceStore>,
+	onion_messenger: Arc<OnionMessenger>,
+	om_mailbox: Option<Arc<OnionMessageMailbox>>,
 }
 
 impl<L: Deref + Clone + Sync + Send + 'static> EventHandler<L>
@@ -468,7 +540,9 @@ where
 		output_sweeper: Arc<Sweeper>, network_graph: Arc<Graph>,
 		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<L>>,
-		runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>, logger: L, config: Arc<Config>,
+		static_invoice_store: Option<StaticInvoiceStore>, onion_messenger: Arc<OnionMessenger>,
+		om_mailbox: Option<Arc<OnionMessageMailbox>>, runtime: Arc<Runtime>, logger: L,
+		config: Arc<Config>,
 	) -> Self {
 		Self {
 			event_queue,
@@ -484,6 +558,9 @@ where
 			logger,
 			runtime,
 			config,
+			static_invoice_store,
+			onion_messenger,
+			om_mailbox,
 		}
 	}
 
@@ -494,7 +571,7 @@ where
 				counterparty_node_id,
 				channel_value_satoshis,
 				output_script,
-				..
+				user_channel_id,
 			} => {
 				// Construct the raw transaction with the output that is paid the amount of the
 				// channel.
@@ -513,16 +590,44 @@ where
 					locktime,
 				) {
 					Ok(final_tx) => {
-						// Give the funding transaction back to LDK for opening the channel.
-						match self.channel_manager.funding_transaction_generated(
-							temporary_channel_id,
-							counterparty_node_id,
-							final_tx,
-						) {
+						let needs_manual_broadcast =
+							self.liquidity_source.as_ref().map_or(false, |ls| {
+								ls.as_ref().lsps2_channel_needs_manual_broadcast(
+									counterparty_node_id,
+									user_channel_id,
+								)
+							});
+
+						let result = if needs_manual_broadcast {
+							self.liquidity_source.as_ref().map(|ls| {
+								ls.lsps2_store_funding_transaction(
+									user_channel_id,
+									counterparty_node_id,
+									final_tx.clone(),
+								);
+							});
+							self.channel_manager.funding_transaction_generated_manual_broadcast(
+								temporary_channel_id,
+								counterparty_node_id,
+								final_tx,
+							)
+						} else {
+							self.channel_manager.funding_transaction_generated(
+								temporary_channel_id,
+								counterparty_node_id,
+								final_tx,
+							)
+						};
+
+						match result {
 							Ok(()) => {},
 							Err(APIError::APIMisuseError { err }) => {
-								log_error!(self.logger, "Panicking due to APIMisuseError: {}", err);
-								panic!("APIMisuseError: {}", err);
+								log_error!(
+									self.logger,
+									"Encountered APIMisuseError, this should never happen: {}",
+									err
+								);
+								debug_assert!(false, "APIMisuseError: {}", err);
 							},
 							Err(APIError::ChannelUnavailable { err }) => {
 								log_error!(
@@ -543,34 +648,33 @@ where
 					Err(err) => {
 						log_error!(self.logger, "Failed to create funding transaction: {}", err);
 						self.channel_manager
-							.force_close_without_broadcasting_txn(
+							.force_close_broadcasting_latest_txn(
 								&temporary_channel_id,
 								&counterparty_node_id,
 								"Failed to create funding transaction".to_string(),
 							)
 							.unwrap_or_else(|e| {
 								log_error!(self.logger, "Failed to force close channel after funding generation failed: {:?}", e);
-								panic!(
+								debug_assert!(false,
 									"Failed to force close channel after funding generation failed"
 								);
 							});
 					},
 				}
 			},
-			LdkEvent::FundingTxBroadcastSafe { .. } => {
-				debug_assert!(false, "We currently only support safe funding, so this event should never be emitted.");
+			LdkEvent::FundingTxBroadcastSafe { user_channel_id, counterparty_node_id, .. } => {
+				self.liquidity_source.as_ref().map(|ls| {
+					ls.lsps2_funding_tx_broadcast_safe(user_channel_id, counterparty_node_id);
+				});
 			},
 			LdkEvent::PaymentClaimable {
 				payment_hash,
 				purpose,
 				amount_msat,
-				receiver_node_id: _,
-				via_channel_id: _,
-				via_user_channel_id: _,
 				claim_deadline,
 				onion_fields,
 				counterparty_skimmed_fee_msat,
-				payment_id: _,
+				..
 			} => {
 				let payment_id = PaymentId(payment_hash.0);
 				if let Some(info) = self.payment_store.get(&payment_id) {
@@ -684,7 +788,8 @@ where
 					// the payment has been registered via `_for_hash` variants and needs to be manually claimed via
 					// user interaction.
 					match info.kind {
-						PaymentKind::Bolt11 { preimage, .. } => {
+						PaymentKind::Bolt11 { preimage, .. }
+						| PaymentKind::Bolt11Jit { preimage, .. } => {
 							if purpose.preimage().is_none() {
 								debug_assert!(
 									preimage.is_none(),
@@ -703,7 +808,7 @@ where
 									claim_deadline,
 									custom_records,
 								};
-								match self.event_queue.add_event(event) {
+								match self.event_queue.add_event(event).await {
 									Ok(_) => return Ok(()),
 									Err(e) => {
 										log_error!(
@@ -955,7 +1060,7 @@ where
 						.map(|cf| cf.custom_tlvs().into_iter().map(|tlv| tlv.into()).collect())
 						.unwrap_or_default(),
 				};
-				match self.event_queue.add_event(event) {
+				match self.event_queue.add_event(event).await {
 					Ok(_) => return Ok(()),
 					Err(e) => {
 						log_error!(self.logger, "Failed to push to event queue: {}", e);
@@ -1016,7 +1121,7 @@ where
 					fee_paid_msat,
 				};
 
-				match self.event_queue.add_event(event) {
+				match self.event_queue.add_event(event).await {
 					Ok(_) => return Ok(()),
 					Err(e) => {
 						log_error!(self.logger, "Failed to push to event queue: {}", e);
@@ -1047,7 +1152,7 @@ where
 
 				let event =
 					Event::PaymentFailed { payment_id: Some(payment_id), payment_hash, reason };
-				match self.event_queue.add_event(event) {
+				match self.event_queue.add_event(event).await {
 					Ok(_) => return Ok(()),
 					Err(e) => {
 						log_error!(self.logger, "Failed to push to event queue: {}", e);
@@ -1060,29 +1165,17 @@ where
 			LdkEvent::PaymentPathFailed { .. } => {},
 			LdkEvent::ProbeSuccessful { .. } => {},
 			LdkEvent::ProbeFailed { .. } => {},
-			LdkEvent::HTLCHandlingFailed { failed_next_destination, .. } => {
+			LdkEvent::HTLCHandlingFailed { failure_type, .. } => {
 				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
-					liquidity_source.handle_htlc_handling_failed(failed_next_destination);
-				}
-			},
-			LdkEvent::PendingHTLCsForwardable { time_forwardable } => {
-				let forwarding_channel_manager = self.channel_manager.clone();
-				let min = time_forwardable.as_millis() as u64;
-
-				let runtime_lock = self.runtime.read().unwrap();
-				debug_assert!(runtime_lock.is_some());
-
-				if let Some(runtime) = runtime_lock.as_ref() {
-					runtime.spawn(async move {
-						let millis_to_sleep = thread_rng().gen_range(min..min * 5) as u64;
-						tokio::time::sleep(Duration::from_millis(millis_to_sleep)).await;
-
-						forwarding_channel_manager.process_pending_htlc_forwards();
-					});
+					liquidity_source.handle_htlc_handling_failed(failure_type).await;
 				}
 			},
 			LdkEvent::SpendableOutputs { outputs, channel_id } => {
-				match self.output_sweeper.track_spendable_outputs(outputs, channel_id, true, None) {
+				match self
+					.output_sweeper
+					.track_spendable_outputs(outputs, channel_id, true, None)
+					.await
+				{
 					Ok(_) => return Ok(()),
 					Err(_) => {
 						log_error!(self.logger, "Failed to track spendable outputs");
@@ -1104,7 +1197,7 @@ where
 						log_error!(self.logger, "Rejecting inbound announced channel from peer {} due to missing configuration: {}", counterparty_node_id, err);
 
 						self.channel_manager
-							.force_close_without_broadcasting_txn(
+							.force_close_broadcasting_latest_txn(
 								&temporary_channel_id,
 								&counterparty_node_id,
 								"Channel request rejected".to_string(),
@@ -1148,7 +1241,7 @@ where
 								required_amount_sats,
 							);
 							self.channel_manager
-								.force_close_without_broadcasting_txn(
+								.force_close_broadcasting_latest_txn(
 									&temporary_channel_id,
 									&counterparty_node_id,
 									"Channel request rejected".to_string(),
@@ -1165,7 +1258,7 @@ where
 							counterparty_node_id,
 						);
 						self.channel_manager
-							.force_close_without_broadcasting_txn(
+							.force_close_broadcasting_latest_txn(
 								&temporary_channel_id,
 								&counterparty_node_id,
 								"Channel request rejected".to_string(),
@@ -1177,7 +1270,7 @@ where
 					}
 				}
 
-				// fix for LND nodes which support both 0-conf and non-0conf
+				/*// fix for LND nodes which support both 0-conf and non-0conf
 				// remove when https://github.com/lightningnetwork/lnd/pull/8796 is in LND
 				let mut lnd_0conf_non0conf_fix: Vec<PublicKey> = Vec::new();
 				// Olympus
@@ -1219,18 +1312,47 @@ where
 				let user_channel_id: u128 = rand::thread_rng().gen::<u128>();
 				let allow_0conf = (channel_type.requires_zero_conf()
 					|| !lnd_0conf_non0conf_fix.contains(&counterparty_node_id))
-					&& self.config.trusted_peers_0conf.contains(&counterparty_node_id);
+					&& self.config.trusted_peers_0conf.contains(&counterparty_node_id);*/
+				let user_channel_id: u128 = rng().random();
+				let allow_0conf = self.config.trusted_peers_0conf.contains(&counterparty_node_id);
+				let mut channel_override_config = None;
+				if let Some((lsp_node_id, _)) = self
+					.liquidity_source
+					.as_ref()
+					.and_then(|ls| ls.as_ref().get_lsps2_lsp_details())
+				{
+					if lsp_node_id == counterparty_node_id {
+						// When we're an LSPS2 client, allow claiming underpaying HTLCs as the LSP will skim off some fee. We'll
+						// check that they don't take too much before claiming.
+						//
+						// We also set maximum allowed inbound HTLC value in flight
+						// to 100%. We should eventually be able to set this on a per-channel basis, but for
+						// now we just bump the default for all channels.
+						channel_override_config = Some(ChannelConfigOverrides {
+							handshake_overrides: Some(ChannelHandshakeConfigUpdate {
+								max_inbound_htlc_value_in_flight_percent_of_channel: Some(100),
+								..Default::default()
+							}),
+							update_overrides: Some(ChannelConfigUpdate {
+								accept_underpaying_htlcs: Some(true),
+								..Default::default()
+							}),
+						});
+					}
+				}
 				let res = if allow_0conf {
 					self.channel_manager.accept_inbound_channel_from_trusted_peer_0conf(
 						&temporary_channel_id,
 						&counterparty_node_id,
 						user_channel_id,
+						channel_override_config,
 					)
 				} else {
 					self.channel_manager.accept_inbound_channel(
 						&temporary_channel_id,
 						&counterparty_node_id,
 						user_channel_id,
+						channel_override_config,
 					)
 				};
 
@@ -1271,40 +1393,46 @@ where
 				claim_from_onchain_tx,
 				outbound_amount_forwarded_msat,
 			} => {
-				let read_only_network_graph = self.network_graph.read_only();
-				let nodes = read_only_network_graph.nodes();
-				let channels = self.channel_manager.list_channels();
+				{
+					let read_only_network_graph = self.network_graph.read_only();
+					let nodes = read_only_network_graph.nodes();
+					let channels = self.channel_manager.list_channels();
 
-				let node_str = |channel_id: &Option<ChannelId>| {
-					channel_id
-						.and_then(|channel_id| channels.iter().find(|c| c.channel_id == channel_id))
-						.and_then(|channel| {
-							nodes.get(&NodeId::from_pubkey(&channel.counterparty.node_id))
-						})
-						.map_or("private_node".to_string(), |node| {
-							node.announcement_info
-								.as_ref()
-								.map_or("unnamed node".to_string(), |ann| {
-									format!("node {}", ann.alias())
-								})
-						})
-				};
-				let channel_str = |channel_id: &Option<ChannelId>| {
-					channel_id
-						.map(|channel_id| format!(" with channel {}", channel_id))
-						.unwrap_or_default()
-				};
-				let from_prev_str = format!(
-					" from {}{}",
-					node_str(&prev_channel_id),
-					channel_str(&prev_channel_id)
-				);
-				let to_next_str =
-					format!(" to {}{}", node_str(&next_channel_id), channel_str(&next_channel_id));
+					let node_str = |channel_id: &Option<ChannelId>| {
+						channel_id
+							.and_then(|channel_id| {
+								channels.iter().find(|c| c.channel_id == channel_id)
+							})
+							.and_then(|channel| {
+								nodes.get(&NodeId::from_pubkey(&channel.counterparty.node_id))
+							})
+							.map_or("private_node".to_string(), |node| {
+								node.announcement_info
+									.as_ref()
+									.map_or("unnamed node".to_string(), |ann| {
+										format!("node {}", ann.alias())
+									})
+							})
+					};
+					let channel_str = |channel_id: &Option<ChannelId>| {
+						channel_id
+							.map(|channel_id| format!(" with channel {}", channel_id))
+							.unwrap_or_default()
+					};
+					let from_prev_str = format!(
+						" from {}{}",
+						node_str(&prev_channel_id),
+						channel_str(&prev_channel_id)
+					);
+					let to_next_str = format!(
+						" to {}{}",
+						node_str(&next_channel_id),
+						channel_str(&next_channel_id)
+					);
 
-				let fee_earned = total_fee_earned_msat.unwrap_or(0);
-				if claim_from_onchain_tx {
-					log_info!(
+					let fee_earned = total_fee_earned_msat.unwrap_or(0);
+					if claim_from_onchain_tx {
+						log_info!(
 						self.logger,
 						"Forwarded payment{}{} of {}msat, earning {}msat in fees from claiming onchain.",
 						from_prev_str,
@@ -1312,19 +1440,23 @@ where
 						outbound_amount_forwarded_msat.unwrap_or(0),
 						fee_earned,
 					);
-				} else {
-					log_info!(
-						self.logger,
-						"Forwarded payment{}{} of {}msat, earning {}msat in fees.",
-						from_prev_str,
-						to_next_str,
-						outbound_amount_forwarded_msat.unwrap_or(0),
-						fee_earned,
-					);
+					} else {
+						log_info!(
+							self.logger,
+							"Forwarded payment{}{} of {}msat, earning {}msat in fees.",
+							from_prev_str,
+							to_next_str,
+							outbound_amount_forwarded_msat.unwrap_or(0),
+							fee_earned,
+						);
+					}
 				}
 
 				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
-					liquidity_source.handle_payment_forwarded(next_channel_id);
+					let skimmed_fee_msat = skimmed_fee_msat.unwrap_or(0);
+					liquidity_source
+						.handle_payment_forwarded(next_channel_id, skimmed_fee_msat)
+						.await;
 				}
 
 				let event = Event::PaymentForwarded {
@@ -1339,7 +1471,7 @@ where
 					claim_from_onchain_tx,
 					outbound_amount_forwarded_msat,
 				};
-				self.event_queue.add_event(event).map_err(|e| {
+				self.event_queue.add_event(event).await.map_err(|e| {
 					log_error!(self.logger, "Failed to push to event queue: {}", e);
 					ReplayEvent()
 				})?;
@@ -1366,7 +1498,7 @@ where
 					counterparty_node_id,
 					funding_txo,
 				};
-				match self.event_queue.add_event(event) {
+				match self.event_queue.add_event(event).await {
 					Ok(_) => {},
 					Err(e) => {
 						log_error!(self.logger, "Failed to push to event queue: {}", e);
@@ -1407,29 +1539,42 @@ where
 				}
 			},
 			LdkEvent::ChannelReady {
-				channel_id, user_channel_id, counterparty_node_id, ..
+				channel_id,
+				user_channel_id,
+				counterparty_node_id,
+				funding_txo,
+				..
 			} => {
-				log_info!(
-					self.logger,
-					"Channel {} with counterparty {} ready to be used.",
-					channel_id,
-					counterparty_node_id,
-				);
+				if let Some(funding_txo) = funding_txo {
+					log_info!(
+						self.logger,
+						"Channel {} with counterparty {} ready to be used with funding_txo {}",
+						channel_id,
+						counterparty_node_id,
+						funding_txo,
+					);
+				} else {
+					log_info!(
+						self.logger,
+						"Channel {} with counterparty {} ready to be used",
+						channel_id,
+						counterparty_node_id,
+					);
+				}
 
 				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
-					liquidity_source.handle_channel_ready(
-						user_channel_id,
-						&channel_id,
-						&counterparty_node_id,
-					);
+					liquidity_source
+						.handle_channel_ready(user_channel_id, &channel_id, &counterparty_node_id)
+						.await;
 				}
 
 				let event = Event::ChannelReady {
 					channel_id,
 					user_channel_id: UserChannelId(user_channel_id),
 					counterparty_node_id: Some(counterparty_node_id),
+					funding_txo,
 				};
-				match self.event_queue.add_event(event) {
+				match self.event_queue.add_event(event).await {
 					Ok(_) => {},
 					Err(e) => {
 						log_error!(self.logger, "Failed to push to event queue: {}", e);
@@ -1459,7 +1604,7 @@ where
 					reason: Some(reason),
 				};
 
-				match self.event_queue.add_event(event) {
+				match self.event_queue.add_event(event).await {
 					Ok(_) => {},
 					Err(e) => {
 						log_error!(self.logger, "Failed to push to event queue: {}", e);
@@ -1476,43 +1621,41 @@ where
 				..
 			} => {
 				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
-					liquidity_source.handle_htlc_intercepted(
-						requested_next_hop_scid,
-						intercept_id,
-						expected_outbound_amount_msat,
-						payment_hash,
-					);
+					liquidity_source
+						.handle_htlc_intercepted(
+							requested_next_hop_scid,
+							intercept_id,
+							expected_outbound_amount_msat,
+							payment_hash,
+						)
+						.await;
 				}
 			},
 			LdkEvent::InvoiceReceived { .. } => {
 				debug_assert!(false, "We currently don't handle BOLT12 invoices manually, so this event should never be emitted.");
 			},
 			LdkEvent::ConnectionNeeded { node_id, addresses } => {
-				let runtime_lock = self.runtime.read().unwrap();
-				debug_assert!(runtime_lock.is_some());
-
-				if let Some(runtime) = runtime_lock.as_ref() {
-					let spawn_logger = self.logger.clone();
-					let spawn_cm = Arc::clone(&self.connection_manager);
-					runtime.spawn(async move {
-						for addr in &addresses {
-							match spawn_cm.connect_peer_if_necessary(node_id, addr.clone()).await {
-								Ok(()) => {
-									return;
-								},
-								Err(e) => {
-									log_error!(
-										spawn_logger,
-										"Failed to establish connection to peer {}@{}: {}",
-										node_id,
-										addr,
-										e
-									);
-								},
-							}
+				let spawn_logger = self.logger.clone();
+				let spawn_cm = Arc::clone(&self.connection_manager);
+				let future = async move {
+					for addr in &addresses {
+						match spawn_cm.connect_peer_if_necessary(node_id, addr.clone()).await {
+							Ok(()) => {
+								return;
+							},
+							Err(e) => {
+								log_error!(
+									spawn_logger,
+									"Failed to establish connection to peer {}@{}: {}",
+									node_id,
+									addr,
+									e
+								);
+							},
 						}
-					});
-				}
+					}
+				};
+				self.runtime.spawn_cancellable_background_task(future);
 			},
 			LdkEvent::BumpTransaction(bte) => {
 				match bte {
@@ -1540,13 +1683,210 @@ where
 					BumpTransactionEvent::HTLCResolution { .. } => {},
 				}
 
-				self.bump_tx_event_handler.handle_event(&bte);
+				self.bump_tx_event_handler.handle_event(&bte).await;
 			},
-			LdkEvent::OnionMessageIntercepted { .. } => {
-				debug_assert!(false, "We currently don't support onion message interception, so this event should never be emitted.");
+			LdkEvent::OnionMessageIntercepted { peer_node_id, message } => {
+				if let Some(om_mailbox) = self.om_mailbox.as_ref() {
+					om_mailbox.onion_message_intercepted(peer_node_id, message);
+				} else {
+					log_trace!(
+						self.logger,
+						"Onion message intercepted, but no onion message mailbox available"
+					);
+				}
 			},
-			LdkEvent::OnionMessagePeerConnected { .. } => {
-				debug_assert!(false, "We currently don't support onion message interception, so this event should never be emitted.");
+			LdkEvent::OnionMessagePeerConnected { peer_node_id } => {
+				if let Some(om_mailbox) = self.om_mailbox.as_ref() {
+					let messages = om_mailbox.onion_message_peer_connected(peer_node_id);
+
+					for message in messages {
+						if let Err(e) =
+							self.onion_messenger.forward_onion_message(message, &peer_node_id)
+						{
+							log_trace!(
+								self.logger,
+								"Failed to forward onion message to peer {}: {:?}",
+								peer_node_id,
+								e
+							);
+						}
+					}
+				}
+			},
+
+			LdkEvent::PersistStaticInvoice {
+				invoice,
+				invoice_request_path,
+				invoice_slot,
+				recipient_id,
+				invoice_persisted_path,
+			} => {
+				if let Some(store) = self.static_invoice_store.as_ref() {
+					match store
+						.handle_persist_static_invoice(
+							invoice,
+							invoice_request_path,
+							invoice_slot,
+							recipient_id,
+						)
+						.await
+					{
+						Ok(_) => {
+							self.channel_manager.static_invoice_persisted(invoice_persisted_path);
+						},
+						Err(e) => {
+							log_error!(self.logger, "Failed to persist static invoice: {}", e);
+							return Err(ReplayEvent());
+						},
+					};
+				}
+			},
+			LdkEvent::StaticInvoiceRequested {
+				recipient_id,
+				invoice_slot,
+				reply_path,
+				invoice_request,
+			} => {
+				if let Some(store) = self.static_invoice_store.as_ref() {
+					let invoice =
+						store.handle_static_invoice_requested(&recipient_id, invoice_slot).await;
+
+					match invoice {
+						Ok(Some((invoice, invoice_request_path))) => {
+							if let Err(e) = self.channel_manager.respond_to_static_invoice_request(
+								invoice,
+								reply_path,
+								invoice_request,
+								invoice_request_path,
+							) {
+								log_error!(self.logger, "Failed to send static invoice: {:?}", e);
+							}
+						},
+						Ok(None) => {
+							log_trace!(
+								self.logger,
+								"No static invoice found for recipient {} and slot {}",
+								hex_utils::to_string(&recipient_id),
+								invoice_slot
+							);
+						},
+						Err(e) => {
+							log_error!(self.logger, "Failed to retrieve static invoice: {}", e);
+							return Err(ReplayEvent());
+						},
+					}
+				}
+			},
+			// TODO(splicing): Revisit error handling once splicing API is settled in LDK 0.3
+			LdkEvent::FundingTransactionReadyForSigning {
+				channel_id,
+				counterparty_node_id,
+				unsigned_transaction,
+				..
+			} => match self.wallet.sign_owned_inputs(unsigned_transaction) {
+				Ok(partially_signed_tx) => {
+					match self.channel_manager.funding_transaction_signed(
+						&channel_id,
+						&counterparty_node_id,
+						partially_signed_tx,
+					) {
+						Ok(()) => {
+							log_info!(
+								self.logger,
+								"Signed funding transaction for channel {} with counterparty {}",
+								channel_id,
+								counterparty_node_id
+							);
+						},
+						Err(e) => {
+							// TODO(splicing): Abort splice once supported in LDK 0.3
+							debug_assert!(false, "Failed signing funding transaction: {:?}", e);
+							log_error!(self.logger, "Failed signing funding transaction: {:?}", e);
+						},
+					}
+				},
+				Err(()) => log_error!(self.logger, "Failed signing funding transaction"),
+			},
+			LdkEvent::SplicePending {
+				channel_id,
+				user_channel_id,
+				counterparty_node_id,
+				new_funding_txo,
+				..
+			} => {
+				log_info!(
+					self.logger,
+					"Channel {} with counterparty {} pending splice with funding_txo {}",
+					channel_id,
+					counterparty_node_id,
+					new_funding_txo,
+				);
+
+				let event = Event::SplicePending {
+					channel_id,
+					user_channel_id: UserChannelId(user_channel_id),
+					counterparty_node_id,
+					new_funding_txo,
+				};
+
+				match self.event_queue.add_event(event).await {
+					Ok(_) => {},
+					Err(e) => {
+						log_error!(self.logger, "Failed to push to event queue: {}", e);
+						return Err(ReplayEvent());
+					},
+				};
+			},
+			LdkEvent::SpliceFailed {
+				channel_id,
+				user_channel_id,
+				counterparty_node_id,
+				abandoned_funding_txo,
+				contributed_outputs,
+				..
+			} => {
+				if let Some(funding_txo) = abandoned_funding_txo {
+					log_info!(
+						self.logger,
+						"Channel {} with counterparty {} failed splice with funding_txo {}",
+						channel_id,
+						counterparty_node_id,
+						funding_txo,
+					);
+				} else {
+					log_info!(
+						self.logger,
+						"Channel {} with counterparty {} failed splice",
+						channel_id,
+						counterparty_node_id,
+					);
+				}
+
+				let tx = bitcoin::Transaction {
+					version: bitcoin::transaction::Version::TWO,
+					lock_time: bitcoin::absolute::LockTime::ZERO,
+					input: vec![],
+					output: contributed_outputs,
+				};
+				if let Err(e) = self.wallet.cancel_tx(&tx) {
+					log_error!(self.logger, "Failed reclaiming unused addresses: {}", e);
+					return Err(ReplayEvent());
+				}
+
+				let event = Event::SpliceFailed {
+					channel_id,
+					user_channel_id: UserChannelId(user_channel_id),
+					counterparty_node_id,
+					abandoned_funding_txo,
+				};
+
+				match self.event_queue.add_event(event).await {
+					Ok(_) => {},
+					Err(e) => {
+						log_error!(self.logger, "Failed to push to event queue: {}", e);
+						return Err(ReplayEvent());
+					},
+				};
 			},
 		}
 		Ok(())
@@ -1555,14 +1895,17 @@ where
 
 #[cfg(test)]
 mod tests {
-	use super::*;
-	use lightning::util::test_utils::{TestLogger, TestStore};
 	use std::sync::atomic::{AtomicU16, Ordering};
 	use std::time::Duration;
 
+	use lightning::util::test_utils::TestLogger;
+
+	use super::*;
+	use crate::io::test_utils::InMemoryStore;
+
 	#[tokio::test]
 	async fn event_queue_persistence() {
-		let store: Arc<DynStore> = Arc::new(TestStore::new(false));
+		let store: Arc<DynStore> = Arc::new(InMemoryStore::new());
 		let logger = Arc::new(TestLogger::new());
 		let event_queue = Arc::new(EventQueue::new(Arc::clone(&store), Arc::clone(&logger)));
 		assert_eq!(event_queue.next_event(), None);
@@ -1571,35 +1914,36 @@ mod tests {
 			channel_id: ChannelId([23u8; 32]),
 			user_channel_id: UserChannelId(2323),
 			counterparty_node_id: None,
+			funding_txo: None,
 		};
-		event_queue.add_event(expected_event.clone()).unwrap();
+		event_queue.add_event(expected_event.clone()).await.unwrap();
 
 		// Check we get the expected event and that it is returned until we mark it handled.
 		for _ in 0..5 {
-			assert_eq!(event_queue.wait_next_event(), expected_event);
 			assert_eq!(event_queue.next_event_async().await, expected_event);
 			assert_eq!(event_queue.next_event(), Some(expected_event.clone()));
 		}
 
 		// Check we can read back what we persisted.
-		let persisted_bytes = store
-			.read(
-				EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
-				EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
-				EVENT_QUEUE_PERSISTENCE_KEY,
-			)
-			.unwrap();
+		let persisted_bytes = KVStore::read(
+			&*store,
+			EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_KEY,
+		)
+		.await
+		.unwrap();
 		let deser_event_queue =
 			EventQueue::read(&mut &persisted_bytes[..], (Arc::clone(&store), logger)).unwrap();
-		assert_eq!(deser_event_queue.wait_next_event(), expected_event);
+		assert_eq!(deser_event_queue.next_event_async().await, expected_event);
 
-		event_queue.event_handled().unwrap();
+		event_queue.event_handled().await.unwrap();
 		assert_eq!(event_queue.next_event(), None);
 	}
 
 	#[tokio::test]
 	async fn event_queue_concurrency() {
-		let store: Arc<DynStore> = Arc::new(TestStore::new(false));
+		let store: Arc<DynStore> = Arc::new(InMemoryStore::new());
 		let logger = Arc::new(TestLogger::new());
 		let event_queue = Arc::new(EventQueue::new(Arc::clone(&store), Arc::clone(&logger)));
 		assert_eq!(event_queue.next_event(), None);
@@ -1608,6 +1952,7 @@ mod tests {
 			channel_id: ChannelId([23u8; 32]),
 			user_channel_id: UserChannelId(2323),
 			counterparty_node_id: None,
+			funding_txo: None,
 		};
 
 		// Check `next_event_async` won't return if the queue is empty and always rather timeout.
@@ -1627,28 +1972,28 @@ mod tests {
 		let mut delayed_enqueue = false;
 
 		for _ in 0..25 {
-			event_queue.add_event(expected_event.clone()).unwrap();
+			event_queue.add_event(expected_event.clone()).await.unwrap();
 			enqueued_events.fetch_add(1, Ordering::SeqCst);
 		}
 
 		loop {
 			tokio::select! {
 				_ = tokio::time::sleep(Duration::from_millis(10)), if !delayed_enqueue => {
-					event_queue.add_event(expected_event.clone()).unwrap();
+					event_queue.add_event(expected_event.clone()).await.unwrap();
 					enqueued_events.fetch_add(1, Ordering::SeqCst);
 					delayed_enqueue = true;
 				}
 				e = event_queue.next_event_async() => {
 					assert_eq!(e, expected_event);
-					event_queue.event_handled().unwrap();
+					event_queue.event_handled().await.unwrap();
 					received_events.fetch_add(1, Ordering::SeqCst);
 
-					event_queue.add_event(expected_event.clone()).unwrap();
+					event_queue.add_event(expected_event.clone()).await.unwrap();
 					enqueued_events.fetch_add(1, Ordering::SeqCst);
 				}
 				e = event_queue.next_event_async() => {
 					assert_eq!(e, expected_event);
-					event_queue.event_handled().unwrap();
+					event_queue.event_handled().await.unwrap();
 					received_events.fetch_add(1, Ordering::SeqCst);
 				}
 			}
@@ -1659,33 +2004,6 @@ mod tests {
 				break;
 			}
 		}
-		assert_eq!(event_queue.next_event(), None);
-
-		// Check we operate correctly, even when mixing and matching blocking and async API calls.
-		let (tx, mut rx) = tokio::sync::watch::channel(());
-		let thread_queue = Arc::clone(&event_queue);
-		let thread_event = expected_event.clone();
-		std::thread::spawn(move || {
-			let e = thread_queue.wait_next_event();
-			assert_eq!(e, thread_event);
-			thread_queue.event_handled().unwrap();
-			tx.send(()).unwrap();
-		});
-
-		let thread_queue = Arc::clone(&event_queue);
-		let thread_event = expected_event.clone();
-		std::thread::spawn(move || {
-			// Sleep a bit before we enqueue the events everybody is waiting for.
-			std::thread::sleep(Duration::from_millis(20));
-			thread_queue.add_event(thread_event.clone()).unwrap();
-			thread_queue.add_event(thread_event.clone()).unwrap();
-		});
-
-		let e = event_queue.next_event_async().await;
-		assert_eq!(e, expected_event.clone());
-		event_queue.event_handled().unwrap();
-
-		rx.changed().await.unwrap();
 		assert_eq!(event_queue.next_event(), None);
 	}
 }

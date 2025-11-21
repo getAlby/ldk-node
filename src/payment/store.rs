@@ -5,23 +5,21 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use crate::types::TlvEntry;
+//use crate::types::TlvEntry;
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use bitcoin::{BlockHash, Txid};
 use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::msgs::DecodeError;
 use lightning::offers::offer::OfferId;
 use lightning::util::ser::{Readable, Writeable};
-use lightning::util::string::UntrustedString;
 use lightning::{
 	_init_and_read_len_prefixed_tlv_fields, impl_writeable_tlv_based,
 	impl_writeable_tlv_based_enum, write_tlv_fields,
 };
-
 use lightning_types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
-
-use bitcoin::{BlockHash, Txid};
-
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use lightning_types::string::UntrustedString;
 
 use crate::data_store::{StorableObject, StorableObjectId, StorableObjectUpdate};
 use crate::hex_utils;
@@ -212,7 +210,7 @@ impl StorableObject for PaymentDetails {
 		let mut updated = false;
 
 		macro_rules! update_if_necessary {
-			($val: expr, $update: expr) => {
+			($val:expr, $update:expr) => {
 				if $val != $update {
 					$val = $update;
 					updated = true;
@@ -645,9 +643,10 @@ impl StorableObjectUpdate<PaymentDetails> for PaymentDetailsUpdate {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use bitcoin::io::Cursor;
 	use lightning::util::ser::Readable;
+
+	use super::*;
 
 	/// We refactored `PaymentDetails` to hold a payment id and moved some required fields into
 	/// `PaymentKind`. Here, we keep the old layout available in order test de/ser compatibility.

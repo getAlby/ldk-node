@@ -5,35 +5,11 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use super::*;
-use crate::config::WALLET_KEYS_SEED_LEN;
-
-use crate::chain::ChainSource;
-use crate::fee_estimator::OnchainFeeEstimator;
-use crate::io::{
-	NODE_METRICS_KEY, NODE_METRICS_PRIMARY_NAMESPACE, NODE_METRICS_SECONDARY_NAMESPACE,
-};
-use crate::logger::{log_error, LdkLogger, Logger};
-use crate::peer_store::PeerStore;
-use crate::sweep::DeprecatedSpendableOutputInfo;
-use crate::types::{Broadcaster, DynStore, KeysManager, Sweeper};
-use crate::wallet::ser::{ChangeSetDeserWrapper, ChangeSetSerWrapper};
-use crate::{Error, EventQueue, NodeMetrics, PaymentDetails};
-
-use lightning::io::Cursor;
-use lightning::ln::msgs::DecodeError;
-use lightning::routing::gossip::NetworkGraph;
-use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringDecayParameters};
-use lightning::util::persist::{
-	KVSTORE_NAMESPACE_KEY_ALPHABET, KVSTORE_NAMESPACE_KEY_MAX_LEN, NETWORK_GRAPH_PERSISTENCE_KEY,
-	NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE, NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
-	OUTPUT_SWEEPER_PERSISTENCE_KEY, OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE,
-	OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE, SCORER_PERSISTENCE_KEY,
-	SCORER_PERSISTENCE_PRIMARY_NAMESPACE, SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
-};
-use lightning::util::ser::{Readable, ReadableArgs, Writeable};
-use lightning::util::string::PrintableString;
-use lightning::util::sweep::{OutputSpendStatus, OutputSweeper};
+use std::fs;
+use std::io::Write;
+use std::ops::Deref;
+use std::path::Path;
+use std::sync::Arc;
 
 use bdk_chain::indexer::keychain_txout::ChangeSet as BdkIndexerChangeSet;
 use bdk_chain::local_chain::ChangeSet as BdkLocalChainChangeSet;
@@ -41,18 +17,45 @@ use bdk_chain::miniscript::{Descriptor, DescriptorPublicKey};
 use bdk_chain::tx_graph::ChangeSet as BdkTxGraphChangeSet;
 use bdk_chain::ConfirmationBlockTime;
 use bdk_wallet::ChangeSet as BdkWalletChangeSet;
-
 use bip39::Mnemonic;
 use bitcoin::Network;
-use rand::{thread_rng, RngCore};
+use lightning::io::Cursor;
+use lightning::ln::msgs::DecodeError;
+use lightning::routing::gossip::NetworkGraph;
+use lightning::routing::scoring::{
+	ChannelLiquidities, ProbabilisticScorer, ProbabilisticScoringDecayParameters,
+};
+use lightning::util::persist::{
+	KVStore, KVStoreSync, KVSTORE_NAMESPACE_KEY_ALPHABET, KVSTORE_NAMESPACE_KEY_MAX_LEN,
+	NETWORK_GRAPH_PERSISTENCE_KEY, NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
+	NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE, OUTPUT_SWEEPER_PERSISTENCE_KEY,
+	OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE, OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
+	SCORER_PERSISTENCE_KEY, SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
+	SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
+};
+use lightning::util::ser::{Readable, ReadableArgs, Writeable};
+use lightning_types::string::PrintableString;
+use rand::rngs::OsRng;
+use rand::TryRngCore;
 
-use std::fs;
-use std::io::Write;
-use std::ops::Deref;
-use std::path::Path;
-use std::sync::Arc;
+use super::*;
+use crate::chain::ChainSource;
+use crate::config::WALLET_KEYS_SEED_LEN;
+use crate::fee_estimator::OnchainFeeEstimator;
+use crate::io::{
+	NODE_METRICS_KEY, NODE_METRICS_PRIMARY_NAMESPACE, NODE_METRICS_SECONDARY_NAMESPACE,
+};
+use crate::logger::{log_error, LdkLogger, Logger};
+use crate::peer_store::PeerStore;
+use crate::types::{Broadcaster, DynStore, KeysManager, Sweeper, WordCount};
+use crate::wallet::ser::{ChangeSetDeserWrapper, ChangeSetSerWrapper};
+use crate::{Error, EventQueue, NodeMetrics, PaymentDetails};
 
-/// Generates a random [BIP 39] mnemonic.
+pub const EXTERNAL_PATHFINDING_SCORES_CACHE_KEY: &str = "external_pathfinding_scores_cache";
+
+/// Generates a random [BIP 39] mnemonic with the specified word count.
+///
+/// If no word count is specified, defaults to 24 words (256-bit entropy).
 ///
 /// The result may be used to initialize the [`Node`] entropy, i.e., can be given to
 /// [`Builder::set_entropy_bip39_mnemonic`].
@@ -60,11 +63,9 @@ use std::sync::Arc;
 /// [BIP 39]: https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki
 /// [`Node`]: crate::Node
 /// [`Builder::set_entropy_bip39_mnemonic`]: crate::Builder::set_entropy_bip39_mnemonic
-pub fn generate_entropy_mnemonic() -> Mnemonic {
-	// bip39::Mnemonic supports 256 bit entropy max
-	let mut entropy = [0; 32];
-	thread_rng().fill_bytes(&mut entropy);
-	Mnemonic::from_entropy(&entropy).unwrap()
+pub fn generate_entropy_mnemonic(word_count: Option<WordCount>) -> Mnemonic {
+	let word_count = word_count.unwrap_or(WordCount::Words24).word_count();
+	Mnemonic::generate(word_count).expect("Failed to generate mnemonic")
 }
 
 pub(crate) fn read_or_generate_seed_file<L: Deref>(
@@ -96,7 +97,10 @@ where
 		Ok(key)
 	} else {
 		let mut key = [0; WALLET_KEYS_SEED_LEN];
-		thread_rng().fill_bytes(&mut key);
+		OsRng.try_fill_bytes(&mut key).map_err(|e| {
+			log_error!(logger, "Failed to generate entropy: {}", e);
+			std::io::Error::new(std::io::ErrorKind::Other, "Failed to generate seed bytes")
+		})?;
 
 		if let Some(parent_dir) = Path::new(&keys_seed_path).parent() {
 			fs::create_dir_all(parent_dir).map_err(|e| {
@@ -135,7 +139,8 @@ pub(crate) fn read_network_graph<L: Deref + Clone>(
 where
 	L::Target: LdkLogger,
 {
-	let mut reader = Cursor::new(kv_store.read(
+	let mut reader = Cursor::new(KVStoreSync::read(
+		&*kv_store,
 		NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
 		NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
 		NETWORK_GRAPH_PERSISTENCE_KEY,
@@ -154,7 +159,8 @@ where
 	L::Target: LdkLogger,
 {
 	let params = ProbabilisticScoringDecayParameters::default();
-	let mut reader = Cursor::new(kv_store.read(
+	let mut reader = Cursor::new(KVStoreSync::read(
+		&*kv_store,
 		SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
 		SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
 		SCORER_PERSISTENCE_KEY,
@@ -166,6 +172,53 @@ where
 	})
 }
 
+/// Read previously persisted external pathfinding scores from the cache.
+pub(crate) fn read_external_pathfinding_scores_from_cache<L: Deref>(
+	kv_store: Arc<DynStore>, logger: L,
+) -> Result<ChannelLiquidities, std::io::Error>
+where
+	L::Target: LdkLogger,
+{
+	let mut reader = Cursor::new(KVStoreSync::read(
+		&*kv_store,
+		SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
+		SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
+		EXTERNAL_PATHFINDING_SCORES_CACHE_KEY,
+	)?);
+	ChannelLiquidities::read(&mut reader).map_err(|e| {
+		log_error!(logger, "Failed to deserialize scorer: {}", e);
+		std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to deserialize Scorer")
+	})
+}
+
+/// Persist external pathfinding scores to the cache.
+pub(crate) async fn write_external_pathfinding_scores_to_cache<L: Deref>(
+	kv_store: Arc<DynStore>, data: &ChannelLiquidities, logger: L,
+) -> Result<(), Error>
+where
+	L::Target: LdkLogger,
+{
+	KVStore::write(
+		&*kv_store,
+		SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
+		SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
+		EXTERNAL_PATHFINDING_SCORES_CACHE_KEY,
+		data.encode(),
+	)
+	.await
+	.map_err(|e| {
+		log_error!(
+			logger,
+			"Writing data to key {}/{}/{} failed due to: {}",
+			NODE_METRICS_PRIMARY_NAMESPACE,
+			NODE_METRICS_SECONDARY_NAMESPACE,
+			EXTERNAL_PATHFINDING_SCORES_CACHE_KEY,
+			e
+		);
+		Error::PersistenceFailed
+	})
+}
+
 /// Read previously persisted events from the store.
 pub(crate) fn read_event_queue<L: Deref + Clone>(
 	kv_store: Arc<DynStore>, logger: L,
@@ -173,7 +226,8 @@ pub(crate) fn read_event_queue<L: Deref + Clone>(
 where
 	L::Target: LdkLogger,
 {
-	let mut reader = Cursor::new(kv_store.read(
+	let mut reader = Cursor::new(KVStoreSync::read(
+		&*kv_store,
 		EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
 		EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
 		EVENT_QUEUE_PERSISTENCE_KEY,
@@ -191,7 +245,8 @@ pub(crate) fn read_peer_info<L: Deref + Clone>(
 where
 	L::Target: LdkLogger,
 {
-	let mut reader = Cursor::new(kv_store.read(
+	let mut reader = Cursor::new(KVStoreSync::read(
+		&*kv_store,
 		PEER_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
 		PEER_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
 		PEER_INFO_PERSISTENCE_KEY,
@@ -211,11 +266,13 @@ where
 {
 	let mut res = Vec::new();
 
-	for stored_key in kv_store.list(
+	for stored_key in KVStoreSync::list(
+		&*kv_store,
 		PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
 		PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
 	)? {
-		let mut reader = Cursor::new(kv_store.read(
+		let mut reader = Cursor::new(KVStoreSync::read(
+			&*kv_store,
 			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
 			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
 			&stored_key,
@@ -238,7 +295,8 @@ pub(crate) fn read_output_sweeper(
 	chain_data_source: Arc<ChainSource>, keys_manager: Arc<KeysManager>, kv_store: Arc<DynStore>,
 	logger: Arc<Logger>,
 ) -> Result<Sweeper, std::io::Error> {
-	let mut reader = Cursor::new(kv_store.read(
+	let mut reader = Cursor::new(KVStoreSync::read(
+		&*kv_store,
 		OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE,
 		OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
 		OUTPUT_SWEEPER_PERSISTENCE_KEY,
@@ -252,107 +310,11 @@ pub(crate) fn read_output_sweeper(
 		kv_store,
 		logger.clone(),
 	);
-	OutputSweeper::read(&mut reader, args).map_err(|e| {
+	let (_, sweeper) = <(_, Sweeper)>::read(&mut reader, args).map_err(|e| {
 		log_error!(logger, "Failed to deserialize OutputSweeper: {}", e);
 		std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to deserialize OutputSweeper")
-	})
-}
-
-/// Read previously persisted spendable output information from the store and migrate to the
-/// upstreamed `OutputSweeper`.
-///
-/// We first iterate all `DeprecatedSpendableOutputInfo`s and have them tracked by the new
-/// `OutputSweeper`. In order to be certain the initial output spends will happen in a single
-/// transaction (and safe on-chain fees), we batch them to happen at current height plus two
-/// blocks. Lastly, we remove the previously persisted data once we checked they are tracked and
-/// awaiting their initial spend at the correct height.
-///
-/// Note that this migration will be run in the `Builder`, i.e., at the time when the migration is
-/// happening no background sync is ongoing, so we shouldn't have a risk of interleaving block
-/// connections during the migration.
-pub(crate) fn migrate_deprecated_spendable_outputs<L: Deref>(
-	sweeper: Arc<Sweeper>, kv_store: Arc<DynStore>, logger: L,
-) -> Result<(), std::io::Error>
-where
-	L::Target: LdkLogger,
-{
-	let best_block = sweeper.current_best_block();
-
-	for stored_key in kv_store.list(
-		DEPRECATED_SPENDABLE_OUTPUT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
-		DEPRECATED_SPENDABLE_OUTPUT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
-	)? {
-		let mut reader = Cursor::new(kv_store.read(
-			DEPRECATED_SPENDABLE_OUTPUT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
-			DEPRECATED_SPENDABLE_OUTPUT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
-			&stored_key,
-		)?);
-		let output = DeprecatedSpendableOutputInfo::read(&mut reader).map_err(|e| {
-			log_error!(logger, "Failed to deserialize SpendableOutputInfo: {}", e);
-			std::io::Error::new(
-				std::io::ErrorKind::InvalidData,
-				"Failed to deserialize SpendableOutputInfo",
-			)
-		})?;
-		let descriptors = vec![output.descriptor.clone()];
-		let spend_delay = Some(best_block.height + 2);
-		sweeper
-			.track_spendable_outputs(descriptors, output.channel_id, true, spend_delay)
-			.map_err(|_| {
-				log_error!(logger, "Failed to track spendable outputs. Aborting migration, will retry in the future.");
-				std::io::Error::new(
-					std::io::ErrorKind::InvalidData,
-					"Failed to track spendable outputs. Aborting migration, will retry in the future.",
-				)
-			})?;
-
-		if let Some(tracked_spendable_output) =
-			sweeper.tracked_spendable_outputs().iter().find(|o| o.descriptor == output.descriptor)
-		{
-			match tracked_spendable_output.status {
-				OutputSpendStatus::PendingInitialBroadcast { delayed_until_height } => {
-					if delayed_until_height == spend_delay {
-						kv_store.remove(
-							DEPRECATED_SPENDABLE_OUTPUT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
-							DEPRECATED_SPENDABLE_OUTPUT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
-							&stored_key,
-							false,
-						)?;
-					} else {
-						debug_assert!(false, "Unexpected status in OutputSweeper migration.");
-						log_error!(logger, "Unexpected status in OutputSweeper migration.");
-						return Err(std::io::Error::new(
-							std::io::ErrorKind::Other,
-							"Failed to migrate OutputSweeper state.",
-						));
-					}
-				},
-				_ => {
-					debug_assert!(false, "Unexpected status in OutputSweeper migration.");
-					log_error!(logger, "Unexpected status in OutputSweeper migration.");
-					return Err(std::io::Error::new(
-						std::io::ErrorKind::Other,
-						"Failed to migrate OutputSweeper state.",
-					));
-				},
-			}
-		} else {
-			debug_assert!(
-				false,
-				"OutputSweeper failed to track and persist outputs during migration."
-			);
-			log_error!(
-				logger,
-				"OutputSweeper failed to track and persist outputs during migration."
-			);
-			return Err(std::io::Error::new(
-				std::io::ErrorKind::Other,
-				"Failed to migrate OutputSweeper state.",
-			));
-		}
-	}
-
-	Ok(())
+	})?;
+	Ok(sweeper)
 }
 
 pub(crate) fn read_node_metrics<L: Deref>(
@@ -361,7 +323,8 @@ pub(crate) fn read_node_metrics<L: Deref>(
 where
 	L::Target: LdkLogger,
 {
-	let mut reader = Cursor::new(kv_store.read(
+	let mut reader = Cursor::new(KVStoreSync::read(
+		&*kv_store,
 		NODE_METRICS_PRIMARY_NAMESPACE,
 		NODE_METRICS_SECONDARY_NAMESPACE,
 		NODE_METRICS_KEY,
@@ -379,24 +342,24 @@ where
 	L::Target: LdkLogger,
 {
 	let data = node_metrics.encode();
-	kv_store
-		.write(
+	KVStoreSync::write(
+		&*kv_store,
+		NODE_METRICS_PRIMARY_NAMESPACE,
+		NODE_METRICS_SECONDARY_NAMESPACE,
+		NODE_METRICS_KEY,
+		data,
+	)
+	.map_err(|e| {
+		log_error!(
+			logger,
+			"Writing data to key {}/{}/{} failed due to: {}",
 			NODE_METRICS_PRIMARY_NAMESPACE,
 			NODE_METRICS_SECONDARY_NAMESPACE,
 			NODE_METRICS_KEY,
-			&data,
-		)
-		.map_err(|e| {
-			log_error!(
-				logger,
-				"Writing data to key {}/{}/{} failed due to: {}",
-				NODE_METRICS_PRIMARY_NAMESPACE,
-				NODE_METRICS_SECONDARY_NAMESPACE,
-				NODE_METRICS_KEY,
-				e
-			);
-			Error::PersistenceFailed
-		})
+			e
+		);
+		Error::PersistenceFailed
+	})
 }
 
 pub(crate) fn is_valid_kvstore_str(key: &str) -> bool {
@@ -491,31 +454,40 @@ pub(crate) fn check_namespace_key_validity(
 }
 
 macro_rules! impl_read_write_change_set_type {
-	( $read_name: ident, $write_name: ident, $change_set_type:ty, $primary_namespace: expr, $secondary_namespace: expr, $key: expr ) => {
+	(
+		$read_name:ident,
+		$write_name:ident,
+		$change_set_type:ty,
+		$primary_namespace:expr,
+		$secondary_namespace:expr,
+		$key:expr
+	) => {
 		pub(crate) fn $read_name<L: Deref>(
 			kv_store: Arc<DynStore>, logger: L,
 		) -> Result<Option<$change_set_type>, std::io::Error>
 		where
 			L::Target: LdkLogger,
 		{
-			let bytes = match kv_store.read($primary_namespace, $secondary_namespace, $key) {
-				Ok(bytes) => bytes,
-				Err(e) => {
-					if e.kind() == lightning::io::ErrorKind::NotFound {
-						return Ok(None);
-					} else {
-						log_error!(
-							logger,
-							"Reading data from key {}/{}/{} failed due to: {}",
-							$primary_namespace,
-							$secondary_namespace,
-							$key,
-							e
-						);
-						return Err(e.into());
-					}
-				},
-			};
+			let bytes =
+				match KVStoreSync::read(&*kv_store, $primary_namespace, $secondary_namespace, $key)
+				{
+					Ok(bytes) => bytes,
+					Err(e) => {
+						if e.kind() == lightning::io::ErrorKind::NotFound {
+							return Ok(None);
+						} else {
+							log_error!(
+								logger,
+								"Reading data from key {}/{}/{} failed due to: {}",
+								$primary_namespace,
+								$secondary_namespace,
+								$key,
+								e
+							);
+							return Err(e.into());
+						}
+					},
+				};
 
 			let mut reader = Cursor::new(bytes);
 			let res: Result<ChangeSetDeserWrapper<$change_set_type>, DecodeError> =
@@ -539,17 +511,18 @@ macro_rules! impl_read_write_change_set_type {
 			L::Target: LdkLogger,
 		{
 			let data = ChangeSetSerWrapper(value).encode();
-			kv_store.write($primary_namespace, $secondary_namespace, $key, &data).map_err(|e| {
-				log_error!(
-					logger,
-					"Writing data to key {}/{}/{} failed due to: {}",
-					$primary_namespace,
-					$secondary_namespace,
-					$key,
-					e
-				);
-				e.into()
-			})
+			KVStoreSync::write(&*kv_store, $primary_namespace, $secondary_namespace, $key, data)
+				.map_err(|e| {
+					log_error!(
+						logger,
+						"Writing data to key {}/{}/{} failed due to: {}",
+						$primary_namespace,
+						$secondary_namespace,
+						$key,
+						e
+					);
+					e.into()
+				})
 		}
 	};
 }
@@ -654,9 +627,35 @@ mod tests {
 
 	#[test]
 	fn mnemonic_to_entropy_to_mnemonic() {
-		let mnemonic = generate_entropy_mnemonic();
-
+		// Test default (24 words)
+		let mnemonic = generate_entropy_mnemonic(None);
 		let entropy = mnemonic.to_entropy();
 		assert_eq!(mnemonic, Mnemonic::from_entropy(&entropy).unwrap());
+		assert_eq!(mnemonic.word_count(), 24);
+
+		// Test with different word counts
+		let word_counts = [
+			WordCount::Words12,
+			WordCount::Words15,
+			WordCount::Words18,
+			WordCount::Words21,
+			WordCount::Words24,
+		];
+
+		for word_count in word_counts {
+			let mnemonic = generate_entropy_mnemonic(Some(word_count));
+			let entropy = mnemonic.to_entropy();
+			assert_eq!(mnemonic, Mnemonic::from_entropy(&entropy).unwrap());
+
+			// Verify expected word count
+			let expected_words = match word_count {
+				WordCount::Words12 => 12,
+				WordCount::Words15 => 15,
+				WordCount::Words18 => 18,
+				WordCount::Words21 => 21,
+				WordCount::Words24 => 24,
+			};
+			assert_eq!(mnemonic.word_count(), expected_words);
+		}
 	}
 }

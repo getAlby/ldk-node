@@ -5,6 +5,28 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
+use std::fmt;
+use std::sync::{Arc, Mutex};
+
+use bitcoin::secp256k1::PublicKey;
+use bitcoin::OutPoint;
+use lightning::chain::chainmonitor;
+use lightning::impl_writeable_tlv_based;
+use lightning::ln::channel_state::ChannelDetails as LdkChannelDetails;
+use lightning::ln::msgs::{RoutingMessageHandler, SocketAddress};
+use lightning::ln::peer_handler::IgnoringMessageHandler;
+use lightning::ln::types::ChannelId;
+use lightning::routing::gossip;
+use lightning::routing::router::DefaultRouter;
+use lightning::routing::scoring::{CombinedScorer, ProbabilisticScoringFeeParameters};
+use lightning::sign::InMemorySigner;
+use lightning::util::persist::{KVStore, KVStoreSync, MonitorUpdatingPersister};
+use lightning::util::ser::{Readable, Writeable, Writer};
+use lightning::util::sweep::OutputSweeper;
+use lightning_block_sync::gossip::{GossipVerifier, UtxoSource};
+use lightning_liquidity::utils::time::DefaultTimeProvider;
+use lightning_net_tokio::SocketDescriptor;
+
 use crate::chain::ChainSource;
 use crate::config::ChannelConfig;
 use crate::data_store::DataStore;
@@ -14,31 +36,56 @@ use crate::logger::Logger;
 use crate::message_handler::NodeCustomMessageHandler;
 use crate::payment::PaymentDetails;
 
-use lightning::chain::chainmonitor;
-use lightning::impl_writeable_tlv_based;
-use lightning::ln::channel_state::ChannelDetails as LdkChannelDetails;
-use lightning::ln::msgs::RoutingMessageHandler;
-use lightning::ln::msgs::SocketAddress;
-use lightning::ln::peer_handler::IgnoringMessageHandler;
-use lightning::ln::types::ChannelId;
-use lightning::routing::gossip;
-use lightning::routing::router::DefaultRouter;
-use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringFeeParameters};
-use lightning::sign::InMemorySigner;
-use lightning::util::persist::KVStore;
-use lightning::util::ser::{Readable, Writeable, Writer};
-use lightning::util::sweep::OutputSweeper;
+/// Supported BIP39 mnemonic word counts for entropy generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WordCount {
+	/// 12-word mnemonic (128-bit entropy)
+	Words12,
+	/// 15-word mnemonic (160-bit entropy)
+	Words15,
+	/// 18-word mnemonic (192-bit entropy)
+	Words18,
+	/// 21-word mnemonic (224-bit entropy)
+	Words21,
+	/// 24-word mnemonic (256-bit entropy)
+	Words24,
+}
 
-use lightning_block_sync::gossip::{GossipVerifier, UtxoSource};
+impl WordCount {
+	/// Returns the word count as a usize value.
+	pub fn word_count(&self) -> usize {
+		match self {
+			WordCount::Words12 => 12,
+			WordCount::Words15 => 15,
+			WordCount::Words18 => 18,
+			WordCount::Words21 => 21,
+			WordCount::Words24 => 24,
+		}
+	}
+}
 
-use lightning_net_tokio::SocketDescriptor;
+/// A supertrait that requires that a type implements both [`KVStore`] and [`KVStoreSync`] at the
+/// same time.
+pub trait SyncAndAsyncKVStore: KVStore + KVStoreSync {}
 
-use bitcoin::secp256k1::PublicKey;
-use bitcoin::OutPoint;
+impl<T> SyncAndAsyncKVStore for T
+where
+	T: KVStore,
+	T: KVStoreSync,
+{
+}
 
-use std::sync::{Arc, Mutex};
+/// A type alias for [`SyncAndAsyncKVStore`] with `Sync`/`Send` markers;
+pub type DynStore = dyn SyncAndAsyncKVStore + Sync + Send;
 
-pub(crate) type DynStore = dyn KVStore + Sync + Send;
+pub type Persister = MonitorUpdatingPersister<
+	Arc<DynStore>,
+	Arc<Logger>,
+	Arc<KeysManager>,
+	Arc<KeysManager>,
+	Arc<Broadcaster>,
+	Arc<OnchainFeeEstimator>,
+>;
 
 pub(crate) type ChainMonitor = chainmonitor::ChainMonitor<
 	InMemorySigner,
@@ -46,7 +93,8 @@ pub(crate) type ChainMonitor = chainmonitor::ChainMonitor<
 	Arc<Broadcaster>,
 	Arc<OnchainFeeEstimator>,
 	Arc<Logger>,
-	Arc<DynStore>,
+	Arc<Persister>,
+	Arc<KeysManager>,
 >;
 
 pub(crate) type PeerManager = lightning::ln::peer_handler::PeerManager<
@@ -57,10 +105,18 @@ pub(crate) type PeerManager = lightning::ln::peer_handler::PeerManager<
 	Arc<Logger>,
 	Arc<NodeCustomMessageHandler<Arc<Logger>>>,
 	Arc<KeysManager>,
+	Arc<ChainMonitor>,
 >;
 
-pub(crate) type LiquidityManager =
-	lightning_liquidity::LiquidityManager<Arc<KeysManager>, Arc<ChannelManager>, Arc<ChainSource>>;
+pub(crate) type LiquidityManager = lightning_liquidity::LiquidityManager<
+	Arc<KeysManager>,
+	Arc<KeysManager>,
+	Arc<ChannelManager>,
+	Arc<ChainSource>,
+	Arc<DynStore>,
+	DefaultTimeProvider,
+	Arc<Broadcaster>,
+>;
 
 pub(crate) type ChannelManager = lightning::ln::channelmanager::ChannelManager<
 	Arc<ChainMonitor>,
@@ -76,11 +132,8 @@ pub(crate) type ChannelManager = lightning::ln::channelmanager::ChannelManager<
 
 pub(crate) type Broadcaster = crate::tx_broadcaster::TransactionBroadcaster<Arc<Logger>>;
 
-pub(crate) type Wallet =
-	crate::wallet::Wallet<Arc<Broadcaster>, Arc<OnchainFeeEstimator>, Arc<Logger>>;
-
-pub(crate) type KeysManager =
-	crate::wallet::WalletKeysManager<Arc<Broadcaster>, Arc<OnchainFeeEstimator>, Arc<Logger>>;
+pub(crate) type Wallet = crate::wallet::Wallet;
+pub(crate) type KeysManager = crate::wallet::WalletKeysManager;
 
 pub(crate) type Router = DefaultRouter<
 	Arc<Graph>,
@@ -90,7 +143,7 @@ pub(crate) type Router = DefaultRouter<
 	ProbabilisticScoringFeeParameters,
 	Scorer,
 >;
-pub(crate) type Scorer = ProbabilisticScorer<Arc<Graph>, Arc<Logger>>;
+pub(crate) type Scorer = CombinedScorer<Arc<Graph>, Arc<Logger>>;
 
 pub(crate) type Graph = gossip::NetworkGraph<Arc<Logger>>;
 
@@ -116,7 +169,7 @@ pub(crate) type OnionMessenger = lightning::onion_message::messenger::OnionMesse
 	Arc<ChannelManager>,
 	Arc<MessageRouter>,
 	Arc<ChannelManager>,
-	IgnoringMessageHandler,
+	Arc<ChannelManager>,
 	IgnoringMessageHandler,
 	IgnoringMessageHandler,
 >;
@@ -167,18 +220,11 @@ impl Readable for UserChannelId {
 	}
 }
 
-/// The type of a channel, as negotiated during channel opening.
-///
-/// See [`BOLT 2`] for more information.
-///
-/// [`BOLT 2`]: https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#defined-channel-types
-// #[derive(Debug, Clone, PartialEq, Eq)]
-// pub enum ChannelType {
-// 	/// A channel of type `option_static_remotekey`.
-// 	StaticRemoteKey,
-// 	/// A channel of type `option_anchors_zero_fee_htlc_tx`.
-// 	Anchors,
-// }
+impl fmt::Display for UserChannelId {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "UserChannelId({})", self.0)
+	}
+}
 
 /// Details of a channel as returned by [`Node::list_channels`].
 ///

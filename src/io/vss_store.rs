@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use crate::io::utils::check_namespace_key_validity;
+/*use crate::io::utils::check_namespace_key_validity;
 use bitcoin::hashes::{sha256, Hash, HashEngine, Hmac, HmacEngine};
 use lightning::io::{self, Error, ErrorKind};
 use lightning::util::persist::{
@@ -13,12 +13,25 @@ use lightning::util::persist::{
 	NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use prost::Message;
-use rand::RngCore;
+use rand::RngCore;*/
+use std::boxed::Box;
+use std::collections::HashMap;
+use std::future::Future;
 #[cfg(test)]
 use std::panic::RefUnwindSafe;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::runtime::Runtime;
+
+use bdk_chain::Merge;
+use bitcoin::hashes::{sha256, Hash, HashEngine, Hmac, HmacEngine};
+use lightning::impl_writeable_tlv_based_enum;
+use lightning::io::{self, Error, ErrorKind};
+use lightning::util::persist::{KVStore, KVStoreSync};
+use lightning::util::ser::{Readable, Writeable};
+use prost::Message;
+use rand::RngCore;
 use vss_client::client::VssClient;
 use vss_client::error::VssError;
 use vss_client::headers::VssHeaderProvider;
@@ -33,6 +46,8 @@ use vss_client::util::retry::{
 };
 use vss_client::util::storable_builder::{EntropySource, StorableBuilder};
 
+use crate::io::utils::check_namespace_key_validity;
+
 type CustomRetryPolicy = FilteredRetryPolicy<
 	JitteredRetryPolicy<
 		MaxTotalDelayRetryPolicy<MaxAttemptsRetryPolicy<ExponentialBackoffRetryPolicy<VssError>>>,
@@ -40,13 +55,44 @@ type CustomRetryPolicy = FilteredRetryPolicy<
 	Box<dyn Fn(&VssError) -> bool + 'static + Send + Sync>,
 >;
 
-/// A [`KVStore`] implementation that writes to and reads from a [VSS](https://github.com/lightningdevkit/vss-server/blob/main/README.md) backend.
+#[derive(Debug, PartialEq)]
+enum VssSchemaVersion {
+	// The initial schema version.
+	// This used an empty `aad` and unobfuscated `primary_namespace`/`secondary_namespace`s in the
+	// stored key.
+	V0,
+	// The second deployed schema version.
+	// Here we started to obfuscate the primary and secondary namespaces and the obfuscated `store_key` (`obfuscate(primary_namespace#secondary_namespace)#obfuscate(key)`) is now used as `aad` for encryption, ensuring that the encrypted blobs commit to the key they're stored under.
+	V1,
+}
+
+impl_writeable_tlv_based_enum!(VssSchemaVersion,
+	(0, V0) => {},
+	(1, V1) => {},
+);
+
+const VSS_SCHEMA_VERSION_KEY: &str = "vss_schema_version";
+
+// We set this to a small number of threads that would still allow to make some progress if one
+// would hit a blocking case
+const INTERNAL_RUNTIME_WORKERS: usize = 2;
+
+/// A [`KVStoreSync`] implementation that writes to and reads from a [VSS](https://github.com/lightningdevkit/vss-server/blob/main/README.md) backend.
 pub struct VssStore {
-	client: VssClient<CustomRetryPolicy>,
-	store_id: String,
-	runtime: Runtime,
-	storable_builder: StorableBuilder<RandEntropySource>,
-	key_obfuscator: KeyObfuscator,
+	inner: Arc<VssStoreInner>,
+	// Version counter to ensure that writes are applied in the correct order. It is assumed that read and list
+	// operations aren't sensitive to the order of execution.
+	next_version: AtomicU64,
+	// A VSS-internal runtime we use to avoid any deadlocks we could hit when waiting on a spawned
+	// blocking task to finish while the blocked thread had acquired the reactor. In particular,
+	// this works around a previously-hit case where a concurrent call to
+	// `PeerManager::process_pending_events` -> `ChannelManager::get_and_clear_pending_msg_events`
+	// would deadlock when trying to acquire sync `Mutex` locks that are held by the thread
+	// currently being blocked waiting on the VSS operation to finish.
+	internal_runtime: Option<tokio::runtime::Runtime>,
+
+	// Alby: secondary kv store for saving the network graph as it's large and shouldn't be saved to VSS
+	// NOTE: for Alby Cloud we use a transient network graph (saved in memory and rebuilt on startup)
 	secondary_kv_store: Arc<dyn KVStore + Send + Sync>,
 }
 
@@ -56,44 +102,355 @@ impl VssStore {
 		header_provider: Arc<dyn VssHeaderProvider>,
 		secondary_kv_store: Arc<dyn KVStore + Send + Sync>,
 	) -> io::Result<Self> {
-		let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+		let next_version = AtomicU64::new(1);
+		let internal_runtime = tokio::runtime::Builder::new_multi_thread()
+			.enable_all()
+			.thread_name_fn(|| {
+				static ATOMIC_ID: AtomicUsize = AtomicUsize::new(0);
+				let id = ATOMIC_ID.fetch_add(1, Ordering::SeqCst);
+				format!("ldk-node-vss-runtime-{}", id)
+			})
+			.worker_threads(INTERNAL_RUNTIME_WORKERS)
+			.max_blocking_threads(INTERNAL_RUNTIME_WORKERS)
+			.build()
+			.unwrap();
+
 		let (data_encryption_key, obfuscation_master_key) =
 			derive_data_encryption_and_obfuscation_keys(&vss_seed);
 		let key_obfuscator = KeyObfuscator::new(obfuscation_master_key);
-		let storable_builder = StorableBuilder::new(data_encryption_key, RandEntropySource);
-		let retry_policy = ExponentialBackoffRetryPolicy::new(Duration::from_millis(10))
-			//.with_max_attempts(10)
-			.with_max_attempts(15) // Alby: account for unexpected networking errors
-			//.with_max_total_delay(Duration::from_secs(15))
-			.with_max_total_delay(Duration::from_secs(180)) // Alby: account for unexpected networking errors
-			.with_max_jitter(Duration::from_millis(10))
-			.skip_retry_on_error(Box::new(|e: &VssError| {
-				matches!(
-					e,
-					VssError::NoSuchKeyError(..)
-						| VssError::InvalidRequestError(..)
-						| VssError::ConflictError(..)
-				)
-			}) as _);
 
-		let client = VssClient::new_with_headers(base_url, retry_policy, header_provider);
-		Ok(Self { client, store_id, runtime, storable_builder, key_obfuscator, secondary_kv_store })
+		let sync_retry_policy = retry_policy();
+		let blocking_client = VssClient::new_with_headers(
+			base_url.clone(),
+			sync_retry_policy,
+			header_provider.clone(),
+		);
+
+		let runtime_handle = internal_runtime.handle();
+		let schema_version = tokio::task::block_in_place(|| {
+			runtime_handle.block_on(async {
+				determine_and_write_schema_version(
+					&blocking_client,
+					&store_id,
+					data_encryption_key,
+					&key_obfuscator,
+				)
+				.await
+			})
+		})?;
+
+		let async_retry_policy = retry_policy();
+		let async_client =
+			VssClient::new_with_headers(base_url, async_retry_policy, header_provider);
+
+		let inner = Arc::new(VssStoreInner::new(
+			schema_version,
+			blocking_client,
+			async_client,
+			store_id,
+			data_encryption_key,
+			key_obfuscator,
+		));
+
+		Ok(Self {
+			inner,
+			next_version,
+			internal_runtime: Some(internal_runtime),
+			secondary_kv_store,
+		})
 	}
 
-	fn build_key(
+	// Same logic as for the obfuscated keys below, but just for locking, using the plaintext keys
+	fn build_locking_key(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
-	) -> io::Result<String> {
-		let obfuscated_key = self.key_obfuscator.obfuscate(key);
+	) -> String {
 		if primary_namespace.is_empty() {
-			Ok(obfuscated_key)
+			key.to_owned()
 		} else {
-			Ok(format!("{}#{}#{}", primary_namespace, secondary_namespace, obfuscated_key))
+			format!("{}#{}#{}", primary_namespace, secondary_namespace, key)
+		}
+	}
+
+	fn get_new_version_and_lock_ref(
+		&self, locking_key: String,
+	) -> (Arc<tokio::sync::Mutex<u64>>, u64) {
+		let version = self.next_version.fetch_add(1, Ordering::Relaxed);
+		if version == u64::MAX {
+			panic!("VssStore version counter overflowed");
+		}
+
+		// Get a reference to the inner lock. We do this early so that the arc can double as an in-flight counter for
+		// cleaning up unused locks.
+		let inner_lock_ref = self.inner.get_inner_lock_ref(locking_key);
+
+		(inner_lock_ref, version)
+	}
+}
+
+impl KVStoreSync for VssStore {
+	fn read(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
+	) -> io::Result<Vec<u8>> {
+		let internal_runtime = self.internal_runtime.as_ref().ok_or_else(|| {
+			debug_assert!(false, "Failed to access internal runtime");
+			let msg = format!("Failed to access internal runtime");
+			Error::new(ErrorKind::Other, msg)
+		})?;
+		let primary_namespace = primary_namespace.to_string();
+		let secondary_namespace = secondary_namespace.to_string();
+		let key = key.to_string();
+		let inner = Arc::clone(&self.inner);
+		let fut = async move {
+			inner
+				.read_internal(&inner.blocking_client, primary_namespace, secondary_namespace, key)
+				.await
+		};
+		tokio::task::block_in_place(move || internal_runtime.block_on(fut))
+	}
+
+	fn write(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
+	) -> io::Result<()> {
+		let internal_runtime = self.internal_runtime.as_ref().ok_or_else(|| {
+			debug_assert!(false, "Failed to access internal runtime");
+			let msg = format!("Failed to access internal runtime");
+			Error::new(ErrorKind::Other, msg)
+		})?;
+		let primary_namespace = primary_namespace.to_string();
+		let secondary_namespace = secondary_namespace.to_string();
+		let key = key.to_string();
+		let inner = Arc::clone(&self.inner);
+		let locking_key = self.build_locking_key(&primary_namespace, &secondary_namespace, &key);
+		let (inner_lock_ref, version) = self.get_new_version_and_lock_ref(locking_key.clone());
+		let fut = async move {
+			inner
+				.write_internal(
+					&inner.blocking_client,
+					inner_lock_ref,
+					locking_key,
+					version,
+					primary_namespace,
+					secondary_namespace,
+					key,
+					buf,
+				)
+				.await
+		};
+		tokio::task::block_in_place(move || internal_runtime.block_on(fut))
+	}
+
+	fn remove(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool,
+	) -> io::Result<()> {
+		let internal_runtime = self.internal_runtime.as_ref().ok_or_else(|| {
+			debug_assert!(false, "Failed to access internal runtime");
+			let msg = format!("Failed to access internal runtime");
+			Error::new(ErrorKind::Other, msg)
+		})?;
+		let primary_namespace = primary_namespace.to_string();
+		let secondary_namespace = secondary_namespace.to_string();
+		let key = key.to_string();
+		let inner = Arc::clone(&self.inner);
+		let locking_key = self.build_locking_key(&primary_namespace, &secondary_namespace, &key);
+		let (inner_lock_ref, version) = self.get_new_version_and_lock_ref(locking_key.clone());
+		let fut = async move {
+			inner
+				.remove_internal(
+					&inner.blocking_client,
+					inner_lock_ref,
+					locking_key,
+					version,
+					primary_namespace,
+					secondary_namespace,
+					key,
+					lazy,
+				)
+				.await
+		};
+		tokio::task::block_in_place(move || internal_runtime.block_on(fut))
+	}
+
+	fn list(&self, primary_namespace: &str, secondary_namespace: &str) -> io::Result<Vec<String>> {
+		let internal_runtime = self.internal_runtime.as_ref().ok_or_else(|| {
+			debug_assert!(false, "Failed to access internal runtime");
+			let msg = format!("Failed to access internal runtime");
+			Error::new(ErrorKind::Other, msg)
+		})?;
+		let primary_namespace = primary_namespace.to_string();
+		let secondary_namespace = secondary_namespace.to_string();
+		let inner = Arc::clone(&self.inner);
+		let fut = async move {
+			inner
+				.list_internal(&inner.blocking_client, primary_namespace, secondary_namespace)
+				.await
+		};
+		tokio::task::block_in_place(move || internal_runtime.block_on(fut))
+	}
+}
+
+impl KVStore for VssStore {
+	fn read(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
+	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, io::Error>> + Send>> {
+		let primary_namespace = primary_namespace.to_string();
+		let secondary_namespace = secondary_namespace.to_string();
+		let key = key.to_string();
+		let inner = Arc::clone(&self.inner);
+		Box::pin(async move {
+			inner
+				.read_internal(&inner.async_client, primary_namespace, secondary_namespace, key)
+				.await
+		})
+	}
+	fn write(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
+	) -> Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send>> {
+		let locking_key = self.build_locking_key(primary_namespace, secondary_namespace, key);
+		let (inner_lock_ref, version) = self.get_new_version_and_lock_ref(locking_key.clone());
+		let primary_namespace = primary_namespace.to_string();
+		let secondary_namespace = secondary_namespace.to_string();
+		let key = key.to_string();
+		let inner = Arc::clone(&self.inner);
+		Box::pin(async move {
+			inner
+				.write_internal(
+					&inner.async_client,
+					inner_lock_ref,
+					locking_key,
+					version,
+					primary_namespace,
+					secondary_namespace,
+					key,
+					buf,
+				)
+				.await
+		})
+	}
+	fn remove(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool,
+	) -> Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send>> {
+		let locking_key = self.build_locking_key(primary_namespace, secondary_namespace, key);
+		let (inner_lock_ref, version) = self.get_new_version_and_lock_ref(locking_key.clone());
+		let primary_namespace = primary_namespace.to_string();
+		let secondary_namespace = secondary_namespace.to_string();
+		let key = key.to_string();
+		let inner = Arc::clone(&self.inner);
+		Box::pin(async move {
+			inner
+				.remove_internal(
+					&inner.async_client,
+					inner_lock_ref,
+					locking_key,
+					version,
+					primary_namespace,
+					secondary_namespace,
+					key,
+					lazy,
+				)
+				.await
+		})
+	}
+	fn list(
+		&self, primary_namespace: &str, secondary_namespace: &str,
+	) -> Pin<Box<dyn Future<Output = Result<Vec<String>, io::Error>> + Send>> {
+		let primary_namespace = primary_namespace.to_string();
+		let secondary_namespace = secondary_namespace.to_string();
+		let inner = Arc::clone(&self.inner);
+		Box::pin(async move {
+			inner.list_internal(&inner.async_client, primary_namespace, secondary_namespace).await
+		})
+	}
+}
+
+impl Drop for VssStore {
+	fn drop(&mut self) {
+		let internal_runtime = self.internal_runtime.take();
+		tokio::task::block_in_place(move || drop(internal_runtime));
+	}
+}
+
+struct VssStoreInner {
+	schema_version: VssSchemaVersion,
+	blocking_client: VssClient<CustomRetryPolicy>,
+	// A secondary client that will only be used for async persistence via `KVStore`, to ensure TCP
+	// connections aren't shared between our outer and the internal runtime.
+	async_client: VssClient<CustomRetryPolicy>,
+	store_id: String,
+	data_encryption_key: [u8; 32],
+	key_obfuscator: KeyObfuscator,
+	// Per-key locks that ensures that we don't have concurrent writes to the same namespace/key.
+	// The lock also encapsulates the latest written version per key.
+	locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<u64>>>>,
+	pending_lazy_deletes: Mutex<Vec<KeyValue>>,
+}
+
+impl VssStoreInner {
+	pub(crate) fn new(
+		schema_version: VssSchemaVersion, blocking_client: VssClient<CustomRetryPolicy>,
+		async_client: VssClient<CustomRetryPolicy>, store_id: String,
+		data_encryption_key: [u8; 32], key_obfuscator: KeyObfuscator,
+	) -> Self {
+		let locks = Mutex::new(HashMap::new());
+		let pending_lazy_deletes = Mutex::new(Vec::new());
+		Self {
+			schema_version,
+			blocking_client,
+			async_client,
+			store_id,
+			data_encryption_key,
+			key_obfuscator,
+			locks,
+			pending_lazy_deletes,
+		}
+	}
+
+	fn get_inner_lock_ref(&self, locking_key: String) -> Arc<tokio::sync::Mutex<u64>> {
+		let mut outer_lock = self.locks.lock().unwrap();
+		Arc::clone(&outer_lock.entry(locking_key).or_default())
+	}
+
+	fn build_obfuscated_key(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
+	) -> String {
+		if self.schema_version == VssSchemaVersion::V1 {
+			let obfuscated_prefix =
+				self.build_obfuscated_prefix(primary_namespace, secondary_namespace);
+			let obfuscated_key = self.key_obfuscator.obfuscate(key);
+			format!("{}#{}", obfuscated_prefix, obfuscated_key)
+		} else {
+			// Default to V0 schema
+			let obfuscated_key = self.key_obfuscator.obfuscate(key);
+			if primary_namespace.is_empty() {
+				obfuscated_key
+			} else {
+				format!("{}#{}#{}", primary_namespace, secondary_namespace, obfuscated_key)
+			}
+		}
+	}
+
+	fn build_obfuscated_prefix(
+		&self, primary_namespace: &str, secondary_namespace: &str,
+	) -> String {
+		if self.schema_version == VssSchemaVersion::V1 {
+			let prefix = format!("{}#{}", primary_namespace, secondary_namespace);
+			self.key_obfuscator.obfuscate(&prefix)
+		} else {
+			// Default to V0 schema
+			format!("{}#{}", primary_namespace, secondary_namespace)
 		}
 	}
 
 	fn extract_key(&self, unified_key: &str) -> io::Result<String> {
-		let mut parts = unified_key.splitn(3, '#');
-		let (_primary_namespace, _secondary_namespace) = (parts.next(), parts.next());
+		let mut parts = if self.schema_version == VssSchemaVersion::V1 {
+			let mut parts = unified_key.splitn(2, '#');
+			let _obfuscated_namespace = parts.next();
+			parts
+		} else {
+			// Default to V0 schema
+			let mut parts = unified_key.splitn(3, '#');
+			let (_primary_namespace, _secondary_namespace) = (parts.next(), parts.next());
+			parts
+		};
 		match parts.next() {
 			Some(obfuscated_key) => {
 				let actual_key = self.key_obfuscator.deobfuscate(obfuscated_key)?;
@@ -104,11 +461,12 @@ impl VssStore {
 	}
 
 	async fn list_all_keys(
-		&self, primary_namespace: &str, secondary_namespace: &str,
+		&self, client: &VssClient<CustomRetryPolicy>, primary_namespace: &str,
+		secondary_namespace: &str,
 	) -> io::Result<Vec<String>> {
 		let mut page_token = None;
 		let mut keys = vec![];
-		let key_prefix = format!("{}#{}", primary_namespace, secondary_namespace);
+		let key_prefix = self.build_obfuscated_prefix(primary_namespace, secondary_namespace);
 		while page_token != Some("".to_string()) {
 			let request = ListKeyVersionsRequest {
 				store_id: self.store_id.clone(),
@@ -117,7 +475,7 @@ impl VssStore {
 				page_size: None,
 			};
 
-			let response = self.client.list_key_versions(&request).await.map_err(|e| {
+			let response = client.list_key_versions(&request).await.map_err(|e| {
 				let msg = format!(
 					"Failed to list keys in {}/{}: {}",
 					primary_namespace, secondary_namespace, e
@@ -132,13 +490,12 @@ impl VssStore {
 		}
 		Ok(keys)
 	}
-}
 
-impl KVStore for VssStore {
-	fn read(
-		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
+	async fn read_internal(
+		&self, client: &VssClient<CustomRetryPolicy>, primary_namespace: String,
+		secondary_namespace: String, key: String,
 	) -> io::Result<Vec<u8>> {
-		// Alby: write network graph to secondary storage
+		// Alby: read network graph from secondary storage
 		if primary_namespace == NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE
 			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
 			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
@@ -146,24 +503,21 @@ impl KVStore for VssStore {
 			return self.secondary_kv_store.read(primary_namespace, secondary_namespace, key);
 		}
 
-		check_namespace_key_validity(primary_namespace, secondary_namespace, Some(key), "read")?;
-		let request = GetObjectRequest {
-			store_id: self.store_id.clone(),
-			key: self.build_key(primary_namespace, secondary_namespace, key)?,
-		};
+		check_namespace_key_validity(&primary_namespace, &secondary_namespace, Some(&key), "read")?;
 
-		let resp =
-			tokio::task::block_in_place(|| self.runtime.block_on(self.client.get_object(&request)))
-				.map_err(|e| {
-					let msg = format!(
-						"Failed to read from key {}/{}/{}: {}",
-						primary_namespace, secondary_namespace, key, e
-					);
-					match e {
-						VssError::NoSuchKeyError(..) => Error::new(ErrorKind::NotFound, msg),
-						_ => Error::new(ErrorKind::Other, msg),
-					}
-				})?;
+		let store_key = self.build_obfuscated_key(&primary_namespace, &secondary_namespace, &key);
+		let request = GetObjectRequest { store_id: self.store_id.clone(), key: store_key.clone() };
+		let resp = client.get_object(&request).await.map_err(|e| {
+			let msg = format!(
+				"Failed to read from key {}/{}/{}: {}",
+				primary_namespace, secondary_namespace, key, e
+			);
+			match e {
+				VssError::NoSuchKeyError(..) => Error::new(ErrorKind::NotFound, msg),
+				_ => Error::new(ErrorKind::Other, msg),
+			}
+		})?;
+
 		// unwrap safety: resp.value must be always present for a non-erroneous VSS response, otherwise
 		// it is an API-violation which is converted to [`VssError::InternalServerError`] in [`VssClient`]
 		let storable = Storable::decode(&resp.value.unwrap().value[..]).map_err(|e| {
@@ -174,11 +528,17 @@ impl KVStore for VssStore {
 			Error::new(ErrorKind::Other, msg)
 		})?;
 
-		Ok(self.storable_builder.deconstruct(storable)?.0)
+		let storable_builder = StorableBuilder::new(RandEntropySource);
+		let aad =
+			if self.schema_version == VssSchemaVersion::V1 { store_key.as_bytes() } else { &[] };
+		let decrypted = storable_builder.deconstruct(storable, &self.data_encryption_key, aad)?.0;
+		Ok(decrypted)
 	}
 
-	fn write(
-		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: &[u8],
+	async fn write_internal(
+		&self, client: &VssClient<CustomRetryPolicy>, inner_lock_ref: Arc<tokio::sync::Mutex<u64>>,
+		locking_key: String, version: u64, primary_namespace: String, secondary_namespace: String,
+		key: String, buf: Vec<u8>,
 	) -> io::Result<()> {
 		// Alby: write network graph to secondary storage
 		if primary_namespace == NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE
@@ -188,22 +548,44 @@ impl KVStore for VssStore {
 			return self.secondary_kv_store.write(primary_namespace, secondary_namespace, key, buf);
 		}
 
-		check_namespace_key_validity(primary_namespace, secondary_namespace, Some(key), "write")?;
-		let version = -1;
-		let storable = self.storable_builder.build(buf.to_vec(), version);
+		check_namespace_key_validity(
+			&primary_namespace,
+			&secondary_namespace,
+			Some(&key),
+			"write",
+		)?;
+
+		let delete_items = self
+			.pending_lazy_deletes
+			.try_lock()
+			.ok()
+			.and_then(|mut guard| guard.take())
+			.unwrap_or_default();
+		let store_key = self.build_obfuscated_key(&primary_namespace, &secondary_namespace, &key);
+		let vss_version = -1;
+		let storable_builder = StorableBuilder::new(RandEntropySource);
+		let aad =
+			if self.schema_version == VssSchemaVersion::V1 { store_key.as_bytes() } else { &[] };
+		let storable =
+			storable_builder.build(buf.to_vec(), vss_version, &self.data_encryption_key, aad);
 		let request = PutObjectRequest {
 			store_id: self.store_id.clone(),
 			global_version: None,
 			transaction_items: vec![KeyValue {
-				key: self.build_key(primary_namespace, secondary_namespace, key)?,
-				version,
+				key: store_key,
+				version: vss_version,
 				value: storable.encode_to_vec(),
 			}],
-			delete_items: vec![],
+			delete_items: delete_items.clone(),
 		};
 
-		tokio::task::block_in_place(|| self.runtime.block_on(self.client.put_object(&request)))
-			.map_err(|e| {
+		self.execute_locked_write(inner_lock_ref, locking_key, version, async move || {
+			client.put_object(&request).await.map_err(|e| {
+				// Restore delete items so they'll be retried on next write.
+				if !delete_items.is_empty() {
+					self.pending_lazy_deletes.lock().unwrap().extend(delete_items);
+				}
+
 				let msg = format!(
 					"Failed to write to key {}/{}/{}: {}",
 					primary_namespace, secondary_namespace, key, e
@@ -211,13 +593,17 @@ impl KVStore for VssStore {
 				Error::new(ErrorKind::Other, msg)
 			})?;
 
-		Ok(())
+			Ok(())
+		})
+		.await
 	}
 
-	fn remove(
-		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, _lazy: bool,
+	async fn remove_internal(
+		&self, client: &VssClient<CustomRetryPolicy>, inner_lock_ref: Arc<tokio::sync::Mutex<u64>>,
+		locking_key: String, version: u64, primary_namespace: String, secondary_namespace: String,
+		key: String, lazy: bool,
 	) -> io::Result<()> {
-		// Alby: write network graph to secondary storage
+		// Alby: remove network graph from secondary storage
 		if primary_namespace == NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE
 			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
 			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
@@ -229,40 +615,57 @@ impl KVStore for VssStore {
 				_lazy,
 			);
 		}
-		check_namespace_key_validity(primary_namespace, secondary_namespace, Some(key), "remove")?;
-		let request = DeleteObjectRequest {
-			store_id: self.store_id.clone(),
-			key_value: Some(KeyValue {
-				key: self.build_key(primary_namespace, secondary_namespace, key)?,
-				version: -1,
-				value: vec![],
-			}),
-		};
 
-		tokio::task::block_in_place(|| self.runtime.block_on(self.client.delete_object(&request)))
-			.map_err(|e| {
+		check_namespace_key_validity(
+			&primary_namespace,
+			&secondary_namespace,
+			Some(&key),
+			"remove",
+		)?;
+
+		let obfuscated_key =
+			self.build_obfuscated_key(&primary_namespace, &secondary_namespace, &key);
+
+		let key_value = KeyValue { key: obfuscated_key, version: -1, value: vec![] };
+		if lazy {
+			let mut pending_lazy_deletes = self.pending_lazy_deletes.lock().unwrap();
+			pending_lazy_deletes.push(key_value);
+			return Ok(());
+		}
+
+		self.execute_locked_write(inner_lock_ref, locking_key, version, async move || {
+			let request =
+				DeleteObjectRequest { store_id: self.store_id.clone(), key_value: Some(key_value) };
+
+			client.delete_object(&request).await.map_err(|e| {
 				let msg = format!(
 					"Failed to delete key {}/{}/{}: {}",
 					primary_namespace, secondary_namespace, key, e
 				);
 				Error::new(ErrorKind::Other, msg)
 			})?;
-		Ok(())
+
+			Ok(())
+		})
+		.await
 	}
 
-	fn list(&self, primary_namespace: &str, secondary_namespace: &str) -> io::Result<Vec<String>> {
-		check_namespace_key_validity(primary_namespace, secondary_namespace, None, "list")?;
+	async fn list_internal(
+		&self, client: &VssClient<CustomRetryPolicy>, primary_namespace: String,
+		secondary_namespace: String,
+	) -> io::Result<Vec<String>> {
+		check_namespace_key_validity(&primary_namespace, &secondary_namespace, None, "list")?;
 
-		let keys = tokio::task::block_in_place(|| {
-			self.runtime.block_on(self.list_all_keys(primary_namespace, secondary_namespace))
-		})
-		.map_err(|e| {
-			let msg = format!(
-				"Failed to retrieve keys in namespace: {}/{} : {}",
-				primary_namespace, secondary_namespace, e
-			);
-			Error::new(ErrorKind::Other, msg)
-		})?;
+		let keys = self
+			.list_all_keys(client, &primary_namespace, &secondary_namespace)
+			.await
+			.map_err(|e| {
+				let msg = format!(
+					"Failed to retrieve keys in namespace: {}/{} : {}",
+					primary_namespace, secondary_namespace, e
+				);
+				Error::new(ErrorKind::Other, msg)
+			})?;
 
 		// Alby: also list keys from secondary storage
 		let secondary_keys =
@@ -271,6 +674,50 @@ impl KVStore for VssStore {
 		let all_keys: Vec<String> =
 			keys.iter().cloned().chain(secondary_keys.iter().cloned()).collect();
 		Ok(all_keys)
+	}
+
+	async fn execute_locked_write<
+		F: Future<Output = Result<(), lightning::io::Error>>,
+		FN: FnOnce() -> F,
+	>(
+		&self, inner_lock_ref: Arc<tokio::sync::Mutex<u64>>, locking_key: String, version: u64,
+		callback: FN,
+	) -> Result<(), lightning::io::Error> {
+		let res = {
+			let mut last_written_version = inner_lock_ref.lock().await;
+
+			// Check if we already have a newer version written/removed. This is used in async contexts to realize eventual
+			// consistency.
+			let is_stale_version = version <= *last_written_version;
+
+			// If the version is not stale, we execute the callback. Otherwise we can and must skip writing.
+			if is_stale_version {
+				Ok(())
+			} else {
+				callback().await.map(|_| {
+					*last_written_version = version;
+				})
+			}
+		};
+
+		self.clean_locks(&inner_lock_ref, locking_key);
+
+		res
+	}
+
+	fn clean_locks(&self, inner_lock_ref: &Arc<tokio::sync::Mutex<u64>>, locking_key: String) {
+		// If there no arcs in use elsewhere, this means that there are no in-flight writes. We can remove the map entry
+		// to prevent leaking memory. The two arcs that are expected are the one in the map and the one held here in
+		// inner_lock_ref. The outer lock is obtained first, to avoid a new arc being cloned after we've already
+		// counted.
+		let mut outer_lock = self.locks.lock().unwrap();
+
+		let strong_count = Arc::strong_count(&inner_lock_ref);
+		debug_assert!(strong_count >= 2, "Unexpected VssStore strong count");
+
+		if strong_count == 2 {
+			outer_lock.remove(&locking_key);
+		}
 	}
 }
 
@@ -287,12 +734,132 @@ fn derive_data_encryption_and_obfuscation_keys(vss_seed: &[u8; 32]) -> ([u8; 32]
 	(k1, k2)
 }
 
+fn retry_policy() -> CustomRetryPolicy {
+	ExponentialBackoffRetryPolicy::new(Duration::from_millis(10))
+		.with_max_attempts(100)
+		.with_max_total_delay(Duration::from_secs(180))
+		.with_max_jitter(Duration::from_millis(100))
+		.skip_retry_on_error(Box::new(|e: &VssError| {
+			matches!(
+				e,
+				VssError::NoSuchKeyError(..)
+					| VssError::InvalidRequestError(..)
+					| VssError::ConflictError(..)
+			)
+		}) as _)
+}
+
+async fn determine_and_write_schema_version(
+	client: &VssClient<CustomRetryPolicy>, store_id: &String, data_encryption_key: [u8; 32],
+	key_obfuscator: &KeyObfuscator,
+) -> io::Result<VssSchemaVersion> {
+	// Build the obfuscated `vss_schema_version` key.
+	let obfuscated_prefix = key_obfuscator.obfuscate(&format! {"{}#{}", "", ""});
+	let obfuscated_key = key_obfuscator.obfuscate(VSS_SCHEMA_VERSION_KEY);
+	let store_key = format!("{}#{}", obfuscated_prefix, obfuscated_key);
+
+	// Try to read the stored schema version.
+	let request = GetObjectRequest { store_id: store_id.clone(), key: store_key.clone() };
+	let resp = match client.get_object(&request).await {
+		Ok(resp) => Some(resp),
+		Err(VssError::NoSuchKeyError(..)) => {
+			// The value is not set.
+			None
+		},
+		Err(e) => {
+			let msg = format!("Failed to read schema version: {}", e);
+			return Err(Error::new(ErrorKind::Other, msg));
+		},
+	};
+
+	if let Some(resp) = resp {
+		// The schema version was present, so just decrypt the stored data.
+
+		// unwrap safety: resp.value must be always present for a non-erroneous VSS response, otherwise
+		// it is an API-violation which is converted to [`VssError::InternalServerError`] in [`VssClient`]
+		let storable = Storable::decode(&resp.value.unwrap().value[..]).map_err(|e| {
+			let msg = format!("Failed to decode schema version: {}", e);
+			Error::new(ErrorKind::Other, msg)
+		})?;
+
+		let storable_builder = StorableBuilder::new(RandEntropySource);
+		// Schema version was added starting with V1, so if set at all, we use the key as `aad`
+		let aad = store_key.as_bytes();
+		let decrypted = storable_builder
+			.deconstruct(storable, &data_encryption_key, aad)
+			.map_err(|e| {
+				let msg = format!("Failed to decode schema version: {}", e);
+				Error::new(ErrorKind::Other, msg)
+			})?
+			.0;
+
+		let schema_version: VssSchemaVersion = Readable::read(&mut io::Cursor::new(decrypted))
+			.map_err(|e| {
+				let msg = format!("Failed to decode schema version: {}", e);
+				Error::new(ErrorKind::Other, msg)
+			})?;
+		Ok(schema_version)
+	} else {
+		// The schema version wasn't present, this either means we're running for the first time *or* it's V0 pre-migration (predating writing of the schema version).
+
+		// Check if any `bdk_wallet` data was written by listing keys under the respective
+		// (unobfuscated) prefix.
+		const V0_BDK_WALLET_PREFIX: &str = "bdk_wallet#";
+		let request = ListKeyVersionsRequest {
+			store_id: store_id.clone(),
+			key_prefix: Some(V0_BDK_WALLET_PREFIX.to_string()),
+			page_token: None,
+			page_size: None,
+		};
+
+		let response = client.list_key_versions(&request).await.map_err(|e| {
+			let msg = format!("Failed to determine schema version: {}", e);
+			Error::new(ErrorKind::Other, msg)
+		})?;
+
+		let wallet_data_present = !response.key_versions.is_empty();
+		if wallet_data_present {
+			// If the wallet data is present, it means we're not running for the first time.
+			Ok(VssSchemaVersion::V0)
+		} else {
+			// We're running for the first time, write the schema version to save unnecessary IOps
+			// on future startup.
+			let schema_version = VssSchemaVersion::V1;
+			let encoded_version = schema_version.encode();
+
+			let storable_builder = StorableBuilder::new(RandEntropySource);
+			let vss_version = -1;
+			let aad = store_key.as_bytes();
+			let storable =
+				storable_builder.build(encoded_version, vss_version, &data_encryption_key, aad);
+
+			let request = PutObjectRequest {
+				store_id: store_id.clone(),
+				global_version: None,
+				transaction_items: vec![KeyValue {
+					key: store_key,
+					version: vss_version,
+					value: storable.encode_to_vec(),
+				}],
+				delete_items: vec![],
+			};
+
+			client.put_object(&request).await.map_err(|e| {
+				let msg = format!("Failed to write schema version: {}", e);
+				Error::new(ErrorKind::Other, msg)
+			})?;
+
+			Ok(schema_version)
+		}
+	}
+}
+
 /// A source for generating entropy/randomness using [`rand`].
 pub(crate) struct RandEntropySource;
 
 impl EntropySource for RandEntropySource {
 	fn fill_bytes(&self, buffer: &mut [u8]) {
-		rand::thread_rng().fill_bytes(buffer);
+		rand::rng().fill_bytes(buffer);
 	}
 }
 
@@ -302,17 +869,32 @@ impl RefUnwindSafe for VssStore {}
 #[cfg(test)]
 #[cfg(vss_test)]
 mod tests {
-	use super::*;
-	use crate::io::test_utils::do_read_write_remove_list_persist;
-	use rand::distributions::Alphanumeric;
-	use rand::{thread_rng, Rng, RngCore};
 	use std::collections::HashMap;
+
+	use rand::distr::Alphanumeric;
+	use rand::{rng, Rng, RngCore};
 	use vss_client::headers::FixedHeaders;
 
+	use super::*;
+	use crate::io::test_utils::do_read_write_remove_list_persist;
+
 	#[test]
-	fn read_write_remove_list_persist() {
+	fn vss_read_write_remove_list_persist() {
 		let vss_base_url = std::env::var("TEST_VSS_BASE_URL").unwrap();
-		let mut rng = thread_rng();
+		let mut rng = rng();
+		let rand_store_id: String = (0..7).map(|_| rng.sample(Alphanumeric) as char).collect();
+		let mut vss_seed = [0u8; 32];
+		rng.fill_bytes(&mut vss_seed);
+		let header_provider = Arc::new(FixedHeaders::new(HashMap::new()));
+		let vss_store =
+			VssStore::new(vss_base_url, rand_store_id, vss_seed, header_provider).unwrap();
+		do_read_write_remove_list_persist(&vss_store);
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+	async fn vss_read_write_remove_list_persist_in_runtime_context() {
+		let vss_base_url = std::env::var("TEST_VSS_BASE_URL").unwrap();
+		let mut rng = rng();
 		let rand_store_id: String = (0..7).map(|_| rng.sample(Alphanumeric) as char).collect();
 		let mut vss_seed = [0u8; 32];
 		rng.fill_bytes(&mut vss_seed);
@@ -321,5 +903,87 @@ mod tests {
 			VssStore::new(vss_base_url, rand_store_id, vss_seed, header_provider).unwrap();
 
 		do_read_write_remove_list_persist(&vss_store);
+		drop(vss_store)
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+	async fn vss_lazy_delete() {
+		let vss_base_url = std::env::var("TEST_VSS_BASE_URL").unwrap();
+		let mut rng = rng();
+		let rand_store_id: String = (0..7).map(|_| rng.sample(Alphanumeric) as char).collect();
+		let mut vss_seed = [0u8; 32];
+		rng.fill_bytes(&mut vss_seed);
+		let header_provider = Arc::new(FixedHeaders::new(HashMap::new()));
+		let vss_store =
+			VssStore::new(vss_base_url, rand_store_id, vss_seed, header_provider).unwrap();
+
+		let primary_namespace = "test_namespace";
+		let secondary_namespace = "";
+		let key_to_delete = "key_to_delete";
+		let key_for_trigger = "key_for_trigger";
+		let data_to_delete = b"data_to_delete".to_vec();
+		let trigger_data = b"trigger_data".to_vec();
+
+		// Write the key that we'll later lazily delete
+		KVStore::write(
+			&vss_store,
+			primary_namespace,
+			secondary_namespace,
+			key_to_delete,
+			data_to_delete.clone(),
+		)
+		.await
+		.unwrap();
+
+		// Verify the key exists
+		let read_data =
+			KVStore::read(&vss_store, primary_namespace, secondary_namespace, key_to_delete)
+				.await
+				.unwrap();
+		assert_eq!(read_data, data_to_delete);
+
+		// Perform a lazy delete
+		KVStore::remove(&vss_store, primary_namespace, secondary_namespace, key_to_delete, true)
+			.await
+			.unwrap();
+
+		// Verify the key still exists (lazy delete doesn't immediately remove it)
+		let read_data =
+			KVStore::read(&vss_store, primary_namespace, secondary_namespace, key_to_delete)
+				.await
+				.unwrap();
+		assert_eq!(read_data, data_to_delete);
+
+		// Verify the key is still in the list
+		let keys = KVStore::list(&vss_store, primary_namespace, secondary_namespace).await.unwrap();
+		assert!(keys.contains(&key_to_delete.to_string()));
+
+		// Trigger the actual deletion by performing a write operation
+		KVStore::write(
+			&vss_store,
+			primary_namespace,
+			secondary_namespace,
+			key_for_trigger,
+			trigger_data.clone(),
+		)
+		.await
+		.unwrap();
+
+		// Now verify the key is actually deleted
+		let read_result =
+			KVStore::read(&vss_store, primary_namespace, secondary_namespace, key_to_delete).await;
+		assert!(read_result.is_err());
+		assert_eq!(read_result.unwrap_err().kind(), ErrorKind::NotFound);
+
+		// Verify the key is no longer in the list
+		let keys = KVStore::list(&vss_store, primary_namespace, secondary_namespace).await.unwrap();
+		assert!(!keys.contains(&key_to_delete.to_string()));
+
+		// Verify the trigger key still exists
+		let read_data =
+			KVStore::read(&vss_store, primary_namespace, secondary_namespace, key_for_trigger)
+				.await
+				.unwrap();
+		assert_eq!(read_data, trigger_data);
 	}
 }

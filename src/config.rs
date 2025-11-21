@@ -7,20 +7,19 @@
 
 //! Objects for configuring the node.
 
-use crate::logger::LogLevel;
-use crate::payment::SendingParameters;
-
-use lightning::ln::msgs::SocketAddress;
-use lightning::routing::gossip::NodeAlias;
-use lightning::util::config::ChannelConfig as LdkChannelConfig;
-use lightning::util::config::MaxDustHTLCExposure as LdkMaxDustHTLCExposure;
-use lightning::util::config::UserConfig;
+use std::fmt;
+use std::time::Duration;
 
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::Network;
+use lightning::ln::msgs::SocketAddress;
+use lightning::routing::gossip::NodeAlias;
+use lightning::routing::router::RouteParametersConfig;
+use lightning::util::config::{
+	ChannelConfig as LdkChannelConfig, MaxDustHTLCExposure as LdkMaxDustHTLCExposure, UserConfig,
+};
 
-use std::fmt;
-use std::time::Duration;
+use crate::logger::LogLevel;
 
 // Config defaults
 const DEFAULT_NETWORK: Network = Network::Bitcoin;
@@ -38,6 +37,12 @@ pub const DEFAULT_LOG_FILENAME: &'static str = "ldk_node.log";
 
 /// The default storage directory.
 pub const DEFAULT_STORAGE_DIR_PATH: &str = "/tmp/ldk_node";
+
+// The default Esplora server we're using.
+pub(crate) const DEFAULT_ESPLORA_SERVER_URL: &str = "https://blockstream.info/api";
+
+// The default Esplora client timeout we're using.
+pub(crate) const DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS: u64 = 10;
 
 // The 'stop gap' parameter used by BDK's wallet sync. This seems to configure the threshold
 // number of derivation indexes after which BDK stops looking for new scripts belonging to the wallet.
@@ -60,6 +65,9 @@ pub(crate) const PEER_RECONNECTION_INTERVAL: Duration = Duration::from_secs(60);
 // The time in-between RGS sync attempts.
 pub(crate) const RGS_SYNC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
+// The time in-between external scores sync attempts.
+pub(crate) const EXTERNAL_PATHFINDING_SCORES_SYNC_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
 // The time in-between node announcement broadcast attempts.
 pub(crate) const NODE_ANN_BCAST_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
@@ -70,7 +78,7 @@ pub(crate) const WALLET_SYNC_INTERVAL_MINIMUM_SECS: u64 = 10;
 pub(crate) const BDK_WALLET_SYNC_TIMEOUT_SECS: u64 = 40; //20; // Alby: originally 90
 
 // The timeout after which we abort a wallet syncing operation.
-pub(crate) const LDK_WALLET_SYNC_TIMEOUT_SECS: u64 = 20; //10; // Alby: originally 90
+pub(crate) const LDK_WALLET_SYNC_TIMEOUT_SECS: u64 = 40; //10; // Alby: originally 90
 
 // The timeout after which we give up waiting on LDK's event handler to exit on shutdown.
 pub(crate) const LDK_EVENT_HANDLER_SHUTDOWN_TIMEOUT_SECS: u64 = 60; // 30;
@@ -89,6 +97,9 @@ pub(crate) const RGS_SYNC_TIMEOUT_SECS: u64 = 5;
 
 /// The length in bytes of our wallets' keys seed.
 pub const WALLET_KEYS_SEED_LEN: usize = 64;
+
+// The timeout after which we abort a external scores sync operation.
+pub(crate) const EXTERNAL_PATHFINDING_SCORES_SYNC_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Debug, Clone)]
 /// Represents the configuration of an [`Node`] instance.
@@ -110,9 +121,9 @@ pub const WALLET_KEYS_SEED_LEN: usize = 64;
 /// | `probing_liquidity_limit_multiplier`   | 3                  |
 /// | `log_level`                            | Debug              |
 /// | `anchor_channels_config`               | Some(..)           |
-/// | `sending_parameters`                   | None               |
+/// | `route_parameters`                   | None               |
 ///
-/// See [`AnchorChannelsConfig`] and [`SendingParameters`] for more information regarding their
+/// See [`AnchorChannelsConfig`] and [`RouteParametersConfig`] for more information regarding their
 /// respective default values.
 ///
 /// [`Node`]: crate::Node
@@ -169,12 +180,12 @@ pub struct Config {
 	pub anchor_channels_config: Option<AnchorChannelsConfig>,
 	/// Configuration options for payment routing and pathfinding.
 	///
-	/// Setting the `SendingParameters` provides flexibility to customize how payments are routed,
+	/// Setting the [`RouteParametersConfig`] provides flexibility to customize how payments are routed,
 	/// including setting limits on routing fees, CLTV expiry, and channel utilization.
 	///
 	/// **Note:** If unset, default parameters will be used, and you will be able to override the
 	/// parameters on a per-payment basis in the corresponding method calls.
-	pub sending_parameters: Option<SendingParameters>,
+	pub route_parameters: Option<RouteParametersConfig>,
 	/// Alby: Transient network graph.
 	///
 	/// If set to `true`, the graph is not persisted in the database and is only kept in memory.
@@ -192,7 +203,7 @@ impl Default for Config {
 			trusted_peers_0conf: Vec::new(),
 			probing_liquidity_limit_multiplier: DEFAULT_PROBING_LIQUIDITY_LIMIT_MULTIPLIER,
 			anchor_channels_config: Some(AnchorChannelsConfig::default()),
-			sending_parameters: None,
+			route_parameters: None,
 			node_alias: None,
 			transient_network_graph: false,
 		}
@@ -322,6 +333,7 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	user_config.manually_accept_inbound_channels = true;
 	user_config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx =
 		config.anchor_channels_config.is_some();
+	user_config.reject_inbound_splices = false;
 
 	if may_announce_channel(config).is_err() {
 		user_config.accept_forwards_to_priv_channels = false;
@@ -409,6 +421,15 @@ impl Default for ElectrumSyncConfig {
 	fn default() -> Self {
 		Self { background_sync_config: Some(BackgroundSyncConfig::default()) }
 	}
+}
+
+/// Configuration for syncing with Bitcoin Core backend via REST.
+#[derive(Debug, Clone)]
+pub struct BitcoindRestClientConfig {
+	/// Host URL.
+	pub rest_host: String,
+	/// Host port.
+	pub rest_port: u16,
 }
 
 /// Options which apply on a per-channel basis and may change at runtime or based on negotiation
@@ -527,15 +548,24 @@ impl From<MaxDustHTLCExposure> for LdkMaxDustHTLCExposure {
 	}
 }
 
+#[derive(Debug, Clone, Copy)]
+/// The role of the node in an asynchronous payments context.
+///
+/// See <https://github.com/lightning/bolts/pull/1149> for more information about the async payments protocol.
+pub enum AsyncPaymentsRole {
+	/// Node acts a client in an async payments context. This means that if possible, it will instruct its peers to hold
+	/// HTLCs for it, so that it can go offline.
+	Client,
+	/// Node acts as a server in an async payments context. This means that it will hold async payments HTLCs and onion
+	/// messages for its peers.
+	Server,
+}
+
 #[cfg(test)]
 mod tests {
 	use std::str::FromStr;
 
-	use super::may_announce_channel;
-	use super::AnnounceError;
-	use super::Config;
-	use super::NodeAlias;
-	use super::SocketAddress;
+	use super::{may_announce_channel, AnnounceError, Config, NodeAlias, SocketAddress};
 
 	#[test]
 	fn node_announce_channel() {

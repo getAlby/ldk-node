@@ -11,22 +11,23 @@
 //! [BIP 21]: https://github.com/bitcoin/bips/blob/master/bip-0021.mediawiki
 //! [BOLT 11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
 //! [BOLT 12]: https://github.com/lightning/bolts/blob/master/12-offer-encoding.md
-use crate::error::Error;
-use crate::logger::{log_error, LdkLogger, Logger};
-use crate::payment::{bolt11::maybe_wrap_invoice, Bolt11Payment, Bolt12Payment, OnchainPayment};
-use crate::Config;
-
-use lightning::ln::channelmanager::PaymentId;
-use lightning::offers::offer::Offer;
-use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
+use std::sync::Arc;
+use std::vec::IntoIter;
 
 use bip21::de::ParamKind;
 use bip21::{DeserializationError, DeserializeParams, Param, SerializeParams};
 use bitcoin::address::{NetworkChecked, NetworkUnchecked};
 use bitcoin::{Amount, Txid};
+use lightning::ln::channelmanager::PaymentId;
+use lightning::offers::offer::Offer;
+use lightning::routing::router::RouteParametersConfig;
+use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 
-use std::sync::Arc;
-use std::vec::IntoIter;
+use crate::error::Error;
+use crate::ffi::maybe_wrap;
+use crate::logger::{log_error, LdkLogger, Logger};
+use crate::payment::{Bolt11Payment, Bolt12Payment, OnchainPayment};
+use crate::Config;
 
 type Uri<'a> = bip21::Uri<'a, NetworkChecked, Extras>;
 
@@ -94,14 +95,14 @@ impl UnifiedQrPayment {
 
 		let amount_msats = amount_sats * 1_000;
 
-		let bolt12_offer = match self.bolt12_payment.receive(amount_msats, description, None, None)
-		{
-			Ok(offer) => Some(offer),
-			Err(e) => {
-				log_error!(self.logger, "Failed to create offer: {}", e);
-				None
-			},
-		};
+		let bolt12_offer =
+			match self.bolt12_payment.receive_inner(amount_msats, description, None, None) {
+				Ok(offer) => Some(offer),
+				Err(e) => {
+					log_error!(self.logger, "Failed to create offer: {}", e);
+					None
+				},
+			};
 
 		let invoice_description = Bolt11InvoiceDescription::Direct(
 			Description::new(description.to_string()).map_err(|_| Error::InvoiceCreationFailed)?,
@@ -137,8 +138,13 @@ impl UnifiedQrPayment {
 	/// Returns a `QrPaymentResult` indicating the outcome of the payment. If an error
 	/// occurs, an `Error` is returned detailing the issue encountered.
 	///
+	/// If `route_parameters` are provided they will override the default as well as the
+	/// node-wide parameters configured via [`Config::route_parameters`] on a per-field basis.
+	///
 	/// [BIP 21]: https://github.com/bitcoin/bips/blob/master/bip-0021.mediawiki
-	pub fn send(&self, uri_str: &str) -> Result<QrPaymentResult, Error> {
+	pub fn send(
+		&self, uri_str: &str, route_parameters: Option<RouteParametersConfig>,
+	) -> Result<QrPaymentResult, Error> {
 		let uri: bip21::Uri<NetworkUnchecked, Extras> =
 			uri_str.parse().map_err(|_| Error::InvalidUri)?;
 
@@ -146,15 +152,16 @@ impl UnifiedQrPayment {
 			uri.clone().require_network(self.config.network).map_err(|_| Error::InvalidNetwork)?;
 
 		if let Some(offer) = uri_network_checked.extras.bolt12_offer {
-			match self.bolt12_payment.send(&offer, None, None) {
+			let offer = maybe_wrap(offer);
+			match self.bolt12_payment.send(&offer, None, None, route_parameters) {
 				Ok(payment_id) => return Ok(QrPaymentResult::Bolt12 { payment_id }),
 				Err(e) => log_error!(self.logger, "Failed to send BOLT12 offer: {:?}. This is part of a unified QR code payment. Falling back to the BOLT11 invoice.", e),
 			}
 		}
 
 		if let Some(invoice) = uri_network_checked.extras.bolt11_invoice {
-			let invoice = maybe_wrap_invoice(invoice);
-			match self.bolt11_invoice.send(&invoice, None) {
+			let invoice = maybe_wrap(invoice);
+			match self.bolt11_invoice.send(&invoice, route_parameters) {
 				Ok(payment_id) => return Ok(QrPaymentResult::Bolt11 { payment_id }),
 				Err(e) => log_error!(self.logger, "Failed to send BOLT11 invoice: {:?}. This is part of a unified QR code payment. Falling back to the on-chain transaction.", e),
 			}
@@ -301,10 +308,12 @@ impl DeserializationError for Extras {
 
 #[cfg(test)]
 mod tests {
+	use std::str::FromStr;
+
+	use bitcoin::{Address, Network};
+
 	use super::*;
 	use crate::payment::unified_qr::Extras;
-	use bitcoin::{Address, Network};
-	use std::str::FromStr;
 
 	#[test]
 	fn parse_uri() {

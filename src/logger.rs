@@ -7,21 +7,18 @@
 
 //! Logging-related objects.
 
-pub(crate) use lightning::util::logger::{Logger as LdkLogger, Record as LdkRecord};
-pub(crate) use lightning::{log_bytes, log_debug, log_error, log_info, log_trace};
-
-pub use lightning::util::logger::Level as LogLevel;
-
-use chrono::Utc;
-use log::Level as LogFacadeLevel;
-use log::Record as LogFacadeRecord;
-
 #[cfg(not(feature = "uniffi"))]
 use core::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
+
+use chrono::Utc;
+pub use lightning::util::logger::Level as LogLevel;
+pub(crate) use lightning::util::logger::{Logger as LdkLogger, Record as LdkRecord};
+pub(crate) use lightning::{log_bytes, log_debug, log_error, log_info, log_trace};
+use log::{Level as LogFacadeLevel, Record as LogFacadeRecord};
 
 /// A unit of logging output with metadata to enable filtering `module_path`,
 /// `file`, and `line` to inform on log's source.
@@ -124,7 +121,7 @@ impl LogWriter for Writer {
 
 				let log = format!(
 					"{} {:<5} [{}:{}] {}\n",
-					Utc::now().format("%Y-%m-%d %H:%M:%S"),
+					Utc::now().format("%Y-%m-%d %H:%M:%S%.3f"),
 					record.level.to_string(),
 					record.module_path,
 					record.line,
@@ -153,6 +150,7 @@ impl LogWriter for Writer {
 				#[cfg(not(feature = "uniffi"))]
 				log::logger().log(
 					&builder
+						.target(record.module_path)
 						.module_path(Some(record.module_path))
 						.line(Some(record.line))
 						.args(format_args!("{}", record.args))
@@ -161,6 +159,7 @@ impl LogWriter for Writer {
 				#[cfg(feature = "uniffi")]
 				log::logger().log(
 					&builder
+						.target(&record.module_path)
 						.module_path(Some(&record.module_path))
 						.line(Some(record.line))
 						.args(format_args!("{}", record.args))
