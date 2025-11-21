@@ -1438,6 +1438,7 @@ impl TestSyncStoreInner {
 			sql_dir,
 			Some("test_sync_db".to_string()),
 			Some("test_sync_table".to_string()),
+			None,
 		)
 		.unwrap();
 		let test_store = TestStore::new(false);

@@ -629,11 +629,11 @@ impl NodeBuilder {
 			transient_graph: self.config.transient_network_graph,
 		};
 		let kv_store = Arc::new(
-			SqliteStore::with_config(
+			SqliteStore::new(
 				storage_dir_path.into(),
 				Some(io::sqlite_store::SQLITE_DB_FILE_NAME.to_string()),
 				Some(io::sqlite_store::KV_TABLE_NAME.to_string()),
-				sql_store_config,
+				Some(sql_store_config),
 			)
 			.map_err(|_| BuildError::KVStoreSetupFailed)?,
 		);
@@ -811,6 +811,7 @@ impl NodeBuilder {
 					storage_dir_path.into(),
 					Some(backup_filename),
 					Some(io::sqlite_store::KV_TABLE_NAME.to_string()),
+					None,
 				)
 				.map_err(|_| BuildError::KVStoreSetupFailed)?,
 			) as Arc<SqliteStore>);
@@ -822,11 +823,11 @@ impl NodeBuilder {
 			transient_graph: self.config.transient_network_graph,
 		};
 		let secondary_kv_store = Arc::new(
-			SqliteStore::with_config(
+			SqliteStore::new(
 				storage_dir_path.into(),
 				Some(io::sqlite_store::SQLITE_DB_FILE_NAME.to_string()),
 				Some(io::sqlite_store::KV_TABLE_NAME.to_string()),
-				sql_store_config,
+				Some(sql_store_config),
 			)
 			.map_err(|_| BuildError::KVStoreSetupFailed)?,
 		) as Arc<DynStore>;

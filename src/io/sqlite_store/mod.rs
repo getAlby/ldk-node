@@ -43,6 +43,7 @@ pub const DEFAULT_KV_TABLE_NAME: &str = "ldk_data";
 const SCHEMA_USER_VERSION: u16 = 2;
 
 /// Alby: extended SqliteStore configuration.
+#[derive(Clone)]
 pub struct SqliteStoreConfig {
 	/// Do not persist network graph.
 	pub(crate) transient_graph: bool,
@@ -74,10 +75,27 @@ impl SqliteStore {
 	/// Similarly, the given `kv_table_name` will be used or default to [`DEFAULT_KV_TABLE_NAME`].
 	pub fn new(
 		data_dir: PathBuf, db_file_name: Option<String>, kv_table_name: Option<String>,
+		config: Option<SqliteStoreConfig>,
 	) -> io::Result<Self> {
-		let inner = Arc::new(SqliteStoreInner::new(data_dir, db_file_name, kv_table_name)?);
+		let config = config.unwrap_or_default();
+		let inner =
+			Arc::new(SqliteStoreInner::new(data_dir, db_file_name, kv_table_name, config.clone())?);
 		let next_write_version = AtomicU64::new(1);
-		Ok(Self { inner, next_write_version })
+		let store = Self { inner, next_write_version };
+
+		// Alby: enable not saving network graph (Alby Cloud)
+		if config.transient_graph {
+			// Drop existing network graph if it has been persisted before.
+			KVStoreSync::remove(
+				&store,
+				NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
+				NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
+				NETWORK_GRAPH_PERSISTENCE_KEY,
+				false,
+			)?;
+		}
+
+		Ok(store)
 	}
 
 	fn build_locking_key(
@@ -102,28 +120,6 @@ impl SqliteStore {
 	/// Returns the data directory.
 	pub fn get_data_dir(&self) -> PathBuf {
 		self.inner.data_dir.clone()
-	}
-
-	/// Alby: constructs a new [`SqliteStore`] with an extended configuration.
-	pub fn with_config(
-		data_dir: PathBuf, db_file_name: Option<String>, kv_table_name: Option<String>,
-		config: SqliteStoreConfig,
-	) -> io::Result<Self> {
-		let mut ret = SqliteStore::new(data_dir, db_file_name, kv_table_name)?;
-
-		if config.transient_graph {
-			// Drop existing network graph if it has been persisted before.
-			KVStoreSync::remove(
-				&ret,
-				NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
-				NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
-				NETWORK_GRAPH_PERSISTENCE_KEY,
-				false,
-			)?;
-		}
-
-		ret.inner.config = config;
-		Ok(ret)
 	}
 }
 
@@ -273,6 +269,7 @@ struct SqliteStoreInner {
 impl SqliteStoreInner {
 	fn new(
 		data_dir: PathBuf, db_file_name: Option<String>, kv_table_name: Option<String>,
+		config: SqliteStoreConfig,
 	) -> io::Result<Self> {
 		let db_file_name = db_file_name.unwrap_or(DEFAULT_SQLITE_DB_FILE_NAME.to_string());
 		let kv_table_name = kv_table_name.unwrap_or(DEFAULT_KV_TABLE_NAME.to_string());
@@ -342,13 +339,7 @@ impl SqliteStoreInner {
 
 		let connection = Arc::new(Mutex::new(connection));
 		let write_version_locks = Mutex::new(HashMap::new());
-		Ok(Self {
-			connection,
-			data_dir,
-			kv_table_name,
-			write_version_locks,
-			config: SqliteStoreConfig::default(),
-		})
+		Ok(Self { connection, data_dir, kv_table_name, write_version_locks, config })
 	}
 
 	fn get_inner_lock_ref(&self, locking_key: String) -> Arc<Mutex<u64>> {
@@ -602,6 +593,7 @@ mod tests {
 			temp_path,
 			Some("test_db".to_string()),
 			Some("test_table".to_string()),
+			None,
 		)
 		.unwrap();
 		do_read_write_remove_list_persist(&store);
@@ -615,12 +607,14 @@ mod tests {
 			temp_path.clone(),
 			Some("test_db_0".to_string()),
 			Some("test_table".to_string()),
+			None,
 		)
 		.unwrap();
 		let store_1 = SqliteStore::new(
 			temp_path,
 			Some("test_db_1".to_string()),
 			Some("test_table".to_string()),
+			None,
 		)
 		.unwrap();
 		do_test_store(&store_0, &store_1)
@@ -634,8 +628,10 @@ pub mod bench {
 
 	/// Bench!
 	pub fn bench_sends(bench: &mut Criterion) {
-		let store_a = super::SqliteStore::new("bench_sqlite_store_a".into(), None, None).unwrap();
-		let store_b = super::SqliteStore::new("bench_sqlite_store_b".into(), None, None).unwrap();
+		let store_a =
+			super::SqliteStore::new("bench_sqlite_store_a".into(), None, None, None).unwrap();
+		let store_b =
+			super::SqliteStore::new("bench_sqlite_store_b".into(), None, None, None).unwrap();
 		lightning::ln::channelmanager::bench::bench_two_sends(
 			bench,
 			"bench_sqlite_persisted_sends",

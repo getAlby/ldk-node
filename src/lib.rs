@@ -471,7 +471,7 @@ impl Node {
 										// increase backoff randomly e.g. for the first 6 iterations:
 										// 1, [2-3], [3-5], [4-7], [5-9], [6-11], [7-13]
 										let mut new_peer_retry_backoff = peer_retry_backoff + 1;
-										new_peer_retry_backoff += rand::rng().gen_range(0..new_peer_retry_backoff);
+										new_peer_retry_backoff += rand::rng().random_range(0..new_peer_retry_backoff);
 										if new_peer_retry_backoff > 360 {
 											new_peer_retry_backoff = 360 // 360 * 10 seconds = approx 1 hour maximum backoff
 										}
@@ -681,6 +681,7 @@ impl Node {
 							);
 							return;
 						}
+						_ = liquidity_handler.handle_next_event() => {}
 					}
 				}
 			});
@@ -716,6 +717,9 @@ impl Node {
 				);
 				debug_assert!(false);
 			});
+
+		// Cancel cancellable background tasks
+		self.runtime.abort_cancellable_background_tasks();
 
 		// Disconnect all peers.
 		self.peer_manager.disconnect_all_peers();
@@ -1472,30 +1476,15 @@ impl Node {
 
 	/// Alby: update fee estimates separately rather than doing a full sync
 	pub fn update_fee_estimates(&self) -> Result<(), Error> {
-		let rt_lock = self.runtime.read().unwrap();
-		if rt_lock.is_none() {
+		if !*self.is_running.read().unwrap() {
 			return Err(Error::NotRunning);
 		}
 
 		let chain_source = Arc::clone(&self.chain_source);
-		tokio::task::block_in_place(move || {
-			tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap().block_on(
-				async move {
-					match chain_source.as_ref() {
-						ChainSource::Esplora { .. } => {
-							chain_source.update_fee_rate_estimates().await?;
-						},
-						ChainSource::Electrum { .. } => {
-							chain_source.update_fee_rate_estimates().await?;
-						},
-						ChainSource::BitcoindRpc { .. } => {
-							chain_source.update_fee_rate_estimates().await?;
-						},
-					}
-					Ok(())
-				},
-			)
-		});
+		self.runtime.block_on(async move {
+			chain_source.update_fee_rate_estimates().await?;
+			Ok(())
+		})
 	}
 
 	/// Manually sync the LDK and BDK wallets with the current chain state and update the fee rate
@@ -1649,13 +1638,6 @@ impl Node {
 		self.payment_store.remove(&payment_id)
 	}
 
-	/// Alby: Used to recover funds after restoring static channel backup
-	pub fn force_close_all_channels_without_broadcasting_txn(&self) {
-		self.channel_manager.force_close_all_channels_without_broadcasting_txn(
-			"lost or corrupted channel state".to_string(),
-		);
-	}
-
 	/// Alby: Return encoded channel monitors for a recovery of last resort
 	pub fn get_encoded_channel_monitors(&self) -> Result<Vec<KeyValue>, Error> {
 		let channel_monitor_store: &dyn KVStoreSync = &*self.kv_store;
@@ -1727,7 +1709,7 @@ impl Node {
 				// See [`periodically_archive_fully_resolved_monitors`] for details.
 				let funding_txo =
 					out.channel_id.and_then(|c| funding_txo_by_channel_id.get(&c).cloned());
-				let chmon = funding_txo.and_then(|txo| self.chain_monitor.get_monitor(txo).ok());
+				let chmon = out.channel_id.and_then(|c| self.chain_monitor.get_monitor(c).ok());
 				let counterparty_node_id = chmon.and_then(|m| Some(m.get_counterparty_node_id()));
 				PendingSweepBalance::from_tracked_spendable_output(
 					out,

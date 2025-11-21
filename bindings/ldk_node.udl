@@ -243,6 +243,7 @@ interface Bolt12Payment {
 };
 
 interface SpontaneousPayment {
+	[Throws=NodeError]
 	PaymentId send(u64 amount_msat, PublicKey node_id, RouteParametersConfig? route_parameters);
 	[Throws=NodeError]
 	PaymentId send_with_custom_tlvs(u64 amount_msat, PublicKey node_id, RouteParametersConfig? route_parameters, sequence<CustomTlvRecord> custom_tlvs);
@@ -560,16 +561,16 @@ enum LSPS1PaymentState {
 	"Refunded",
 };
 
-// [NonExhaustive]
-// enum Network {
-// 	"Bitcoin",
-// 	"Testnet",
-// 	"Signet",
-// 	"Regtest",
-// };
+[NonExhaustive]
+enum Network {
+	"Bitcoin",
+	"Testnet",
+	"Signet",
+	"Regtest",
+};
 
-[Custom]
-typedef string Network;
+// [Custom]
+// typedef string Network;
 
 dictionary OutPoint {
 	Txid txid;
@@ -623,7 +624,7 @@ interface LightningBalance {
 		ChannelId channel_id,
 		PublicKey counterparty_node_id,
 		Txid funding_tx_id,
-		u32 funding_tx_index,
+		u16 funding_tx_index,
 		u64 amount_satoshis,
 		u64 transaction_fee_satoshis,
 		u64 outbound_payment_htlc_rounded_msat,
@@ -635,7 +636,7 @@ interface LightningBalance {
 		ChannelId channel_id,
 		PublicKey counterparty_node_id,
 		Txid funding_tx_id,
-		u32 funding_tx_index,
+		u16 funding_tx_index,
 		u64 amount_satoshis,
 		u32 confirmation_height,
 		BalanceSource source
@@ -644,7 +645,7 @@ interface LightningBalance {
 		ChannelId channel_id,
 		PublicKey counterparty_node_id,
 		Txid funding_tx_id,
-		u32 funding_tx_index,
+		u16 funding_tx_index,
 		u64 amount_satoshis,
 		u32 timeout_height,
 		PaymentHash payment_hash,
@@ -654,7 +655,7 @@ interface LightningBalance {
 		ChannelId channel_id,
 		PublicKey counterparty_node_id,
 		Txid funding_tx_id,
-		u32 funding_tx_index,
+		u16 funding_tx_index,
 		u64 amount_satoshis,
 		u32 claimable_height,
 		PaymentHash payment_hash,
@@ -664,7 +665,7 @@ interface LightningBalance {
 		ChannelId channel_id,
 		PublicKey counterparty_node_id,
 		Txid funding_tx_id,
-		u32 funding_tx_index,
+		u16 funding_tx_index,
 		u64 amount_satoshis,
 		u32 expiry_height,
 		PaymentHash payment_hash
@@ -673,7 +674,7 @@ interface LightningBalance {
 		ChannelId channel_id,
 		PublicKey counterparty_node_id,
 		Txid funding_tx_id,
-		u32 funding_tx_index,
+		u16 funding_tx_index,
 		u64 amount_satoshis
 	);
 };
@@ -692,7 +693,7 @@ interface PendingSweepBalance {
 		u64 amount_satoshis,
 		PublicKey? counterparty_node_id,
 		Txid? funding_tx_id,
-		u32? funding_tx_index
+		u16? funding_tx_index
 	);
 	BroadcastAwaitingConfirmation (
 		ChannelId? channel_id,
@@ -701,7 +702,7 @@ interface PendingSweepBalance {
 		u64 amount_satoshis,
 		PublicKey? counterparty_node_id,
 		Txid? funding_tx_id,
-		u32? funding_tx_index
+		u16? funding_tx_index
 	);
 	AwaitingThresholdConfirmations (
 		ChannelId? channel_id,
@@ -711,7 +712,7 @@ interface PendingSweepBalance {
 		u64 amount_satoshis,
 		PublicKey? counterparty_node_id,
 		Txid? funding_tx_id,
-		u32? funding_tx_index
+		u16? funding_tx_index
 	);
 };
 

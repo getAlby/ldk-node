@@ -159,7 +159,8 @@ mod tests {
 		}
 
 		// Check we migrate the db just fine without losing our written data.
-		let store = SqliteStore::new(temp_path, Some(db_file_name), Some(kv_table_name)).unwrap();
+		let store =
+			SqliteStore::new(temp_path, Some(db_file_name), Some(kv_table_name), None).unwrap();
 		let res = store.read(&test_namespace, "", &test_key).unwrap();
 		assert_eq!(res, test_data);
 
