@@ -5,15 +5,6 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-/*use crate::io::utils::check_namespace_key_validity;
-use bitcoin::hashes::{sha256, Hash, HashEngine, Hmac, HmacEngine};
-use lightning::io::{self, Error, ErrorKind};
-use lightning::util::persist::{
-	KVStore, NETWORK_GRAPH_PERSISTENCE_KEY, NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
-	NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
-};
-use prost::Message;
-use rand::RngCore;*/
 use std::boxed::Box;
 use std::collections::HashMap;
 use std::future::Future;
@@ -28,7 +19,10 @@ use bdk_chain::Merge;
 use bitcoin::hashes::{sha256, Hash, HashEngine, Hmac, HmacEngine};
 use lightning::impl_writeable_tlv_based_enum;
 use lightning::io::{self, Error, ErrorKind};
-use lightning::util::persist::{KVStore, KVStoreSync};
+use lightning::util::persist::{
+	KVStore, KVStoreSync, NETWORK_GRAPH_PERSISTENCE_KEY,
+	NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE, NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
+};
 use lightning::util::ser::{Readable, Writeable};
 use prost::Message;
 use rand::RngCore;
@@ -90,7 +84,6 @@ pub struct VssStore {
 	// would deadlock when trying to acquire sync `Mutex` locks that are held by the thread
 	// currently being blocked waiting on the VSS operation to finish.
 	internal_runtime: Option<tokio::runtime::Runtime>,
-
 	// Alby: secondary kv store for saving the network graph as it's large and shouldn't be saved to VSS
 	// NOTE: for Alby Cloud we use a transient network graph (saved in memory and rebuilt on startup)
 	secondary_kv_store: Arc<dyn KVStore + Send + Sync>,
@@ -191,6 +184,14 @@ impl KVStoreSync for VssStore {
 	fn read(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
 	) -> io::Result<Vec<u8>> {
+		// Alby: read network graph from secondary storage
+		if primary_namespace == NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE
+			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
+			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
+		{
+			return self.secondary_kv_store.read(primary_namespace, secondary_namespace, key);
+		}
+
 		let internal_runtime = self.internal_runtime.as_ref().ok_or_else(|| {
 			debug_assert!(false, "Failed to access internal runtime");
 			let msg = format!("Failed to access internal runtime");
@@ -211,6 +212,13 @@ impl KVStoreSync for VssStore {
 	fn write(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
 	) -> io::Result<()> {
+		// Alby: write network graph to secondary storage
+		if primary_namespace == NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE
+			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
+			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
+		{
+			return self.secondary_kv_store.write(primary_namespace, secondary_namespace, key, buf);
+		}
 		let internal_runtime = self.internal_runtime.as_ref().ok_or_else(|| {
 			debug_assert!(false, "Failed to access internal runtime");
 			let msg = format!("Failed to access internal runtime");
@@ -242,6 +250,18 @@ impl KVStoreSync for VssStore {
 	fn remove(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool,
 	) -> io::Result<()> {
+		// Alby: remove network graph from secondary storage
+		if primary_namespace == NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE
+			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
+			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
+		{
+			return self.secondary_kv_store.remove(
+				primary_namespace,
+				secondary_namespace,
+				key,
+				lazy,
+			);
+		}
 		let internal_runtime = self.internal_runtime.as_ref().ok_or_else(|| {
 			debug_assert!(false, "Failed to access internal runtime");
 			let msg = format!("Failed to access internal runtime");
@@ -271,6 +291,16 @@ impl KVStoreSync for VssStore {
 	}
 
 	fn list(&self, primary_namespace: &str, secondary_namespace: &str) -> io::Result<Vec<String>> {
+		// FIXME: list keys
+		/*
+		// Alby: also list keys from secondary storage
+		let secondary_keys =
+			self.secondary_kv_store.list(primary_namespace, secondary_namespace)?;
+
+		let all_keys: Vec<String> =
+			keys.iter().cloned().chain(secondary_keys.iter().cloned()).collect();
+		Ok(all_keys)
+		 */
 		let internal_runtime = self.internal_runtime.as_ref().ok_or_else(|| {
 			debug_assert!(false, "Failed to access internal runtime");
 			let msg = format!("Failed to access internal runtime");
@@ -292,6 +322,13 @@ impl KVStore for VssStore {
 	fn read(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
 	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, io::Error>> + Send>> {
+		// Alby: read network graph from secondary storage
+		if primary_namespace == NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE
+			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
+			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
+		{
+			return self.secondary_kv_store.read(primary_namespace, secondary_namespace, key);
+		}
 		let primary_namespace = primary_namespace.to_string();
 		let secondary_namespace = secondary_namespace.to_string();
 		let key = key.to_string();
@@ -305,6 +342,13 @@ impl KVStore for VssStore {
 	fn write(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
 	) -> Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send>> {
+		// Alby: write network graph to secondary storage
+		if primary_namespace == NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE
+			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
+			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
+		{
+			return self.secondary_kv_store.write(primary_namespace, secondary_namespace, key, buf);
+		}
 		let locking_key = self.build_locking_key(primary_namespace, secondary_namespace, key);
 		let (inner_lock_ref, version) = self.get_new_version_and_lock_ref(locking_key.clone());
 		let primary_namespace = primary_namespace.to_string();
@@ -329,6 +373,18 @@ impl KVStore for VssStore {
 	fn remove(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool,
 	) -> Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send>> {
+		// Alby: remove network graph from secondary storage
+		if primary_namespace == NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE
+			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
+			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
+		{
+			return self.secondary_kv_store.remove(
+				primary_namespace,
+				secondary_namespace,
+				key,
+				lazy,
+			);
+		}
 		let locking_key = self.build_locking_key(primary_namespace, secondary_namespace, key);
 		let (inner_lock_ref, version) = self.get_new_version_and_lock_ref(locking_key.clone());
 		let primary_namespace = primary_namespace.to_string();
@@ -353,6 +409,16 @@ impl KVStore for VssStore {
 	fn list(
 		&self, primary_namespace: &str, secondary_namespace: &str,
 	) -> Pin<Box<dyn Future<Output = Result<Vec<String>, io::Error>> + Send>> {
+		// FIXME: list keys
+		/*
+		// Alby: also list keys from secondary storage
+		let secondary_keys =
+			self.secondary_kv_store.list(primary_namespace, secondary_namespace)?;
+
+		let all_keys: Vec<String> =
+			keys.iter().cloned().chain(secondary_keys.iter().cloned()).collect();
+		Ok(all_keys)
+		 */
 		let primary_namespace = primary_namespace.to_string();
 		let secondary_namespace = secondary_namespace.to_string();
 		let inner = Arc::clone(&self.inner);
@@ -495,14 +561,6 @@ impl VssStoreInner {
 		&self, client: &VssClient<CustomRetryPolicy>, primary_namespace: String,
 		secondary_namespace: String, key: String,
 	) -> io::Result<Vec<u8>> {
-		// Alby: read network graph from secondary storage
-		if primary_namespace == NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE
-			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
-			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
-		{
-			return self.secondary_kv_store.read(primary_namespace, secondary_namespace, key);
-		}
-
 		check_namespace_key_validity(&primary_namespace, &secondary_namespace, Some(&key), "read")?;
 
 		let store_key = self.build_obfuscated_key(&primary_namespace, &secondary_namespace, &key);
@@ -540,14 +598,6 @@ impl VssStoreInner {
 		locking_key: String, version: u64, primary_namespace: String, secondary_namespace: String,
 		key: String, buf: Vec<u8>,
 	) -> io::Result<()> {
-		// Alby: write network graph to secondary storage
-		if primary_namespace == NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE
-			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
-			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
-		{
-			return self.secondary_kv_store.write(primary_namespace, secondary_namespace, key, buf);
-		}
-
 		check_namespace_key_validity(
 			&primary_namespace,
 			&secondary_namespace,
@@ -603,19 +653,6 @@ impl VssStoreInner {
 		locking_key: String, version: u64, primary_namespace: String, secondary_namespace: String,
 		key: String, lazy: bool,
 	) -> io::Result<()> {
-		// Alby: remove network graph from secondary storage
-		if primary_namespace == NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE
-			&& secondary_namespace == NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE
-			&& key == NETWORK_GRAPH_PERSISTENCE_KEY
-		{
-			return self.secondary_kv_store.remove(
-				primary_namespace,
-				secondary_namespace,
-				key,
-				_lazy,
-			);
-		}
-
 		check_namespace_key_validity(
 			&primary_namespace,
 			&secondary_namespace,
@@ -667,13 +704,7 @@ impl VssStoreInner {
 				Error::new(ErrorKind::Other, msg)
 			})?;
 
-		// Alby: also list keys from secondary storage
-		let secondary_keys =
-			self.secondary_kv_store.list(primary_namespace, secondary_namespace)?;
-
-		let all_keys: Vec<String> =
-			keys.iter().cloned().chain(secondary_keys.iter().cloned()).collect();
-		Ok(all_keys)
+		Ok(keys)
 	}
 
 	async fn execute_locked_write<

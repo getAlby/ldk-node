@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::default::Default;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Once, RwLock};
 use std::time::SystemTime;
 use std::{fmt, fs};
@@ -34,8 +34,13 @@ use lightning::routing::scoring::{
 use lightning::sign::{EntropySource, NodeSigner};
 use lightning::util::persist::{
 	KVStoreSync, CHANNEL_MANAGER_PERSISTENCE_KEY, CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
-	CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+	CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE, CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+	CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE, NETWORK_GRAPH_PERSISTENCE_KEY,
+	NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE, NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
+	SCORER_PERSISTENCE_KEY, SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
+	SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
 };
+
 use lightning::util::ser::ReadableArgs;
 use lightning::util::sweep::OutputSweeper;
 use lightning_persister::fs_store::FilesystemStore;
@@ -65,19 +70,21 @@ use crate::io::{
 use crate::liquidity::{
 	LSPS1ClientConfig, LSPS2ClientConfig, LSPS2ServiceConfig, LiquiditySourceBuilder,
 };
-use crate::logger::{log_error, LdkLogger, LogLevel, LogWriter, Logger};
+use crate::logger::{log_error, log_info, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use crate::peer_store::PeerStore;
 use crate::runtime::Runtime;
 use crate::tx_broadcaster::TransactionBroadcaster;
 use crate::types::{
-	ChainMonitor, ChannelManager, DynStore, GossipSync, Graph, KeysManager, MessageRouter,
-	OnionMessenger, PaymentStore, PeerManager, Persister,
+	ChainMonitor, ChannelManager, DynStore, GossipSync, Graph, KeyValue, KeysManager,
+	MessageRouter, MigrateStorage, OnionMessenger, PaymentStore, PeerManager, Persister,
+	ResetState,
 };
 use crate::wallet::persist::KVStoreWalletPersister;
 use crate::wallet::Wallet;
 use crate::{Node, NodeMetrics};
+use chrono::Local;
 
 const VSS_HARDENED_CHILD_INDEX: u32 = 877;
 const VSS_LNURL_AUTH_HARDENED_CHILD_INDEX: u32 = 138;
@@ -252,7 +259,7 @@ pub struct NodeBuilder {
 	chain_data_source_config: Option<ChainDataSourceConfig>,
 	gossip_source_config: Option<GossipSourceConfig>,
 	liquidity_source_config: Option<LiquiditySourceConfig>,
-	monitors_to_restore: Option<Vec<KeyValue>>,
+	monitors_to_restore: Option<Vec<KeyValue>>, // Alby: for hub recovery with SCB backup file
 	reset_state: Option<ResetState>,
 	migrate_storage: Option<MigrateStorage>,
 	log_writer_config: Option<LogWriterConfig>,
@@ -618,8 +625,9 @@ impl NodeBuilder {
 		let storage_dir_path = self.config.storage_dir_path.clone();
 		fs::create_dir_all(storage_dir_path.clone())
 			.map_err(|_| BuildError::StoragePathAccessFailed)?;
-		let sql_store_config =
-			SqliteStoreConfig { transient_graph: self.config.transient_network_graph };
+		let sql_store_config = io::sqlite_store::SqliteStoreConfig {
+			transient_graph: self.config.transient_network_graph,
+		};
 		let kv_store = Arc::new(
 			SqliteStore::with_config(
 				storage_dir_path.into(),
@@ -805,13 +813,14 @@ impl NodeBuilder {
 					Some(io::sqlite_store::KV_TABLE_NAME.to_string()),
 				)
 				.map_err(|_| BuildError::KVStoreSetupFailed)?,
-			) as Arc<DynStore>);
+			) as Arc<SqliteStore>);
 		}
 
 		// Alby: use a secondary KV store for non-essential data (not needed by VSS)
 		let storage_dir_path = config.storage_dir_path.clone();
-		let sql_store_config =
-			SqliteStoreConfig { transient_graph: self.config.transient_network_graph };
+		let sql_store_config = io::sqlite_store::SqliteStoreConfig {
+			transient_graph: self.config.transient_network_graph,
+		};
 		let secondary_kv_store = Arc::new(
 			SqliteStore::with_config(
 				storage_dir_path.into(),
@@ -851,7 +860,7 @@ impl NodeBuilder {
 						BuildError::KVStoreSetupFailed
 					})?;
 				// write value to new store
-				vss_store.write(primary_namespace, secondary_namespace, key, &value).map_err(
+				vss_store.write(primary_namespace, secondary_namespace, key, value).map_err(
 					|e| {
 						log_error!(logger, "Failed to migrate value: {}", e);
 						BuildError::KVStoreSetupFailed
@@ -934,7 +943,7 @@ impl NodeBuilder {
 		if self.monitors_to_restore.is_some() {
 			let monitors = self.monitors_to_restore.clone().unwrap();
 			for monitor in monitors {
-				let result = kv_store.write("monitors", "", &monitor.key, &monitor.value);
+				let result = &*kv_store.write("monitors", "", &monitor.key, &monitor.value);
 				if result.is_err() {
 					log_error!(logger, "Failed to restore monitor: {}", result.unwrap_err());
 				}

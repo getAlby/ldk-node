@@ -6,7 +6,7 @@
 // accordance with one or both of these licenses.
 
 use bitcoin::secp256k1::PublicKey;
-use bitcoin::{Amount, BlockHash, Txid};
+use bitcoin::{Amount, BlockHash, OutPoint, Txid};
 use lightning::chain::channelmonitor::{Balance as LdkBalance, BalanceSource};
 use lightning::ln::types::ChannelId;
 use lightning::sign::SpendableOutputDescriptor;
@@ -80,7 +80,7 @@ pub enum LightningBalance {
 		/// Alby: funding transaction ID.
 		funding_tx_id: Txid,
 		/// Alby: funding transaction output index.
-		funding_tx_index: u16,
+		funding_tx_index: u32,
 		/// The amount available to claim, in satoshis, excluding the on-chain fees which will be
 		/// required to do so.
 		amount_satoshis: u64,
@@ -138,7 +138,7 @@ pub enum LightningBalance {
 		/// Alby: funding transaction ID.
 		funding_tx_id: Txid,
 		/// Alby: funding transaction output index.
-		funding_tx_index: u16,
+		funding_tx_index: u32,
 		/// The amount available to claim, in satoshis, possibly excluding the on-chain fees which
 		/// were spent in broadcasting the transaction.
 		amount_satoshis: u64,
@@ -165,7 +165,7 @@ pub enum LightningBalance {
 		/// Alby: funding transaction ID.
 		funding_tx_id: Txid,
 		/// Alby: funding transaction output index.
-		funding_tx_index: u16,
+		funding_tx_index: u32,
 		/// The amount available to claim, in satoshis, excluding the on-chain fees which will be
 		/// required to do so.
 		amount_satoshis: u64,
@@ -188,7 +188,7 @@ pub enum LightningBalance {
 		/// Alby: funding transaction ID.
 		funding_tx_id: Txid,
 		/// Alby: funding transaction output index.
-		funding_tx_index: u16,
+		funding_tx_index: u32,
 		/// The amount potentially available to claim, in satoshis, excluding the on-chain fees
 		/// which will be required to do so.
 		amount_satoshis: u64,
@@ -211,7 +211,7 @@ pub enum LightningBalance {
 		/// Alby: funding transaction ID.
 		funding_tx_id: Txid,
 		/// Alby: funding transaction output index.
-		funding_tx_index: u16,
+		funding_tx_index: u32,
 		/// The amount potentially available to claim, in satoshis, excluding the on-chain fees
 		/// which will be required to do so.
 		amount_satoshis: u64,
@@ -234,7 +234,7 @@ pub enum LightningBalance {
 		/// Alby: funding transaction ID.
 		funding_tx_id: Txid,
 		/// Alby: funding transaction output index.
-		funding_tx_index: u16,
+		funding_tx_index: u32,
 		/// The amount, in satoshis, of the output which we can claim.
 		amount_satoshis: u64,
 	},
@@ -245,7 +245,7 @@ impl LightningBalance {
 		channel_id: ChannelId, counterparty_node_id: PublicKey, funding_txo: OutPoint,
 		balance: LdkBalance,
 	) -> Self {
-		let OutPoint { txid: funding_tx_id, index: funding_tx_index } = funding_txo;
+		let OutPoint { txid: funding_tx_id, vout: funding_tx_index } = funding_txo;
 		match balance {
 			LdkBalance::ClaimableOnChannelClose {
 				balance_candidates,
@@ -355,7 +355,7 @@ pub enum PendingSweepBalance {
 		/// Alby: funding transaction ID.
 		funding_tx_id: Option<Txid>,
 		/// Alby: funding transaction output index.
-		funding_tx_index: Option<u16>,
+		funding_tx_index: Option<u32>,
 	},
 	/// A spending transaction has been generated and broadcast and is awaiting confirmation
 	/// on-chain.
@@ -373,7 +373,7 @@ pub enum PendingSweepBalance {
 		/// Alby: funding transaction ID.
 		funding_tx_id: Option<Txid>,
 		/// Alby: funding transaction output index.
-		funding_tx_index: Option<u16>,
+		funding_tx_index: Option<u32>,
 	},
 	/// A spending transaction has been confirmed on-chain and is awaiting threshold confirmations.
 	///
@@ -396,7 +396,7 @@ pub enum PendingSweepBalance {
 		/// Alby: funding transaction ID.
 		funding_tx_id: Option<Txid>,
 		/// Alby: funding transaction output index.
-		funding_tx_index: Option<u16>,
+		funding_tx_index: Option<u32>,
 	},
 }
 
@@ -414,7 +414,7 @@ impl PendingSweepBalance {
 					amount_satoshis,
 					counterparty_node_id,
 					funding_tx_id: funding_txo.map(|funding_txo| funding_txo.txid),
-					funding_tx_index: funding_txo.map(|funding_txo| funding_txo.index),
+					funding_tx_index: funding_txo.map(|funding_txo| funding_txo.vout),
 				}
 			},
 			OutputSpendStatus::PendingFirstConfirmation {
@@ -432,7 +432,7 @@ impl PendingSweepBalance {
 					amount_satoshis,
 					counterparty_node_id,
 					funding_tx_id: funding_txo.map(|funding_txo| funding_txo.txid),
-					funding_tx_index: funding_txo.map(|funding_txo| funding_txo.index),
+					funding_tx_index: funding_txo.map(|funding_txo| funding_txo.vout),
 				}
 			},
 			OutputSpendStatus::PendingThresholdConfirmations {
@@ -452,7 +452,7 @@ impl PendingSweepBalance {
 					amount_satoshis,
 					counterparty_node_id,
 					funding_tx_id: funding_txo.map(|funding_txo| funding_txo.txid),
-					funding_tx_index: funding_txo.map(|funding_txo| funding_txo.index),
+					funding_tx_index: funding_txo.map(|funding_txo| funding_txo.vout),
 				}
 			},
 		}

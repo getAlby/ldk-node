@@ -19,9 +19,7 @@ use crate::config::{Config, LDK_PAYMENT_RETRY_TIMEOUT};
 use crate::error::Error;
 use crate::logger::{log_error, log_info, LdkLogger, Logger};
 use crate::payment::store::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
-//use crate::payment::SendingParameters;
-//use crate::types::{ChannelManager, CustomTlvRecord, KeysManager, PaymentStore, TlvEntry};
-use crate::types::{ChannelManager, CustomTlvRecord, KeysManager, PaymentStore};
+use crate::types::{ChannelManager, CustomTlvRecord, KeysManager, PaymentStore, TlvEntry};
 
 // The default `final_cltv_expiry_delta` we apply when not set.
 const LDK_DEFAULT_FINAL_CLTV_EXPIRY_DELTA: u32 = 144;
@@ -54,8 +52,9 @@ impl SpontaneousPayment {
 	/// If `sending_parameters` are provided they will override the default as well as the
 	/// node-wide parameters configured via [`Config::sending_parameters`] on a per-field basis.
 	pub fn send_with_tlvs_and_preimage(
-		&self, amount_msat: u64, node_id: PublicKey, sending_parameters: Option<SendingParameters>,
-		custom_tlvs: Vec<TlvEntry>, preimage: Option<PaymentPreimage>,
+		&self, amount_msat: u64, node_id: PublicKey,
+		route_parameters: Option<RouteParametersConfig>, custom_tlvs: Vec<TlvEntry>,
+		preimage: Option<PaymentPreimage>,
 	) -> Result<PaymentId, Error> {
 		let rt_lock = self.runtime.read().unwrap();
 		if rt_lock.is_none() {
@@ -81,8 +80,7 @@ impl SpontaneousPayment {
 			amount_msat,
 		);
 
-		let override_params =
-			sending_parameters.as_ref().or(self.config.sending_parameters.as_ref());
+		let override_params = route_parameters.as_ref().or(self.config.route_parameters.as_ref());
 		if let Some(override_params) = override_params {
 			override_params
 				.max_total_routing_fee_msat

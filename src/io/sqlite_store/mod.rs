@@ -16,13 +16,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use lightning::io;
-/*use lightning::util::persist::{
-	KVStore, NETWORK_GRAPH_PERSISTENCE_KEY, NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
-	NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
-};
-use lightning::util::string::PrintableString;*/
 
-use lightning::util::persist::{KVStore, KVStoreSync};
+use lightning::util::persist::{
+	KVStore, KVStoreSync, NETWORK_GRAPH_PERSISTENCE_KEY,
+	NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE, NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
+};
 use lightning_types::string::PrintableString;
 use rusqlite::{named_params, Connection};
 
@@ -60,8 +58,6 @@ impl Default for SqliteStoreConfig {
 ///
 /// [SQLite]: https://sqlite.org
 pub struct SqliteStore {
-	config: SqliteStoreConfig,
-
 	inner: Arc<SqliteStoreInner>,
 
 	// Version counter to ensure that writes are applied in the correct order. It is assumed that read and list
@@ -117,7 +113,7 @@ impl SqliteStore {
 
 		if config.transient_graph {
 			// Drop existing network graph if it has been persisted before.
-			ret.remove(
+			ret.inner.remove_internal(
 				NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
 				NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
 				NETWORK_GRAPH_PERSISTENCE_KEY,
@@ -125,7 +121,7 @@ impl SqliteStore {
 			)?;
 		}
 
-		ret.config = config;
+		ret.inner.config = config;
 		Ok(ret)
 	}
 }
@@ -270,6 +266,7 @@ struct SqliteStoreInner {
 	data_dir: PathBuf,
 	kv_table_name: String,
 	write_version_locks: Mutex<HashMap<String, Arc<Mutex<u64>>>>,
+	config: SqliteStoreConfig,
 }
 
 impl SqliteStoreInner {
@@ -344,7 +341,13 @@ impl SqliteStoreInner {
 
 		let connection = Arc::new(Mutex::new(connection));
 		let write_version_locks = Mutex::new(HashMap::new());
-		Ok(Self { connection, data_dir, kv_table_name, write_version_locks })
+		Ok(Self {
+			connection,
+			data_dir,
+			kv_table_name,
+			write_version_locks,
+			config: SqliteStoreConfig::default(),
+		})
 	}
 
 	fn get_inner_lock_ref(&self, locking_key: String) -> Arc<Mutex<u64>> {

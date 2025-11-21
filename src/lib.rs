@@ -108,8 +108,9 @@ pub use lightning;
 pub use lightning_invoice;
 pub use lightning_liquidity;
 pub use lightning_types;
-use std::collections::HashMap;
+
 pub use vss_client;*/
+use std::collections::HashMap;
 use std::default::Default;
 use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex, RwLock};
@@ -207,6 +208,8 @@ pub use {
 
 use crate::scoring::setup_background_pathfinding_scores_sync;
 
+use crate::types::{KeyValue, MigrateStorage, ResetState, TlvEntry};
+
 #[cfg(feature = "uniffi")]
 uniffi::include_scaffolding!("ldk_node");
 
@@ -261,10 +264,6 @@ impl Node {
 		if *is_running_lock {
 			return Err(Error::AlreadyRunning);
 		}
-
-		let mut background_tasks = tokio::task::JoinSet::new();
-		let mut cancellable_background_tasks = tokio::task::JoinSet::new();
-		let runtime_handle = runtime.handle();
 
 		log_info!(
 			self.logger,
@@ -501,7 +500,7 @@ impl Node {
 										// increase backoff randomly e.g. for the first 6 iterations:
 										// 1, [2-3], [3-5], [4-7], [5-9], [6-11], [7-13]
 										let mut new_peer_retry_backoff = peer_retry_backoff + 1;
-										new_peer_retry_backoff += rand::thread_rng().gen_range(0..new_peer_retry_backoff);
+										new_peer_retry_backoff += rand::rng().gen_range(0..new_peer_retry_backoff);
 										if new_peer_retry_backoff > 360 {
 											new_peer_retry_backoff = 360 // 360 * 10 seconds = approx 1 hour maximum backoff
 										}
@@ -696,8 +695,6 @@ impl Node {
 				panic!("Failed to process events");
 			});
 		});
-		debug_assert!(self.background_processor_task.lock().unwrap().is_none());
-		*self.background_processor_task.lock().unwrap() = Some(handle);
 
 		if let Some(liquidity_source) = self.liquidity_source.as_ref() {
 			let mut stop_liquidity_handler = self.stop_sender.subscribe();
@@ -748,20 +745,6 @@ impl Node {
 				);
 				debug_assert!(false);
 			});
-
-		// Cancel cancellable background tasks
-		self.runtime.abort_cancellable_background_tasks();
-
-		// Cancel cancellable background tasks
-		if let Some(mut tasks) = self.cancellable_background_tasks.lock().unwrap().take() {
-			let runtime_2 = Arc::clone(&runtime);
-			tasks.abort_all();
-			tokio::task::block_in_place(move || {
-				runtime_2.block_on(async { while let Some(_) = tasks.join_next().await {} })
-			});
-		} else {
-			debug_assert!(false, "Expected some cancellable background tasks");
-		};
 
 		// Disconnect all peers.
 		self.peer_manager.disconnect_all_peers();
@@ -1740,13 +1723,13 @@ impl Node {
 
 		let mut total_lightning_balance_sats = 0;
 		let mut lightning_balances = Vec::new();
-		for (channel_id) in self.chain_monitor.list_monitors() {
+		for channel_id in self.chain_monitor.list_monitors() {
 			match self.chain_monitor.get_monitor(channel_id) {
 				Ok(monitor) => {
+					let funding_txo = monitor.get_funding_txo();
 					funding_txo_by_channel_id.insert(channel_id, funding_txo);
 
 					let counterparty_node_id = monitor.get_counterparty_node_id();
-					let funding_txo = monitor.get_funding_txo();
 					for ldk_balance in monitor.get_claimable_balances() {
 						total_lightning_balance_sats += ldk_balance.claimable_amount_satoshis();
 						lightning_balances.push(LightningBalance::from_ldk_balance(

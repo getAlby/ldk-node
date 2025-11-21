@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-//use crate::types::TlvEntry;
+use crate::types::TlvEntry;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
