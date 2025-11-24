@@ -40,9 +40,6 @@ default = []
 # max_level_trace = []
 
 [dependencies]
-# Alby: see https://aws.github.io/aws-lc-rs/platform_support.html
-aws-lc-rs = { version = "1", features = ["bindgen"] }
-
 lightning = { version = "0.2.0-rc1", features = ["std"] }
 lightning-types = { version = "0.3.0-rc1" }
 lightning-invoice = { version = "0.34.0-rc1", features = ["std"] }
