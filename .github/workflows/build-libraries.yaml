@@ -39,6 +39,8 @@ jobs:
 
       - name: Build
         run: ${{ matrix.build.tool }} build --release --target ${{ matrix.build.target }} --features uniffi
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: 1
 
       - name: Archive
         uses: actions/upload-artifact@v4
