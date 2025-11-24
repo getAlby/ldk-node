@@ -303,16 +303,14 @@ impl KVStoreSync for VssStore {
 	}
 
 	fn list(&self, primary_namespace: &str, secondary_namespace: &str) -> io::Result<Vec<String>> {
-		// FIXME: list keys
-		/*
-		// Alby: also list keys from secondary storage
-		let secondary_keys =
-			self.secondary_kv_store.list(primary_namespace, secondary_namespace)?;
+		// Alby: we use a secondary store for the network graph and currently don't support merging results
+		if primary_namespace == NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE {
+			panic!("Alby: cannot list from NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE");
+		}
+		if primary_namespace == "" {
+			panic!("Alby: cannot list from empty primary namespace");
+		}
 
-		let all_keys: Vec<String> =
-			keys.iter().cloned().chain(secondary_keys.iter().cloned()).collect();
-		Ok(all_keys)
-		 */
 		let internal_runtime = self.internal_runtime.as_ref().ok_or_else(|| {
 			debug_assert!(false, "Failed to access internal runtime");
 			let msg = format!("Failed to access internal runtime");
@@ -433,16 +431,14 @@ impl KVStore for VssStore {
 	fn list(
 		&self, primary_namespace: &str, secondary_namespace: &str,
 	) -> Pin<Box<dyn Future<Output = Result<Vec<String>, io::Error>> + Send>> {
-		// FIXME: list keys
-		/*
-		// Alby: also list keys from secondary storage
-		let secondary_keys =
-			self.secondary_kv_store.list(primary_namespace, secondary_namespace)?;
+		// Alby: we use a secondary store for the network graph and currently don't support merging results
+		if primary_namespace == NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE {
+			panic!("Alby: cannot list from NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE");
+		}
+		if primary_namespace == "" {
+			panic!("Alby: cannot list from empty primary namespace");
+		}
 
-		let all_keys: Vec<String> =
-			keys.iter().cloned().chain(secondary_keys.iter().cloned()).collect();
-		Ok(all_keys)
-		 */
 		let primary_namespace = primary_namespace.to_string();
 		let secondary_namespace = secondary_namespace.to_string();
 		let inner = Arc::clone(&self.inner);

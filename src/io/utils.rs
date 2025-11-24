@@ -45,7 +45,7 @@ use crate::fee_estimator::OnchainFeeEstimator;
 use crate::io::{
 	NODE_METRICS_KEY, NODE_METRICS_PRIMARY_NAMESPACE, NODE_METRICS_SECONDARY_NAMESPACE,
 };
-use crate::logger::{log_error, LdkLogger, Logger};
+use crate::logger::{log_error, log_trace, LdkLogger, Logger};
 use crate::peer_store::PeerStore;
 use crate::types::{Broadcaster, DynStore, KeysManager, Sweeper, WordCount};
 use crate::wallet::ser::{ChangeSetDeserWrapper, ChangeSetSerWrapper};
@@ -139,6 +139,7 @@ pub(crate) fn read_network_graph<L: Deref + Clone>(
 where
 	L::Target: LdkLogger,
 {
+	log_trace!(logger, "Reading network graph");
 	let mut reader = Cursor::new(KVStoreSync::read(
 		&*kv_store,
 		NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
