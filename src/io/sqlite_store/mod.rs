@@ -6,20 +6,25 @@
 // accordance with one or both of these licenses.
 
 //! Objects related to [`SqliteStore`] live here.
-use crate::io::utils::check_namespace_key_validity;
+use std::boxed::Box;
+use std::collections::HashMap;
+use std::fs;
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use lightning::io;
-use lightning::util::persist::{
-	KVStore, NETWORK_GRAPH_PERSISTENCE_KEY, NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
-	NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
-};
-use lightning::util::string::PrintableString;
 
+use lightning::util::persist::{
+	KVStore, KVStoreSync, NETWORK_GRAPH_PERSISTENCE_KEY,
+	NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE, NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
+};
+use lightning_types::string::PrintableString;
 use rusqlite::{named_params, Connection};
 
-use std::fs;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use crate::io::utils::check_namespace_key_validity;
 
 mod migrations;
 
@@ -37,17 +42,8 @@ pub const DEFAULT_KV_TABLE_NAME: &str = "ldk_data";
 // The current SQLite `user_version`, which we can use if we'd ever need to do a schema migration.
 const SCHEMA_USER_VERSION: u16 = 2;
 
-/// A [`KVStore`] implementation that writes to and reads from an [SQLite] database.
-///
-/// [SQLite]: https://sqlite.org
-pub struct SqliteStore {
-	connection: Arc<Mutex<Connection>>,
-	data_dir: PathBuf,
-	kv_table_name: String,
-	config: SqliteStoreConfig,
-}
-
 /// Alby: extended SqliteStore configuration.
+#[derive(Clone)]
 pub struct SqliteStoreConfig {
 	/// Do not persist network graph.
 	pub(crate) transient_graph: bool,
@@ -59,6 +55,17 @@ impl Default for SqliteStoreConfig {
 	}
 }
 
+/// A [`KVStoreSync`] implementation that writes to and reads from an [SQLite] database.
+///
+/// [SQLite]: https://sqlite.org
+pub struct SqliteStore {
+	inner: Arc<SqliteStoreInner>,
+
+	// Version counter to ensure that writes are applied in the correct order. It is assumed that read and list
+	// operations aren't sensitive to the order of execution.
+	next_write_version: AtomicU64,
+}
+
 impl SqliteStore {
 	/// Constructs a new [`SqliteStore`].
 	///
@@ -68,6 +75,201 @@ impl SqliteStore {
 	/// Similarly, the given `kv_table_name` will be used or default to [`DEFAULT_KV_TABLE_NAME`].
 	pub fn new(
 		data_dir: PathBuf, db_file_name: Option<String>, kv_table_name: Option<String>,
+		config: Option<SqliteStoreConfig>,
+	) -> io::Result<Self> {
+		let config = config.unwrap_or_default();
+		let inner =
+			Arc::new(SqliteStoreInner::new(data_dir, db_file_name, kv_table_name, config.clone())?);
+		let next_write_version = AtomicU64::new(1);
+		let store = Self { inner, next_write_version };
+
+		// Alby: enable not saving network graph (Alby Cloud)
+		if config.transient_graph {
+			// Drop existing network graph if it has been persisted before.
+			KVStoreSync::remove(
+				&store,
+				NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
+				NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
+				NETWORK_GRAPH_PERSISTENCE_KEY,
+				false,
+			)?;
+		}
+
+		Ok(store)
+	}
+
+	fn build_locking_key(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
+	) -> String {
+		format!("{}#{}#{}", primary_namespace, secondary_namespace, key)
+	}
+
+	fn get_new_version_and_lock_ref(&self, locking_key: String) -> (Arc<Mutex<u64>>, u64) {
+		let version = self.next_write_version.fetch_add(1, Ordering::Relaxed);
+		if version == u64::MAX {
+			panic!("SqliteStore version counter overflowed");
+		}
+
+		// Get a reference to the inner lock. We do this early so that the arc can double as an in-flight counter for
+		// cleaning up unused locks.
+		let inner_lock_ref = self.inner.get_inner_lock_ref(locking_key);
+
+		(inner_lock_ref, version)
+	}
+
+	/// Returns the data directory.
+	pub fn get_data_dir(&self) -> PathBuf {
+		self.inner.data_dir.clone()
+	}
+}
+
+impl KVStore for SqliteStore {
+	fn read(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
+	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, io::Error>> + Send>> {
+		let primary_namespace = primary_namespace.to_string();
+		let secondary_namespace = secondary_namespace.to_string();
+		let key = key.to_string();
+		let inner = Arc::clone(&self.inner);
+		let fut = tokio::task::spawn_blocking(move || {
+			inner.read_internal(&primary_namespace, &secondary_namespace, &key)
+		});
+		Box::pin(async move {
+			fut.await.unwrap_or_else(|e| {
+				let msg = format!("Failed to IO operation due join error: {}", e);
+				Err(io::Error::new(io::ErrorKind::Other, msg))
+			})
+		})
+	}
+
+	fn write(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
+	) -> Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send>> {
+		let locking_key = self.build_locking_key(primary_namespace, secondary_namespace, key);
+		let (inner_lock_ref, version) = self.get_new_version_and_lock_ref(locking_key.clone());
+		let primary_namespace = primary_namespace.to_string();
+		let secondary_namespace = secondary_namespace.to_string();
+		let key = key.to_string();
+		let inner = Arc::clone(&self.inner);
+		let fut = tokio::task::spawn_blocking(move || {
+			inner.write_internal(
+				inner_lock_ref,
+				locking_key,
+				version,
+				&primary_namespace,
+				&secondary_namespace,
+				&key,
+				buf,
+			)
+		});
+		Box::pin(async move {
+			fut.await.unwrap_or_else(|e| {
+				let msg = format!("Failed to IO operation due join error: {}", e);
+				Err(io::Error::new(io::ErrorKind::Other, msg))
+			})
+		})
+	}
+
+	fn remove(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, _lazy: bool,
+	) -> Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send>> {
+		let locking_key = self.build_locking_key(primary_namespace, secondary_namespace, key);
+		let (inner_lock_ref, version) = self.get_new_version_and_lock_ref(locking_key.clone());
+		let primary_namespace = primary_namespace.to_string();
+		let secondary_namespace = secondary_namespace.to_string();
+		let key = key.to_string();
+		let inner = Arc::clone(&self.inner);
+		let fut = tokio::task::spawn_blocking(move || {
+			inner.remove_internal(
+				inner_lock_ref,
+				locking_key,
+				version,
+				&primary_namespace,
+				&secondary_namespace,
+				&key,
+			)
+		});
+		Box::pin(async move {
+			fut.await.unwrap_or_else(|e| {
+				let msg = format!("Failed to IO operation due join error: {}", e);
+				Err(io::Error::new(io::ErrorKind::Other, msg))
+			})
+		})
+	}
+
+	fn list(
+		&self, primary_namespace: &str, secondary_namespace: &str,
+	) -> Pin<Box<dyn Future<Output = Result<Vec<String>, io::Error>> + Send>> {
+		let primary_namespace = primary_namespace.to_string();
+		let secondary_namespace = secondary_namespace.to_string();
+		let inner = Arc::clone(&self.inner);
+		let fut = tokio::task::spawn_blocking(move || {
+			inner.list_internal(&primary_namespace, &secondary_namespace)
+		});
+		Box::pin(async move {
+			fut.await.unwrap_or_else(|e| {
+				let msg = format!("Failed to IO operation due join error: {}", e);
+				Err(io::Error::new(io::ErrorKind::Other, msg))
+			})
+		})
+	}
+}
+
+impl KVStoreSync for SqliteStore {
+	fn read(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
+	) -> io::Result<Vec<u8>> {
+		self.inner.read_internal(primary_namespace, secondary_namespace, key)
+	}
+
+	fn write(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
+	) -> io::Result<()> {
+		let locking_key = self.build_locking_key(primary_namespace, secondary_namespace, key);
+		let (inner_lock_ref, version) = self.get_new_version_and_lock_ref(locking_key.clone());
+		self.inner.write_internal(
+			inner_lock_ref,
+			locking_key,
+			version,
+			primary_namespace,
+			secondary_namespace,
+			key,
+			buf,
+		)
+	}
+
+	fn remove(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, _lazy: bool,
+	) -> io::Result<()> {
+		let locking_key = self.build_locking_key(primary_namespace, secondary_namespace, key);
+		let (inner_lock_ref, version) = self.get_new_version_and_lock_ref(locking_key.clone());
+		self.inner.remove_internal(
+			inner_lock_ref,
+			locking_key,
+			version,
+			primary_namespace,
+			secondary_namespace,
+			key,
+		)
+	}
+
+	fn list(&self, primary_namespace: &str, secondary_namespace: &str) -> io::Result<Vec<String>> {
+		self.inner.list_internal(primary_namespace, secondary_namespace)
+	}
+}
+
+struct SqliteStoreInner {
+	connection: Arc<Mutex<Connection>>,
+	data_dir: PathBuf,
+	kv_table_name: String,
+	write_version_locks: Mutex<HashMap<String, Arc<Mutex<u64>>>>,
+	config: SqliteStoreConfig,
+}
+
+impl SqliteStoreInner {
+	fn new(
+		data_dir: PathBuf, db_file_name: Option<String>, kv_table_name: Option<String>,
+		config: SqliteStoreConfig,
 	) -> io::Result<Self> {
 		let db_file_name = db_file_name.unwrap_or(DEFAULT_SQLITE_DB_FILE_NAME.to_string());
 		let kv_table_name = kv_table_name.unwrap_or(DEFAULT_KV_TABLE_NAME.to_string());
@@ -136,38 +338,16 @@ impl SqliteStore {
 		})?;
 
 		let connection = Arc::new(Mutex::new(connection));
-		Ok(Self { connection, data_dir, kv_table_name, config: SqliteStoreConfig::default() })
+		let write_version_locks = Mutex::new(HashMap::new());
+		Ok(Self { connection, data_dir, kv_table_name, write_version_locks, config })
 	}
 
-	/// Alby: constructs a new [`SqliteStore`] with an extended configuration.
-	pub fn with_config(
-		data_dir: PathBuf, db_file_name: Option<String>, kv_table_name: Option<String>,
-		config: SqliteStoreConfig,
-	) -> io::Result<Self> {
-		let mut ret = SqliteStore::new(data_dir, db_file_name, kv_table_name)?;
-
-		if config.transient_graph {
-			// Drop existing network graph if it has been persisted before.
-			ret.remove(
-				NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
-				NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
-				NETWORK_GRAPH_PERSISTENCE_KEY,
-				false,
-			)?;
-		}
-
-		ret.config = config;
-		Ok(ret)
+	fn get_inner_lock_ref(&self, locking_key: String) -> Arc<Mutex<u64>> {
+		let mut outer_lock = self.write_version_locks.lock().unwrap();
+		Arc::clone(&outer_lock.entry(locking_key).or_default())
 	}
 
-	/// Returns the data directory.
-	pub fn get_data_dir(&self) -> PathBuf {
-		self.data_dir.clone()
-	}
-}
-
-impl KVStore for SqliteStore {
-	fn read(
+	fn read_internal(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
 	) -> io::Result<Vec<u8>> {
 		check_namespace_key_validity(primary_namespace, secondary_namespace, Some(key), "read")?;
@@ -224,8 +404,9 @@ impl KVStore for SqliteStore {
 		Ok(res)
 	}
 
-	fn write(
-		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: &[u8],
+	fn write_internal(
+		&self, inner_lock_ref: Arc<Mutex<u64>>, locking_key: String, version: u64,
+		primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
 	) -> io::Result<()> {
 		check_namespace_key_validity(primary_namespace, secondary_namespace, Some(key), "write")?;
 
@@ -238,70 +419,77 @@ impl KVStore for SqliteStore {
 			return Ok(());
 		}
 
-		let locked_conn = self.connection.lock().unwrap();
+		self.execute_locked_write(inner_lock_ref, locking_key, version, || {
+			let locked_conn = self.connection.lock().unwrap();
 
-		let sql = format!(
-			"INSERT OR REPLACE INTO {} (primary_namespace, secondary_namespace, key, value) VALUES (:primary_namespace, :secondary_namespace, :key, :value);",
-			self.kv_table_name
-		);
-
-		let mut stmt = locked_conn.prepare_cached(&sql).map_err(|e| {
-			let msg = format!("Failed to prepare statement: {}", e);
-			io::Error::new(io::ErrorKind::Other, msg)
-		})?;
-
-		stmt.execute(named_params! {
-			":primary_namespace": primary_namespace,
-			":secondary_namespace": secondary_namespace,
-			":key": key,
-			":value": buf,
-		})
-		.map(|_| ())
-		.map_err(|e| {
-			let msg = format!(
-				"Failed to write to key {}/{}/{}: {}",
-				PrintableString(primary_namespace),
-				PrintableString(secondary_namespace),
-				PrintableString(key),
-				e
+			let sql = format!(
+				"INSERT OR REPLACE INTO {} (primary_namespace, secondary_namespace, key, value) VALUES (:primary_namespace, :secondary_namespace, :key, :value);",
+				self.kv_table_name
 			);
-			io::Error::new(io::ErrorKind::Other, msg)
+
+			let mut stmt = locked_conn.prepare_cached(&sql).map_err(|e| {
+				let msg = format!("Failed to prepare statement: {}", e);
+				io::Error::new(io::ErrorKind::Other, msg)
+			})?;
+
+			stmt.execute(named_params! {
+				":primary_namespace": primary_namespace,
+				":secondary_namespace": secondary_namespace,
+				":key": key,
+				":value": buf,
+			})
+			.map(|_| ())
+			.map_err(|e| {
+				let msg = format!(
+					"Failed to write to key {}/{}/{}: {}",
+					PrintableString(primary_namespace),
+					PrintableString(secondary_namespace),
+					PrintableString(key),
+					e
+				);
+				io::Error::new(io::ErrorKind::Other, msg)
+			})
 		})
 	}
 
-	fn remove(
-		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, _lazy: bool,
+	fn remove_internal(
+		&self, inner_lock_ref: Arc<Mutex<u64>>, locking_key: String, version: u64,
+		primary_namespace: &str, secondary_namespace: &str, key: &str,
 	) -> io::Result<()> {
 		check_namespace_key_validity(primary_namespace, secondary_namespace, Some(key), "remove")?;
 
-		let locked_conn = self.connection.lock().unwrap();
+		self.execute_locked_write(inner_lock_ref, locking_key, version, || {
+			let locked_conn = self.connection.lock().unwrap();
 
-		let sql = format!("DELETE FROM {} WHERE primary_namespace=:primary_namespace AND secondary_namespace=:secondary_namespace AND key=:key;", self.kv_table_name);
+			let sql = format!("DELETE FROM {} WHERE primary_namespace=:primary_namespace AND secondary_namespace=:secondary_namespace AND key=:key;", self.kv_table_name);
 
-		let mut stmt = locked_conn.prepare_cached(&sql).map_err(|e| {
-			let msg = format!("Failed to prepare statement: {}", e);
-			io::Error::new(io::ErrorKind::Other, msg)
-		})?;
+			let mut stmt = locked_conn.prepare_cached(&sql).map_err(|e| {
+				let msg = format!("Failed to prepare statement: {}", e);
+				io::Error::new(io::ErrorKind::Other, msg)
+			})?;
 
-		stmt.execute(named_params! {
-			":primary_namespace": primary_namespace,
-			":secondary_namespace": secondary_namespace,
-			":key": key,
+			stmt.execute(named_params! {
+				":primary_namespace": primary_namespace,
+				":secondary_namespace": secondary_namespace,
+				":key": key,
+			})
+			.map_err(|e| {
+				let msg = format!(
+					"Failed to delete key {}/{}/{}: {}",
+					PrintableString(primary_namespace),
+					PrintableString(secondary_namespace),
+					PrintableString(key),
+					e
+				);
+				io::Error::new(io::ErrorKind::Other, msg)
+			})?;
+			Ok(())
 		})
-		.map_err(|e| {
-			let msg = format!(
-				"Failed to delete key {}/{}/{}: {}",
-				PrintableString(primary_namespace),
-				PrintableString(secondary_namespace),
-				PrintableString(key),
-				e
-			);
-			io::Error::new(io::ErrorKind::Other, msg)
-		})?;
-		Ok(())
 	}
 
-	fn list(&self, primary_namespace: &str, secondary_namespace: &str) -> io::Result<Vec<String>> {
+	fn list_internal(
+		&self, primary_namespace: &str, secondary_namespace: &str,
+	) -> io::Result<Vec<String>> {
 		check_namespace_key_validity(primary_namespace, secondary_namespace, None, "list")?;
 
 		let locked_conn = self.connection.lock().unwrap();
@@ -339,6 +527,46 @@ impl KVStore for SqliteStore {
 
 		Ok(keys)
 	}
+
+	fn execute_locked_write<F: FnOnce() -> Result<(), lightning::io::Error>>(
+		&self, inner_lock_ref: Arc<Mutex<u64>>, locking_key: String, version: u64, callback: F,
+	) -> Result<(), lightning::io::Error> {
+		let res = {
+			let mut last_written_version = inner_lock_ref.lock().unwrap();
+
+			// Check if we already have a newer version written/removed. This is used in async contexts to realize eventual
+			// consistency.
+			let is_stale_version = version <= *last_written_version;
+
+			// If the version is not stale, we execute the callback. Otherwise we can and must skip writing.
+			if is_stale_version {
+				Ok(())
+			} else {
+				callback().map(|_| {
+					*last_written_version = version;
+				})
+			}
+		};
+
+		self.clean_locks(&inner_lock_ref, locking_key);
+
+		res
+	}
+
+	fn clean_locks(&self, inner_lock_ref: &Arc<Mutex<u64>>, locking_key: String) {
+		// If there no arcs in use elsewhere, this means that there are no in-flight writes. We can remove the map entry
+		// to prevent leaking memory. The two arcs that are expected are the one in the map and the one held here in
+		// inner_lock_ref. The outer lock is obtained first, to avoid a new arc being cloned after we've already
+		// counted.
+		let mut outer_lock = self.write_version_locks.lock().unwrap();
+
+		let strong_count = Arc::strong_count(&inner_lock_ref);
+		debug_assert!(strong_count >= 2, "Unexpected SqliteStore strong count");
+
+		if strong_count == 2 {
+			outer_lock.remove(&locking_key);
+		}
+	}
 }
 
 #[cfg(test)]
@@ -350,7 +578,7 @@ mod tests {
 
 	impl Drop for SqliteStore {
 		fn drop(&mut self) {
-			match fs::remove_dir_all(&self.data_dir) {
+			match fs::remove_dir_all(&self.inner.data_dir) {
 				Err(e) => println!("Failed to remove test store directory: {}", e),
 				_ => {},
 			}
@@ -365,6 +593,7 @@ mod tests {
 			temp_path,
 			Some("test_db".to_string()),
 			Some("test_table".to_string()),
+			None,
 		)
 		.unwrap();
 		do_read_write_remove_list_persist(&store);
@@ -378,12 +607,14 @@ mod tests {
 			temp_path.clone(),
 			Some("test_db_0".to_string()),
 			Some("test_table".to_string()),
+			None,
 		)
 		.unwrap();
 		let store_1 = SqliteStore::new(
 			temp_path,
 			Some("test_db_1".to_string()),
 			Some("test_table".to_string()),
+			None,
 		)
 		.unwrap();
 		do_test_store(&store_0, &store_1)
@@ -397,8 +628,10 @@ pub mod bench {
 
 	/// Bench!
 	pub fn bench_sends(bench: &mut Criterion) {
-		let store_a = super::SqliteStore::new("bench_sqlite_store_a".into(), None, None).unwrap();
-		let store_b = super::SqliteStore::new("bench_sqlite_store_b".into(), None, None).unwrap();
+		let store_a =
+			super::SqliteStore::new("bench_sqlite_store_a".into(), None, None, None).unwrap();
+		let store_b =
+			super::SqliteStore::new("bench_sqlite_store_b".into(), None, None, None).unwrap();
 		lightning::ln::channelmanager::bench::bench_two_sends(
 			bench,
 			"bench_sqlite_persisted_sends",

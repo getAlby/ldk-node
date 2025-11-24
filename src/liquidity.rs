@@ -7,52 +7,51 @@
 
 //! Objects related to liquidity management.
 
-use crate::chain::ChainSource;
-use crate::connection::ConnectionManager;
-use crate::logger::{log_debug, log_error, log_info, LdkLogger, Logger};
-use crate::types::{ChannelManager, KeysManager, LiquidityManager, PeerManager, Wallet};
-use crate::{total_anchor_channels_reserve_sats, Config, Error};
-
-use lightning::events::HTLCDestination;
-use lightning::ln::channelmanager::{InterceptId, MIN_FINAL_CLTV_EXPIRY_DELTA};
-use lightning::ln::msgs::SocketAddress;
-use lightning::ln::types::ChannelId;
-use lightning::routing::router::{RouteHint, RouteHintHop};
-
-use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, InvoiceBuilder, RoutingFees};
-
-use lightning_liquidity::events::Event;
-use lightning_liquidity::lsps0::ser::RequestId;
-use lightning_liquidity::lsps1::client::LSPS1ClientConfig as LdkLSPS1ClientConfig;
-use lightning_liquidity::lsps1::event::LSPS1ClientEvent;
-use lightning_liquidity::lsps1::msgs::{ChannelInfo, LSPS1Options, OrderId, OrderParameters};
-use lightning_liquidity::lsps2::client::LSPS2ClientConfig as LdkLSPS2ClientConfig;
-use lightning_liquidity::lsps2::event::{LSPS2ClientEvent, LSPS2ServiceEvent};
-use lightning_liquidity::lsps2::msgs::{OpeningFeeParams, RawOpeningFeeParams};
-use lightning_liquidity::lsps2::service::LSPS2ServiceConfig as LdkLSPS2ServiceConfig;
-use lightning_liquidity::lsps2::utils::compute_opening_fee;
-use lightning_liquidity::{LiquidityClientConfig, LiquidityServiceConfig};
-
-use lightning_types::payment::PaymentHash;
-
-use bitcoin::hashes::{sha256, Hash};
-use bitcoin::secp256k1::{PublicKey, Secp256k1};
-
-use tokio::sync::oneshot;
-
-use chrono::{DateTime, Utc};
-
-use rand::Rng;
-
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use bitcoin::hashes::{sha256, Hash};
+use bitcoin::secp256k1::{PublicKey, Secp256k1};
+use bitcoin::Transaction;
+use chrono::Utc;
+use lightning::events::HTLCHandlingFailureType;
+use lightning::ln::channelmanager::{InterceptId, MIN_FINAL_CLTV_EXPIRY_DELTA};
+use lightning::ln::msgs::SocketAddress;
+use lightning::ln::types::ChannelId;
+use lightning::routing::router::{RouteHint, RouteHintHop};
+use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, InvoiceBuilder, RoutingFees};
+use lightning_liquidity::events::LiquidityEvent;
+use lightning_liquidity::lsps0::ser::{LSPSDateTime, LSPSRequestId};
+use lightning_liquidity::lsps1::client::LSPS1ClientConfig as LdkLSPS1ClientConfig;
+use lightning_liquidity::lsps1::event::LSPS1ClientEvent;
+use lightning_liquidity::lsps1::msgs::{
+	LSPS1ChannelInfo, LSPS1Options, LSPS1OrderId, LSPS1OrderParams,
+};
+use lightning_liquidity::lsps2::client::LSPS2ClientConfig as LdkLSPS2ClientConfig;
+use lightning_liquidity::lsps2::event::{LSPS2ClientEvent, LSPS2ServiceEvent};
+use lightning_liquidity::lsps2::msgs::{LSPS2OpeningFeeParams, LSPS2RawOpeningFeeParams};
+use lightning_liquidity::lsps2::service::LSPS2ServiceConfig as LdkLSPS2ServiceConfig;
+use lightning_liquidity::lsps2::utils::compute_opening_fee;
+use lightning_liquidity::{LiquidityClientConfig, LiquidityServiceConfig};
+use lightning_types::payment::PaymentHash;
+use rand::Rng;
+use tokio::sync::oneshot;
+
+use crate::builder::BuildError;
+use crate::chain::ChainSource;
+use crate::connection::ConnectionManager;
+use crate::logger::{log_debug, log_error, log_info, LdkLogger, Logger};
+use crate::runtime::Runtime;
+use crate::types::{
+	Broadcaster, ChannelManager, DynStore, KeysManager, LiquidityManager, PeerManager, Wallet,
+};
+use crate::{total_anchor_channels_reserve_sats, Config, Error};
+
 const LIQUIDITY_REQUEST_TIMEOUT_SECS: u64 = 5;
 
 const LSPS2_GETINFO_REQUEST_EXPIRY: Duration = Duration::from_secs(60 * 60 * 24);
-const LSPS2_CLIENT_TRUSTS_LSP_MODE: bool = true;
 const LSPS2_CHANNEL_CLTV_EXPIRY_DELTA: u32 = 72;
 
 struct LSPS1Client {
@@ -61,10 +60,10 @@ struct LSPS1Client {
 	token: Option<String>,
 	ldk_client_config: LdkLSPS1ClientConfig,
 	pending_opening_params_requests:
-		Mutex<HashMap<RequestId, oneshot::Sender<LSPS1OpeningParamsResponse>>>,
-	pending_create_order_requests: Mutex<HashMap<RequestId, oneshot::Sender<LSPS1OrderStatus>>>,
+		Mutex<HashMap<LSPSRequestId, oneshot::Sender<LSPS1OpeningParamsResponse>>>,
+	pending_create_order_requests: Mutex<HashMap<LSPSRequestId, oneshot::Sender<LSPS1OrderStatus>>>,
 	pending_check_order_status_requests:
-		Mutex<HashMap<RequestId, oneshot::Sender<LSPS1OrderStatus>>>,
+		Mutex<HashMap<LSPSRequestId, oneshot::Sender<LSPS1OrderStatus>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,8 +78,8 @@ struct LSPS2Client {
 	lsp_address: SocketAddress,
 	token: Option<String>,
 	ldk_client_config: LdkLSPS2ClientConfig,
-	pending_fee_requests: Mutex<HashMap<RequestId, oneshot::Sender<LSPS2FeeResponse>>>,
-	pending_buy_requests: Mutex<HashMap<RequestId, oneshot::Sender<LSPS2BuyResponse>>>,
+	pending_fee_requests: Mutex<HashMap<LSPSRequestId, oneshot::Sender<LSPS2FeeResponse>>>,
+	pending_buy_requests: Mutex<HashMap<LSPSRequestId, oneshot::Sender<LSPS2BuyResponse>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +130,19 @@ pub struct LSPS2ServiceConfig {
 	pub min_payment_size_msat: u64,
 	/// The maximum payment size that we will accept when opening a channel.
 	pub max_payment_size_msat: u64,
+	/// Use the 'client-trusts-LSP' trust model.
+	///
+	/// When set, the service will delay *broadcasting* the JIT channel's funding transaction until
+	/// the client claimed sufficient HTLC parts to pay for the channel open.
+	///
+	/// Note this will render the flow incompatible with clients utilizing the 'LSP-trust-client'
+	/// trust model, i.e., in turn delay *claiming* any HTLCs until they see the funding
+	/// transaction in the mempool.
+	///
+	/// Please refer to [`bLIP-52`] for more information.
+	///
+	/// [`bLIP-52`]: https://github.com/lightning/blips/blob/master/blip-0052.md#trust-models
+	pub client_trusts_lsp: bool,
 }
 
 pub(crate) struct LiquiditySourceBuilder<L: Deref>
@@ -144,6 +156,8 @@ where
 	channel_manager: Arc<ChannelManager>,
 	keys_manager: Arc<KeysManager>,
 	chain_source: Arc<ChainSource>,
+	tx_broadcaster: Arc<Broadcaster>,
+	kv_store: Arc<DynStore>,
 	config: Arc<Config>,
 	logger: L,
 }
@@ -154,7 +168,8 @@ where
 {
 	pub(crate) fn new(
 		wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>, keys_manager: Arc<KeysManager>,
-		chain_source: Arc<ChainSource>, config: Arc<Config>, logger: L,
+		chain_source: Arc<ChainSource>, tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>,
+		config: Arc<Config>, logger: L,
 	) -> Self {
 		let lsps1_client = None;
 		let lsps2_client = None;
@@ -167,6 +182,8 @@ where
 			channel_manager,
 			keys_manager,
 			chain_source,
+			tx_broadcaster,
+			kv_store,
 			config,
 			logger,
 		}
@@ -217,28 +234,40 @@ where
 		self
 	}
 
-	pub(crate) fn build(self) -> LiquiditySource<L> {
+	pub(crate) async fn build(self) -> Result<LiquiditySource<L>, BuildError> {
 		let liquidity_service_config = self.lsps2_service.as_ref().map(|s| {
 			let lsps2_service_config = Some(s.ldk_service_config.clone());
+			let lsps5_service_config = None;
 			let advertise_service = s.service_config.advertise_service;
-			LiquidityServiceConfig { lsps2_service_config, advertise_service }
+			LiquidityServiceConfig { lsps2_service_config, lsps5_service_config, advertise_service }
 		});
 
 		let lsps1_client_config = self.lsps1_client.as_ref().map(|s| s.ldk_client_config.clone());
 		let lsps2_client_config = self.lsps2_client.as_ref().map(|s| s.ldk_client_config.clone());
-		let liquidity_client_config =
-			Some(LiquidityClientConfig { lsps1_client_config, lsps2_client_config });
+		let lsps5_client_config = None;
+		let liquidity_client_config = Some(LiquidityClientConfig {
+			lsps1_client_config,
+			lsps2_client_config,
+			lsps5_client_config,
+		});
 
-		let liquidity_manager = Arc::new(LiquidityManager::new(
-			Arc::clone(&self.keys_manager),
-			Arc::clone(&self.channel_manager),
-			Some(Arc::clone(&self.chain_source)),
-			None,
-			liquidity_service_config,
-			liquidity_client_config,
-		));
+		let liquidity_manager = Arc::new(
+			LiquidityManager::new(
+				Arc::clone(&self.keys_manager),
+				Arc::clone(&self.keys_manager),
+				Arc::clone(&self.channel_manager),
+				Some(Arc::clone(&self.chain_source)),
+				None,
+				Arc::clone(&self.kv_store),
+				Arc::clone(&self.tx_broadcaster),
+				liquidity_service_config,
+				liquidity_client_config,
+			)
+			.await
+			.map_err(|_| BuildError::ReadFailed)?,
+		);
 
-		LiquiditySource {
+		Ok(LiquiditySource {
 			lsps1_client: self.lsps1_client,
 			lsps2_client: self.lsps2_client,
 			lsps2_service: self.lsps2_service,
@@ -249,7 +278,7 @@ where
 			liquidity_manager,
 			config: self.config,
 			logger: self.logger,
-		}
+		})
 	}
 }
 
@@ -274,13 +303,11 @@ where
 	L::Target: LdkLogger,
 {
 	pub(crate) fn set_peer_manager(&self, peer_manager: Arc<PeerManager>) {
-		*self.peer_manager.write().unwrap() = Some(Arc::clone(&peer_manager));
-		let process_msgs_callback = move || peer_manager.process_events();
-		self.liquidity_manager.set_process_msgs_callback(process_msgs_callback);
+		*self.peer_manager.write().unwrap() = Some(peer_manager);
 	}
 
-	pub(crate) fn liquidity_manager(&self) -> &LiquidityManager {
-		self.liquidity_manager.as_ref()
+	pub(crate) fn liquidity_manager(&self) -> Arc<LiquidityManager> {
+		Arc::clone(&self.liquidity_manager)
 	}
 
 	pub(crate) fn get_lsps1_lsp_details(&self) -> Option<(PublicKey, SocketAddress)> {
@@ -291,9 +318,76 @@ where
 		self.lsps2_client.as_ref().map(|s| (s.lsp_node_id, s.lsp_address.clone()))
 	}
 
+	pub(crate) fn lsps2_channel_needs_manual_broadcast(
+		&self, counterparty_node_id: PublicKey, user_channel_id: u128,
+	) -> bool {
+		self.lsps2_service.as_ref().map_or(false, |lsps2_service| {
+			lsps2_service.service_config.client_trusts_lsp
+				&& self
+					.liquidity_manager()
+					.lsps2_service_handler()
+					.and_then(|handler| {
+						handler
+							.channel_needs_manual_broadcast(user_channel_id, &counterparty_node_id)
+							.ok()
+					})
+					.unwrap_or(false)
+		})
+	}
+
+	pub(crate) fn lsps2_store_funding_transaction(
+		&self, user_channel_id: u128, counterparty_node_id: PublicKey, funding_tx: Transaction,
+	) {
+		if self.lsps2_service.as_ref().map_or(false, |svc| !svc.service_config.client_trusts_lsp) {
+			// Only necessary for client-trusts-LSP flow
+			return;
+		}
+
+		let lsps2_service_handler = self.liquidity_manager.lsps2_service_handler();
+		if let Some(handler) = lsps2_service_handler {
+			handler
+				.store_funding_transaction(user_channel_id, &counterparty_node_id, funding_tx)
+				.unwrap_or_else(|e| {
+					debug_assert!(false, "Failed to store funding transaction: {:?}", e);
+					log_error!(self.logger, "Failed to store funding transaction: {:?}", e);
+				});
+		} else {
+			log_error!(self.logger, "LSPS2 service handler is not available.");
+		}
+	}
+
+	pub(crate) fn lsps2_funding_tx_broadcast_safe(
+		&self, user_channel_id: u128, counterparty_node_id: PublicKey,
+	) {
+		if self.lsps2_service.as_ref().map_or(false, |svc| !svc.service_config.client_trusts_lsp) {
+			// Only necessary for client-trusts-LSP flow
+			return;
+		}
+
+		let lsps2_service_handler = self.liquidity_manager.lsps2_service_handler();
+		if let Some(handler) = lsps2_service_handler {
+			handler
+				.set_funding_tx_broadcast_safe(user_channel_id, &counterparty_node_id)
+				.unwrap_or_else(|e| {
+					debug_assert!(
+						false,
+						"Failed to mark funding transaction safe to broadcast: {:?}",
+						e
+					);
+					log_error!(
+						self.logger,
+						"Failed to mark funding transaction safe to broadcast: {:?}",
+						e
+					);
+				});
+		} else {
+			log_error!(self.logger, "LSPS2 service handler is not available.");
+		}
+	}
+
 	pub(crate) async fn handle_next_event(&self) {
 		match self.liquidity_manager.next_event_async().await {
-			Event::LSPS1Client(LSPS1ClientEvent::SupportedOptionsReady {
+			LiquidityEvent::LSPS1Client(LSPS1ClientEvent::SupportedOptionsReady {
 				request_id,
 				counterparty_node_id,
 				supported_options,
@@ -346,7 +440,7 @@ where
 					);
 				}
 			},
-			Event::LSPS1Client(LSPS1ClientEvent::OrderCreated {
+			LiquidityEvent::LSPS1Client(LSPS1ClientEvent::OrderCreated {
 				request_id,
 				counterparty_node_id,
 				order_id,
@@ -404,7 +498,7 @@ where
 					log_error!(self.logger, "Received unexpected LSPS1Client::OrderCreated event!");
 				}
 			},
-			Event::LSPS1Client(LSPS1ClientEvent::OrderStatus {
+			LiquidityEvent::LSPS1Client(LSPS1ClientEvent::OrderStatus {
 				request_id,
 				counterparty_node_id,
 				order_id,
@@ -462,7 +556,7 @@ where
 					log_error!(self.logger, "Received unexpected LSPS1Client::OrderStatus event!");
 				}
 			},
-			Event::LSPS2Service(LSPS2ServiceEvent::GetInfo {
+			LiquidityEvent::LSPS2Service(LSPS2ServiceEvent::GetInfo {
 				request_id,
 				counterparty_node_id,
 				token,
@@ -483,7 +577,7 @@ where
 						if token != Some(required) {
 							log_error!(
 								self.logger,
-								"Rejecting LSPS2 request {:?} from counterparty {} as the client provided an invalid token.", 
+								"Rejecting LSPS2 request {:?} from counterparty {} as the client provided an invalid token.",
 								request_id,
 								counterparty_node_id
 							);
@@ -501,10 +595,8 @@ where
 						}
 					}
 
-					let mut valid_until: DateTime<Utc> = Utc::now();
-					valid_until += LSPS2_GETINFO_REQUEST_EXPIRY;
-
-					let opening_fee_params = RawOpeningFeeParams {
+					let valid_until = LSPSDateTime(Utc::now() + LSPS2_GETINFO_REQUEST_EXPIRY);
+					let opening_fee_params = LSPS2RawOpeningFeeParams {
 						min_fee_msat: service_config.min_channel_opening_fee_msat,
 						proportional: service_config.channel_opening_fee_ppm,
 						valid_until,
@@ -532,7 +624,7 @@ where
 					return;
 				}
 			},
-			Event::LSPS2Service(LSPS2ServiceEvent::BuyRequest {
+			LiquidityEvent::LSPS2Service(LSPS2ServiceEvent::BuyRequest {
 				request_id,
 				counterparty_node_id,
 				opening_fee_params: _,
@@ -550,7 +642,7 @@ where
 						return;
 					};
 
-					let user_channel_id: u128 = rand::thread_rng().gen::<u128>();
+					let user_channel_id: u128 = rand::rng().random();
 					let intercept_scid = self.channel_manager.get_intercept_scid();
 
 					if let Some(payment_size_msat) = payment_size_msat {
@@ -576,14 +668,17 @@ where
 						}
 					}
 
-					match lsps2_service_handler.invoice_parameters_generated(
-						&counterparty_node_id,
-						request_id,
-						intercept_scid,
-						LSPS2_CHANNEL_CLTV_EXPIRY_DELTA,
-						LSPS2_CLIENT_TRUSTS_LSP_MODE,
-						user_channel_id,
-					) {
+					match lsps2_service_handler
+						.invoice_parameters_generated(
+							&counterparty_node_id,
+							request_id,
+							intercept_scid,
+							LSPS2_CHANNEL_CLTV_EXPIRY_DELTA,
+							service_config.client_trusts_lsp,
+							user_channel_id,
+						)
+						.await
+					{
 						Ok(()) => {},
 						Err(e) => {
 							log_error!(
@@ -599,7 +694,7 @@ where
 					return;
 				}
 			},
-			Event::LSPS2Service(LSPS2ServiceEvent::OpenChannel {
+			LiquidityEvent::LSPS2Service(LSPS2ServiceEvent::OpenChannel {
 				their_network_key,
 				amt_to_forward_msat,
 				opening_fee_msat: _,
@@ -673,7 +768,7 @@ where
 					return;
 				}
 
-				let mut config = *self.channel_manager.get_current_default_configuration();
+				let mut config = self.channel_manager.get_current_config().clone();
 
 				// We set these LSP-specific values during Node building, here we're making sure it's actually set.
 				debug_assert_eq!(
@@ -713,7 +808,7 @@ where
 					},
 				}
 			},
-			Event::LSPS2Client(LSPS2ClientEvent::OpeningParametersReady {
+			LiquidityEvent::LSPS2Client(LSPS2ClientEvent::OpeningParametersReady {
 				request_id,
 				counterparty_node_id,
 				opening_fee_params_menu,
@@ -763,7 +858,7 @@ where
 					);
 				}
 			},
-			Event::LSPS2Client(LSPS2ClientEvent::InvoiceParametersReady {
+			LiquidityEvent::LSPS2Client(LSPS2ClientEvent::InvoiceParametersReady {
 				request_id,
 				counterparty_node_id,
 				intercept_scid,
@@ -903,7 +998,7 @@ where
 			return Err(Error::LiquidityRequestFailed);
 		}
 
-		let order_params = OrderParameters {
+		let order_params = LSPS1OrderParams {
 			lsp_balance_sat,
 			client_balance_sat,
 			required_channel_confirmations: lsp_limits.min_required_channel_confirmations,
@@ -952,7 +1047,7 @@ where
 	}
 
 	pub(crate) async fn lsps1_check_order_status(
-		&self, order_id: OrderId,
+		&self, order_id: LSPS1OrderId,
 	) -> Result<LSPS1OrderStatus, Error> {
 		let lsps1_client = self.lsps1_client.as_ref().ok_or(Error::LiquiditySourceUnavailable)?;
 		let client_handler = self.liquidity_manager.lsps1_client_handler().ok_or_else(|| {
@@ -987,7 +1082,7 @@ where
 
 	pub(crate) async fn lsps2_receive_to_jit_channel(
 		&self, amount_msat: u64, description: &Bolt11InvoiceDescription, expiry_secs: u32,
-		max_total_lsp_fee_limit_msat: Option<u64>,
+		max_total_lsp_fee_limit_msat: Option<u64>, payment_hash: Option<PaymentHash>,
 	) -> Result<(Bolt11Invoice, u64), Error> {
 		let fee_response = self.lsps2_request_opening_fee_params().await?;
 
@@ -1039,6 +1134,7 @@ where
 			Some(amount_msat),
 			description,
 			expiry_secs,
+			payment_hash,
 		)?;
 
 		log_info!(self.logger, "JIT-channel invoice created: {}", invoice);
@@ -1047,7 +1143,7 @@ where
 
 	pub(crate) async fn lsps2_receive_variable_amount_to_jit_channel(
 		&self, description: &Bolt11InvoiceDescription, expiry_secs: u32,
-		max_proportional_lsp_fee_limit_ppm_msat: Option<u64>,
+		max_proportional_lsp_fee_limit_ppm_msat: Option<u64>, payment_hash: Option<PaymentHash>,
 	) -> Result<(Bolt11Invoice, u64), Error> {
 		let fee_response = self.lsps2_request_opening_fee_params().await?;
 
@@ -1081,8 +1177,13 @@ where
 		);
 
 		let buy_response = self.lsps2_send_buy_request(None, min_opening_params).await?;
-		let invoice =
-			self.lsps2_create_jit_invoice(buy_response, None, description, expiry_secs)?;
+		let invoice = self.lsps2_create_jit_invoice(
+			buy_response,
+			None,
+			description,
+			expiry_secs,
+			payment_hash,
+		)?;
 
 		log_info!(self.logger, "JIT-channel invoice created: {}", invoice);
 		Ok((invoice, min_prop_fee_ppm_msat))
@@ -1120,7 +1221,7 @@ where
 	}
 
 	async fn lsps2_send_buy_request(
-		&self, amount_msat: Option<u64>, opening_fee_params: OpeningFeeParams,
+		&self, amount_msat: Option<u64>, opening_fee_params: LSPS2OpeningFeeParams,
 	) -> Result<LSPS2BuyResponse, Error> {
 		let lsps2_client = self.lsps2_client.as_ref().ok_or(Error::LiquiditySourceUnavailable)?;
 
@@ -1165,18 +1266,36 @@ where
 	fn lsps2_create_jit_invoice(
 		&self, buy_response: LSPS2BuyResponse, amount_msat: Option<u64>,
 		description: &Bolt11InvoiceDescription, expiry_secs: u32,
+		payment_hash: Option<PaymentHash>,
 	) -> Result<Bolt11Invoice, Error> {
 		let lsps2_client = self.lsps2_client.as_ref().ok_or(Error::LiquiditySourceUnavailable)?;
 
 		// LSPS2 requires min_final_cltv_expiry_delta to be at least 2 more than usual.
 		let min_final_cltv_expiry_delta = MIN_FINAL_CLTV_EXPIRY_DELTA + 2;
-		let (payment_hash, payment_secret) = self
-			.channel_manager
-			.create_inbound_payment(None, expiry_secs, Some(min_final_cltv_expiry_delta))
-			.map_err(|e| {
-				log_error!(self.logger, "Failed to register inbound payment: {:?}", e);
-				Error::InvoiceCreationFailed
-			})?;
+		let (payment_hash, payment_secret) = match payment_hash {
+			Some(payment_hash) => {
+				let payment_secret = self
+					.channel_manager
+					.create_inbound_payment_for_hash(
+						payment_hash,
+						None,
+						expiry_secs,
+						Some(min_final_cltv_expiry_delta),
+					)
+					.map_err(|e| {
+						log_error!(self.logger, "Failed to register inbound payment: {:?}", e);
+						Error::InvoiceCreationFailed
+					})?;
+				(payment_hash, payment_secret)
+			},
+			None => self
+				.channel_manager
+				.create_inbound_payment(None, expiry_secs, Some(min_final_cltv_expiry_delta))
+				.map_err(|e| {
+					log_error!(self.logger, "Failed to register inbound payment: {:?}", e);
+					Error::InvoiceCreationFailed
+				})?,
+		};
 
 		let route_hint = RouteHint(vec![RouteHintHop {
 			src_node_id: lsps2_client.lsp_node_id,
@@ -1217,15 +1336,14 @@ where
 			})
 	}
 
-	pub(crate) fn handle_channel_ready(
+	pub(crate) async fn handle_channel_ready(
 		&self, user_channel_id: u128, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
 	) {
 		if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
-			if let Err(e) = lsps2_service_handler.channel_ready(
-				user_channel_id,
-				channel_id,
-				counterparty_node_id,
-			) {
+			if let Err(e) = lsps2_service_handler
+				.channel_ready(user_channel_id, channel_id, counterparty_node_id)
+				.await
+			{
 				log_error!(
 					self.logger,
 					"LSPS2 service failed to handle ChannelReady event: {:?}",
@@ -1235,17 +1353,20 @@ where
 		}
 	}
 
-	pub(crate) fn handle_htlc_intercepted(
+	pub(crate) async fn handle_htlc_intercepted(
 		&self, intercept_scid: u64, intercept_id: InterceptId, expected_outbound_amount_msat: u64,
 		payment_hash: PaymentHash,
 	) {
 		if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
-			if let Err(e) = lsps2_service_handler.htlc_intercepted(
-				intercept_scid,
-				intercept_id,
-				expected_outbound_amount_msat,
-				payment_hash,
-			) {
+			if let Err(e) = lsps2_service_handler
+				.htlc_intercepted(
+					intercept_scid,
+					intercept_id,
+					expected_outbound_amount_msat,
+					payment_hash,
+				)
+				.await
+			{
 				log_error!(
 					self.logger,
 					"LSPS2 service failed to handle HTLCIntercepted event: {:?}",
@@ -1255,9 +1376,9 @@ where
 		}
 	}
 
-	pub(crate) fn handle_htlc_handling_failed(&self, failed_next_destination: HTLCDestination) {
+	pub(crate) async fn handle_htlc_handling_failed(&self, failure_type: HTLCHandlingFailureType) {
 		if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
-			if let Err(e) = lsps2_service_handler.htlc_handling_failed(failed_next_destination) {
+			if let Err(e) = lsps2_service_handler.htlc_handling_failed(failure_type).await {
 				log_error!(
 					self.logger,
 					"LSPS2 service failed to handle HTLCHandlingFailed event: {:?}",
@@ -1267,10 +1388,14 @@ where
 		}
 	}
 
-	pub(crate) fn handle_payment_forwarded(&self, next_channel_id: Option<ChannelId>) {
+	pub(crate) async fn handle_payment_forwarded(
+		&self, next_channel_id: Option<ChannelId>, skimmed_fee_msat: u64,
+	) {
 		if let Some(next_channel_id) = next_channel_id {
 			if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
-				if let Err(e) = lsps2_service_handler.payment_forwarded(next_channel_id) {
+				if let Err(e) =
+					lsps2_service_handler.payment_forwarded(next_channel_id, skimmed_fee_msat).await
+				{
 					log_error!(
 						self.logger,
 						"LSPS2 service failed to handle PaymentForwarded: {:?}",
@@ -1291,82 +1416,24 @@ pub(crate) struct LSPS1OpeningParamsResponse {
 #[derive(Debug, Clone)]
 pub struct LSPS1OrderStatus {
 	/// The id of the channel order.
-	pub order_id: OrderId,
+	pub order_id: LSPS1OrderId,
 	/// The parameters of channel order.
-	pub order_params: OrderParameters,
+	pub order_params: LSPS1OrderParams,
 	/// Contains details about how to pay for the order.
-	pub payment_options: PaymentInfo,
+	pub payment_options: LSPS1PaymentInfo,
 	/// Contains information about the channel state.
-	pub channel_state: Option<ChannelInfo>,
+	pub channel_state: Option<LSPS1ChannelInfo>,
 }
 
 #[cfg(not(feature = "uniffi"))]
-type PaymentInfo = lightning_liquidity::lsps1::msgs::PaymentInfo;
-
-/// Details regarding how to pay for an order.
-#[cfg(feature = "uniffi")]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PaymentInfo {
-	/// A Lightning payment using BOLT 11.
-	pub bolt11: Option<crate::uniffi_types::Bolt11PaymentInfo>,
-	/// An onchain payment.
-	pub onchain: Option<OnchainPaymentInfo>,
-}
+type LSPS1PaymentInfo = lightning_liquidity::lsps1::msgs::LSPS1PaymentInfo;
 
 #[cfg(feature = "uniffi")]
-impl From<lightning_liquidity::lsps1::msgs::PaymentInfo> for PaymentInfo {
-	fn from(value: lightning_liquidity::lsps1::msgs::PaymentInfo) -> Self {
-		PaymentInfo {
-			bolt11: value.bolt11.map(|b| b.into()),
-			onchain: value.onchain.map(|o| o.into()),
-		}
-	}
-}
-
-/// An onchain payment.
-#[cfg(feature = "uniffi")]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OnchainPaymentInfo {
-	/// Indicates the current state of the payment.
-	pub state: lightning_liquidity::lsps1::msgs::PaymentState,
-	/// The datetime when the payment option expires.
-	pub expires_at: chrono::DateTime<chrono::Utc>,
-	/// The total fee the LSP will charge to open this channel in satoshi.
-	pub fee_total_sat: u64,
-	/// The amount the client needs to pay to have the requested channel openend.
-	pub order_total_sat: u64,
-	/// An on-chain address the client can send [`Self::order_total_sat`] to to have the channel
-	/// opened.
-	pub address: bitcoin::Address,
-	/// The minimum number of block confirmations that are required for the on-chain payment to be
-	/// considered confirmed.
-	pub min_onchain_payment_confirmations: Option<u16>,
-	/// The minimum fee rate for the on-chain payment in case the client wants the payment to be
-	/// confirmed without a confirmation.
-	pub min_fee_for_0conf: Arc<bitcoin::FeeRate>,
-	/// The address where the LSP will send the funds if the order fails.
-	pub refund_onchain_address: Option<bitcoin::Address>,
-}
-
-#[cfg(feature = "uniffi")]
-impl From<lightning_liquidity::lsps1::msgs::OnchainPaymentInfo> for OnchainPaymentInfo {
-	fn from(value: lightning_liquidity::lsps1::msgs::OnchainPaymentInfo) -> Self {
-		Self {
-			state: value.state,
-			expires_at: value.expires_at,
-			fee_total_sat: value.fee_total_sat,
-			order_total_sat: value.order_total_sat,
-			address: value.address,
-			min_onchain_payment_confirmations: value.min_onchain_payment_confirmations,
-			min_fee_for_0conf: Arc::new(value.min_fee_for_0conf),
-			refund_onchain_address: value.refund_onchain_address,
-		}
-	}
-}
+type LSPS1PaymentInfo = crate::ffi::LSPS1PaymentInfo;
 
 #[derive(Debug, Clone)]
 pub(crate) struct LSPS2FeeResponse {
-	opening_fee_params_menu: Vec<OpeningFeeParams>,
+	opening_fee_params_menu: Vec<LSPS2OpeningFeeParams>,
 }
 
 #[derive(Debug, Clone)]
@@ -1388,7 +1455,7 @@ pub(crate) struct LSPS2BuyResponse {
 /// [`Bolt11Payment::receive_via_jit_channel`]: crate::payment::Bolt11Payment::receive_via_jit_channel
 #[derive(Clone)]
 pub struct LSPS1Liquidity {
-	runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>,
+	runtime: Arc<Runtime>,
 	wallet: Arc<Wallet>,
 	connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
 	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
@@ -1397,7 +1464,7 @@ pub struct LSPS1Liquidity {
 
 impl LSPS1Liquidity {
 	pub(crate) fn new(
-		runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>, wallet: Arc<Wallet>,
+		runtime: Arc<Runtime>, wallet: Arc<Wallet>,
 		connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
 		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>, logger: Arc<Logger>,
 	) -> Self {
@@ -1418,19 +1485,14 @@ impl LSPS1Liquidity {
 		let (lsp_node_id, lsp_address) =
 			liquidity_source.get_lsps1_lsp_details().ok_or(Error::LiquiditySourceUnavailable)?;
 
-		let rt_lock = self.runtime.read().unwrap();
-		let runtime = rt_lock.as_ref().unwrap();
-
 		let con_node_id = lsp_node_id;
 		let con_addr = lsp_address.clone();
 		let con_cm = Arc::clone(&self.connection_manager);
 
 		// We need to use our main runtime here as a local runtime might not be around to poll
 		// connection futures going forward.
-		tokio::task::block_in_place(move || {
-			runtime.block_on(async move {
-				con_cm.connect_peer_if_necessary(con_node_id, con_addr).await
-			})
+		self.runtime.block_on(async move {
+			con_cm.connect_peer_if_necessary(con_node_id, con_addr).await
 		})?;
 
 		log_info!(self.logger, "Connected to LSP {}@{}. ", lsp_node_id, lsp_address);
@@ -1438,33 +1500,28 @@ impl LSPS1Liquidity {
 		let refund_address = self.wallet.get_new_address()?;
 
 		let liquidity_source = Arc::clone(&liquidity_source);
-		let response = tokio::task::block_in_place(move || {
-			runtime.block_on(async move {
-				liquidity_source
-					.lsps1_request_channel(
-						lsp_balance_sat,
-						client_balance_sat,
-						channel_expiry_blocks,
-						announce_channel,
-						refund_address,
-					)
-					.await
-			})
+		let response = self.runtime.block_on(async move {
+			liquidity_source
+				.lsps1_request_channel(
+					lsp_balance_sat,
+					client_balance_sat,
+					channel_expiry_blocks,
+					announce_channel,
+					refund_address,
+				)
+				.await
 		})?;
 
 		Ok(response)
 	}
 
 	/// Connects to the configured LSP and checks for the status of a previously-placed order.
-	pub fn check_order_status(&self, order_id: OrderId) -> Result<LSPS1OrderStatus, Error> {
+	pub fn check_order_status(&self, order_id: LSPS1OrderId) -> Result<LSPS1OrderStatus, Error> {
 		let liquidity_source =
 			self.liquidity_source.as_ref().ok_or(Error::LiquiditySourceUnavailable)?;
 
 		let (lsp_node_id, lsp_address) =
 			liquidity_source.get_lsps1_lsp_details().ok_or(Error::LiquiditySourceUnavailable)?;
-
-		let rt_lock = self.runtime.read().unwrap();
-		let runtime = rt_lock.as_ref().unwrap();
 
 		let con_node_id = lsp_node_id;
 		let con_addr = lsp_address.clone();
@@ -1472,18 +1529,14 @@ impl LSPS1Liquidity {
 
 		// We need to use our main runtime here as a local runtime might not be around to poll
 		// connection futures going forward.
-		tokio::task::block_in_place(move || {
-			runtime.block_on(async move {
-				con_cm.connect_peer_if_necessary(con_node_id, con_addr).await
-			})
+		self.runtime.block_on(async move {
+			con_cm.connect_peer_if_necessary(con_node_id, con_addr).await
 		})?;
 
 		let liquidity_source = Arc::clone(&liquidity_source);
-		let response = tokio::task::block_in_place(move || {
-			runtime
-				.block_on(async move { liquidity_source.lsps1_check_order_status(order_id).await })
-		})?;
-
+		let response = self
+			.runtime
+			.block_on(async move { liquidity_source.lsps1_check_order_status(order_id).await })?;
 		Ok(response)
 	}
 }
