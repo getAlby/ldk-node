@@ -383,14 +383,6 @@ pub struct ChannelDetails {
 
 impl From<LdkChannelDetails> for ChannelDetails {
 	fn from(value: LdkChannelDetails) -> Self {
-		// let channel_type = value.channel_type.map(|t| {
-		// 	if t.requires_anchors_zero_fee_htlc_tx() {
-		// 		ChannelType::Anchors
-		// 	} else {
-		// 		ChannelType::StaticRemoteKey
-		// 	}
-		// });
-
 		ChannelDetails {
 			channel_id: value.channel_id,
 			counterparty_node_id: value.counterparty.node_id,

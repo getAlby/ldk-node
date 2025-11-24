@@ -40,35 +40,6 @@ use crate::io::{
 	EVENT_QUEUE_PERSISTENCE_KEY, EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
 	EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
 };
-/*use crate::logger::{log_debug, log_error, log_info, LdkLogger};
-
-use lightning::events::bump_transaction::BumpTransactionEvent;
-use lightning::events::{ClosureReason, PaymentPurpose, ReplayEvent};
-use lightning::events::{Event as LdkEvent, PaymentFailureReason};
-use lightning::impl_writeable_tlv_based_enum;
-use lightning::ln::channelmanager::PaymentId;
-use lightning::ln::types::ChannelId;
-use lightning::routing::gossip::NodeId;
-use lightning::util::errors::APIError;
-use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
-
-use lightning_types::payment::{PaymentHash, PaymentPreimage};
-
-use lightning_liquidity::lsps2::utils::compute_opening_fee;
-
-use bitcoin::blockdata::locktime::absolute::LockTime;
-use bitcoin::secp256k1::PublicKey;
-use bitcoin::{Amount, OutPoint};
-
-use rand::{thread_rng, Rng};
-
-use core::future::Future;
-use core::task::{Poll, Waker};
-use std::collections::VecDeque;
-use std::ops::Deref;
-use std::str::FromStr;
-use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::Duration;*/
 use crate::liquidity::LiquiditySource;
 use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;

@@ -8,42 +8,6 @@
 mod bitcoind;
 mod electrum;
 
-/*use crate::chain::bitcoind_rpc::{
-	BitcoindRpcClient, BoundedHeaderCache, ChainListener, FeeRateEstimationMode,
-};
-use crate::chain::electrum::ElectrumRuntimeClient;
-use crate::config::{
-	BackgroundSyncConfig, Config, ElectrumSyncConfig, EsploraSyncConfig, BDK_CLIENT_CONCURRENCY,
-	BDK_CLIENT_STOP_GAP, BDK_WALLET_SYNC_TIMEOUT_SECS, FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS,
-	LDK_WALLET_SYNC_TIMEOUT_SECS, RESOLVED_CHANNEL_MONITOR_ARCHIVAL_INTERVAL,
-	TX_BROADCAST_TIMEOUT_SECS, WALLET_SYNC_INTERVAL_MINIMUM_SECS,
-};
-use crate::fee_estimator::{
-	apply_post_estimation_adjustments, get_all_conf_targets, get_num_block_defaults_for_target,
-	ConfirmationTarget, OnchainFeeEstimator,
-};
-use crate::io::utils::write_node_metrics;
-use crate::logger::{log_bytes, log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
-use crate::types::{Broadcaster, ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
-use crate::{Error, NodeMetrics};
-
-use lightning::chain::chaininterface::ConfirmationTarget as LdkConfirmationTarget;
-use lightning::chain::{Confirm, Filter, Listen, WatchedOutput};
-use lightning::util::ser::Writeable;
-
-use lightning_transaction_sync::EsploraSyncClient;
-
-use lightning_block_sync::gossip::UtxoSource;
-use lightning_block_sync::init::{synchronize_listeners, validate_best_block_header};
-use lightning_block_sync::poll::{ChainPoller, ChainTip, ValidatedBlockHeader};
-use lightning_block_sync::SpvClient;
-
-use bdk_esplora::EsploraAsyncExt;
-use bdk_wallet::Update as BdkUpdate;
-
-use esplora_client::AsyncClient as EsploraAsyncClient;
-
-use bitcoin::{FeeRate, Network, Script, ScriptBuf, Txid};*/
 mod esplora;
 
 use std::collections::HashMap;

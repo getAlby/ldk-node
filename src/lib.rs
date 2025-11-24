@@ -118,16 +118,8 @@ pub use builder::BuildError;
 pub use builder::NodeBuilder as Builder;
 use chain::ChainSource;
 use config::{
-	//default_user_config, may_announce_channel, ChannelConfig, Config,
-	//BACKGROUND_TASK_SHUTDOWN_TIMEOUT_SECS, LDK_EVENT_HANDLER_SHUTDOWN_TIMEOUT_SECS,
-	default_user_config,
-	may_announce_channel,
-	AsyncPaymentsRole,
-	ChannelConfig,
-	Config,
-	NODE_ANN_BCAST_INTERVAL,
-	PEER_RECONNECTION_INTERVAL,
-	RGS_SYNC_INTERVAL,
+	default_user_config, may_announce_channel, AsyncPaymentsRole, ChannelConfig, Config,
+	NODE_ANN_BCAST_INTERVAL, PEER_RECONNECTION_INTERVAL, RGS_SYNC_INTERVAL,
 };
 use connection::ConnectionManager;
 pub use error::Error as NodeError;

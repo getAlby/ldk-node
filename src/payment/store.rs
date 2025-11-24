@@ -48,12 +48,6 @@ pub struct PaymentDetails {
 	pub status: PaymentStatus,
 	/// The timestamp, in seconds since start of the UNIX epoch, when this entry was last updated.
 	pub latest_update_timestamp: u64,
-
-	// Old Alby fields - duplicates of new LDK fields
-	/*/// Alby: Last update timestamp, as seconds since Unix epoch. TODO: remove and use latest_update_timestamp
-	pub last_update: u64,
-	/// Alby: Fee paid. TODO: remove and use fee_paid_msat
-	pub fee_msat: Option<u64>,*/
 	/// Alby: Payment creation timestamp, as seconds since Unix epoch.
 	pub created_at: u64,
 }
