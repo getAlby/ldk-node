@@ -171,7 +171,8 @@ pub use {
 
 use crate::scoring::setup_background_pathfinding_scores_sync;
 
-use crate::types::{KeyValue, MigrateStorage, ResetState, TlvEntry};
+use crate::types::KeyValue;
+pub use crate::types::{MigrateStorage, ResetState, TlvEntry};
 
 #[cfg(feature = "uniffi")]
 uniffi::include_scaffolding!("ldk_node");
