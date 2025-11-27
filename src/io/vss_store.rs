@@ -684,11 +684,12 @@ impl VssStoreInner {
 			self.build_obfuscated_key(&primary_namespace, &secondary_namespace, &key);
 
 		let key_value = KeyValue { key: obfuscated_key, version: -1, value: vec![] };
-		if lazy {
+		// Alby: disable lazy deletes (can cause a conflict error in the VSS server)
+		/*if lazy {
 			let mut pending_lazy_deletes = self.pending_lazy_deletes.lock().unwrap();
 			pending_lazy_deletes.push(key_value);
 			return Ok(());
-		}
+		}*/
 
 		self.execute_locked_write(inner_lock_ref, locking_key, version, async move || {
 			let request =
@@ -791,7 +792,12 @@ fn retry_policy() -> CustomRetryPolicy {
 		.with_max_total_delay(Duration::from_secs(180))
 		.with_max_jitter(Duration::from_millis(100))
 		.skip_retry_on_error(Box::new(|e: &VssError| {
-			matches!(e, VssError::NoSuchKeyError(..) | VssError::InvalidRequestError(..))
+			matches!(
+				e,
+				VssError::NoSuchKeyError(..)
+					| VssError::InvalidRequestError(..)
+					| VssError::ConflictError(..)
+			)
 		}) as _)
 }
 
