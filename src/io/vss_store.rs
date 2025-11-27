@@ -791,12 +791,7 @@ fn retry_policy() -> CustomRetryPolicy {
 		.with_max_total_delay(Duration::from_secs(180))
 		.with_max_jitter(Duration::from_millis(100))
 		.skip_retry_on_error(Box::new(|e: &VssError| {
-			matches!(
-				e,
-				VssError::NoSuchKeyError(..)
-					| VssError::InvalidRequestError(..)
-					| VssError::ConflictError(..)
-			)
+			matches!(e, VssError::NoSuchKeyError(..) | VssError::InvalidRequestError(..))
 		}) as _)
 }
 
