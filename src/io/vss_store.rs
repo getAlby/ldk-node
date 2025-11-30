@@ -685,11 +685,11 @@ impl VssStoreInner {
 
 		let key_value = KeyValue { key: obfuscated_key, version: -1, value: vec![] };
 		// Alby: disable lazy deletes (can cause a conflict error in the VSS server)
-		/*if lazy {
-			let mut pending_lazy_deletes = self.pending_lazy_deletes.lock().unwrap();
-			pending_lazy_deletes.push(key_value);
-			return Ok(());
-		}*/
+		// if lazy {
+		// let mut pending_lazy_deletes = self.pending_lazy_deletes.lock().unwrap();
+		// pending_lazy_deletes.push(key_value);
+		// return Ok(());
+		// }
 
 		self.execute_locked_write(inner_lock_ref, locking_key, version, async move || {
 			let request =

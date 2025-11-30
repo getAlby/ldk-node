@@ -153,7 +153,6 @@ use payment::{
 	UnifiedQrPayment,
 };
 use peer_store::{PeerInfo, PeerStore};
-
 use rand::Rng;
 use runtime::Runtime;
 use types::{
@@ -170,7 +169,6 @@ pub use {
 };
 
 use crate::scoring::setup_background_pathfinding_scores_sync;
-
 use crate::types::KeyValue;
 pub use crate::types::{MigrateStorage, ResetState, TlvEntry};
 
