@@ -112,8 +112,23 @@ impl VssStore {
 		let key_obfuscator = KeyObfuscator::new(obfuscation_master_key);
 
 		let sync_retry_policy = retry_policy();
-		let blocking_client = VssClient::new_with_headers(
+		/*let blocking_client = VssClient::new_with_headers(
 			base_url.clone(),
+			sync_retry_policy,
+			header_provider.clone(),
+		);*/
+		// Alby: use longer timeouts for VSS (rather than default 10 seconds)
+		const ALBY_REQWEST_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+		let client_with_custom_timeouts = reqwest::Client::builder()
+			.timeout(ALBY_REQWEST_CLIENT_TIMEOUT)
+			.connect_timeout(ALBY_REQWEST_CLIENT_TIMEOUT)
+			.read_timeout(ALBY_REQWEST_CLIENT_TIMEOUT)
+			.build()
+			.unwrap();
+
+		let blocking_client = VssClient::from_client_and_headers(
+			base_url.clone(),
+			client_with_custom_timeouts,
 			sync_retry_policy,
 			header_provider.clone(),
 		);
