@@ -779,6 +779,10 @@ impl NodeBuilder {
 			Some(MigrateStorage::VSS) => true,
 			_ => false,
 		};
+
+		let mut current_file_path = PathBuf::new();
+		let mut backup_file_path = PathBuf::new();
+
 		if migrate_to_vss {
 			// rename and read existing file
 			let storage_dir_path = config.storage_dir_path.clone();
@@ -789,10 +793,9 @@ impl NodeBuilder {
 
 			// Create a backup filename based on the current date and time
 			let backup_filename = format!("ldk_node_data_{}.sqlite", timestamp);
-			let current_file_path =
+			current_file_path =
 				Path::new(storage_dir_path.as_str()).join(io::sqlite_store::SQLITE_DB_FILE_NAME);
-			let backup_file_path =
-				Path::new(storage_dir_path.as_str()).join(backup_filename.clone());
+			backup_file_path = Path::new(storage_dir_path.as_str()).join(backup_filename.clone());
 
 			// Rename the file, so that we start fresh
 			log_info!(
@@ -813,9 +816,52 @@ impl NodeBuilder {
 					Some(io::sqlite_store::KV_TABLE_NAME.to_string()),
 					None,
 				)
-				.map_err(|_| BuildError::KVStoreSetupFailed)?,
+				.map_err(|e| {
+					log_error!(logger, "Failed to open backup file for migration: {}", e);
+					// Restore the backup file (no secondary file created yet, so just rename back)
+					if let Err(restore_err) = fs::rename(&backup_file_path, &current_file_path) {
+						log_error!(
+							logger,
+							"CRITICAL: Failed to restore LDK-Node SQLite backup file: {}. Your data is still in: {}",
+							restore_err,
+							backup_file_path.to_str().expect("Invalid backup file path")
+						);
+					} else {
+						log_info!(logger, "Successfully restored original sqlite database");
+					}
+					BuildError::KVStoreSetupFailed
+				})?,
 			) as Arc<SqliteStore>);
 		}
+
+		// Helper function to restore the backup if migration fails
+		let restore_backup = || {
+			log_error!(
+				logger,
+				"VSS migration failed, restoring backup from: {}",
+				backup_file_path.to_str().expect("Invalid backup file path")
+			);
+
+			// Remove the newly created sqlite file so we can restore the backup
+			if let Err(remove_err) = fs::remove_file(&current_file_path) {
+				log_error!(
+					logger,
+					"Failed to remove newly created secondary sqlite file: {}",
+					remove_err
+				);
+			}
+
+			if let Err(restore_err) = fs::rename(&backup_file_path, &current_file_path) {
+				log_error!(
+					logger,
+					"CRITICAL: Failed to restore LDK-Node SQLite backup file: {}. Your data is still in: {}",
+					restore_err,
+					backup_file_path.to_str().expect("Invalid backup file path")
+				);
+			} else {
+				log_info!(logger, "Successfully restored original sqlite database");
+			}
+		};
 
 		// Alby: use a secondary KV store for non-essential data (not needed by VSS)
 		let storage_dir_path = config.storage_dir_path.clone();
@@ -829,78 +875,100 @@ impl NodeBuilder {
 				Some(io::sqlite_store::KV_TABLE_NAME.to_string()),
 				Some(sql_store_config),
 			)
-			.map_err(|_| BuildError::KVStoreSetupFailed)?,
+			.map_err(|e| {
+				log_error!(logger, "Failed to setup secondary KV store: {}", e);
+				if migrate_to_vss {
+					restore_backup();
+				}
+				BuildError::KVStoreSetupFailed
+			})?,
 		) as Arc<DynStore>;
 
 		let vss_store =
 			VssStore::new(vss_url, store_id, vss_seed_bytes, header_provider, secondary_kv_store)
 				.map_err(|e| {
 				log_error!(logger, "Failed to setup VssStore: {}", e);
+				if migrate_to_vss {
+					restore_backup();
+				}
 				BuildError::KVStoreSetupFailed
 			})?;
 
 		// Alby: migrate from backed up sqlite store to VSS
 		if let Some(from_store) = migrate_from_store {
 			log_info!(logger, "Migrating to VSS - migrating store data");
-			// write essential data from old store to new store
 
-			let migrate_kv = |primary_namespace: &str,
-			                  secondary_namespace: &str,
-			                  key: &str|
-			 -> Result<(), BuildError> {
-				log_info!(
-					logger,
-					"Migrating key {} {} {}",
-					primary_namespace,
-					secondary_namespace,
-					key
-				);
-				let value =
-					from_store.read(primary_namespace, secondary_namespace, key).map_err(|e| {
-						log_error!(logger, "Failed to fetch value: {}", e);
+			// Perform migration and restore backup if it fails
+			let migration_result = (|| -> Result<(), BuildError> {
+				// write essential data from old store to new store
+
+				let migrate_kv = |primary_namespace: &str,
+				                  secondary_namespace: &str,
+				                  key: &str|
+				 -> Result<(), BuildError> {
+					log_info!(
+						logger,
+						"Migrating key {} {} {}",
+						primary_namespace,
+						secondary_namespace,
+						key
+					);
+					let value = from_store
+						.read(primary_namespace, secondary_namespace, key)
+						.map_err(|e| {
+							log_error!(logger, "Failed to fetch value: {}", e);
+							BuildError::KVStoreSetupFailed
+						})?;
+					// write value to new store
+					vss_store.write(primary_namespace, secondary_namespace, key, value).map_err(
+						|e| {
+							log_error!(logger, "Failed to migrate value: {}", e);
+							BuildError::KVStoreSetupFailed
+						},
+					)?;
+					Ok(())
+				};
+
+				let channel_monitor_keys = from_store
+					.list(
+						CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+						CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+					)
+					.map_err(|e| {
+						log_error!(logger, "Failed to fetch channel_monitor_keys: {}", e);
 						BuildError::KVStoreSetupFailed
 					})?;
-				// write value to new store
-				vss_store.write(primary_namespace, secondary_namespace, key, value).map_err(
-					|e| {
-						log_error!(logger, "Failed to migrate value: {}", e);
-						BuildError::KVStoreSetupFailed
-					},
-				)?;
-				Ok(())
-			};
 
-			let channel_monitor_keys = from_store
-				.list(
-					CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
-					CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
-				)
-				.map_err(|e| {
-					log_error!(logger, "Failed to fetch channel_monitor_keys: {}", e);
-					BuildError::KVStoreSetupFailed
-				})?;
+				for key in channel_monitor_keys {
+					migrate_kv(
+						CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+						CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+						key.as_str(),
+					)?;
+				}
 
-			for key in channel_monitor_keys {
+				// migrate channel manager
 				migrate_kv(
-					CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
-					CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
-					key.as_str(),
+					CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+					CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+					CHANNEL_MANAGER_PERSISTENCE_KEY,
 				)?;
+
+				// migrate peers
+				migrate_kv(
+					PEER_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+					PEER_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+					PEER_INFO_PERSISTENCE_KEY,
+				)?;
+
+				Ok(())
+			})();
+
+			// If migration failed, restore the backup
+			if let Err(e) = migration_result {
+				restore_backup();
+				return Err(e);
 			}
-
-			// migrate channel manager
-			migrate_kv(
-				CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
-				CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
-				CHANNEL_MANAGER_PERSISTENCE_KEY,
-			)?;
-
-			// migrate peers
-			migrate_kv(
-				PEER_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
-				PEER_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
-				PEER_INFO_PERSISTENCE_KEY,
-			)?;
 
 			log_info!(logger, "Migration to VSS completed successfully");
 		}
