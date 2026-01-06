@@ -174,7 +174,7 @@ interface Node {
 	sequence<PaymentDetails> list_payments();
 	sequence<PeerDetails> list_peers();
 	sequence<ChannelDetails> list_channels();
-	sequence<ChannelMonitorSizeInfo> list_channel_sizes();
+	sequence<ChannelMonitorSizeInfo> list_channel_monitor_sizes();
 	NetworkGraph network_graph();
 	string sign_message([ByRef]sequence<u8> msg);
 	boolean verify_signature([ByRef]sequence<u8> msg, [ByRef]string sig, [ByRef]PublicKey pkey);

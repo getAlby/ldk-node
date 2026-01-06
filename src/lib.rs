@@ -1054,7 +1054,7 @@ impl Node {
 	/// Alby: Retrieve a list of channel monitor sizes (how big each channel monitor is when serialized)
 	/// we use this to be able to notify users when their channel monitors are getting too large
 	/// (a risk that reading/writing to VSS could start taking too long)
-	pub fn list_channel_sizes(&self) -> Vec<ChannelMonitorSizeInfo> {
+	pub fn list_channel_monitor_sizes(&self) -> Vec<ChannelMonitorSizeInfo> {
 		use lightning::util::ser::Writeable;
 		use std::ops::Deref;
 
