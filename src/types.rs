@@ -452,6 +452,17 @@ pub struct PeerDetails {
 	pub is_connected: bool,
 }
 
+/// Information about the size of a channel monitor.
+///
+/// This includes the channel ID and the serialized size in bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelMonitorSizeInfo {
+	/// The channel ID.
+	pub channel_id: ChannelId,
+	/// The size of the channel monitor in bytes when serialized.
+	pub size_bytes: u64,
+}
+
 /// Custom TLV entry. (Alby version)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlvEntry {

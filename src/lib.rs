@@ -161,8 +161,8 @@ use types::{
 	OnionMessenger, PaymentStore, PeerManager, Router, Scorer, Sweeper, Wallet,
 };
 pub use types::{
-	ChannelDetails, CustomTlvRecord, DynStore, PeerDetails, SyncAndAsyncKVStore, UserChannelId,
-	WordCount,
+	ChannelDetails, ChannelMonitorSizeInfo, CustomTlvRecord, DynStore, PeerDetails,
+	SyncAndAsyncKVStore, UserChannelId, WordCount,
 };
 pub use {
 	bip39, bitcoin, lightning, lightning_invoice, lightning_liquidity, lightning_types, tokio,
@@ -1049,6 +1049,31 @@ impl Node {
 	/// Retrieve a list of known channels.
 	pub fn list_channels(&self) -> Vec<ChannelDetails> {
 		self.channel_manager.list_channels().into_iter().map(|c| c.into()).collect()
+	}
+
+	/// Alby: Retrieve a list of channel monitor sizes (how big each channel monitor is when serialized)
+	/// we use this to be able to notify users when their channel monitors are getting too large
+	/// (a risk that reading/writing to VSS could start taking too long)
+	pub fn list_channel_sizes(&self) -> Vec<ChannelMonitorSizeInfo> {
+		use lightning::util::ser::Writeable;
+		use std::ops::Deref;
+
+		let mut channel_sizes = Vec::new();
+
+		for channel_id in self.chain_monitor.list_monitors() {
+			if let Ok(monitor) = self.chain_monitor.get_monitor(channel_id) {
+				// Serialize the monitor to count bytes
+				let mut size_counter = Vec::new();
+				if monitor.deref().write(&mut size_counter).is_ok() {
+					channel_sizes.push(ChannelMonitorSizeInfo {
+						channel_id,
+						size_bytes: size_counter.len() as u64,
+					});
+				}
+			}
+		}
+
+		channel_sizes
 	}
 
 	/// Connect to a node on the peer-to-peer network.
