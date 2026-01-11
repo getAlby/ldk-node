@@ -153,7 +153,6 @@ use payment::{
 	UnifiedQrPayment,
 };
 use peer_store::{PeerInfo, PeerStore};
-
 use rand::Rng;
 use runtime::Runtime;
 use types::{
@@ -170,7 +169,6 @@ pub use {
 };
 
 use crate::scoring::setup_background_pathfinding_scores_sync;
-
 use crate::types::KeyValue;
 pub use crate::types::{MigrateStorage, ResetState, TlvEntry};
 
@@ -1055,8 +1053,9 @@ impl Node {
 	/// we use this to be able to notify users when their channel monitors are getting too large
 	/// (a risk that reading/writing to VSS could start taking too long)
 	pub fn list_channel_monitor_sizes(&self) -> Vec<ChannelMonitorSizeInfo> {
-		use lightning::util::ser::Writeable;
 		use std::ops::Deref;
+
+		use lightning::util::ser::Writeable;
 
 		let mut channel_sizes = Vec::new();
 
