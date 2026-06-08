@@ -38,6 +38,7 @@ pub use lightning_liquidity::lsps0::ser::LSPSDateTime;
 pub use lightning_liquidity::lsps1::msgs::{
 	LSPS1ChannelInfo, LSPS1OrderId, LSPS1OrderParams, LSPS1PaymentState,
 };
+// Alby: expose the LSPS2 opening fee menu item type over UniFFI.
 pub use lightning_liquidity::lsps2::msgs::LSPS2OpeningFeeParams;
 pub use lightning_types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
 pub use lightning_types::string::UntrustedString;
@@ -50,6 +51,7 @@ pub use crate::config::{
 };
 use crate::error::Error;
 pub use crate::graph::{ChannelInfo, ChannelUpdateInfo, NodeAnnouncementInfo, NodeInfo};
+// Alby: expose the LSPS2 get_info response over UniFFI.
 pub use crate::liquidity::{LSPS1OrderStatus, LSPS2GetInfoResponse, LSPS2ServiceConfig};
 pub use crate::logger::{LogLevel, LogRecord, LogWriter};
 pub use crate::payment::store::{

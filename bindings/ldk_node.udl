@@ -1,6 +1,7 @@
 namespace ldk_node {
 	Mnemonic generate_entropy_mnemonic(WordCount? word_count);
 	Config default_config();
+	// Alby: compute LSPS2 opening fees for an LSP-provided offer.
 	u64? lsps2_compute_opening_fee_msat(u64 payment_size_msat, LSPS2OpeningFeeParams opening_fee_params);
 };
 
@@ -146,6 +147,7 @@ interface Node {
 	OnchainPayment onchain_payment();
 	UnifiedQrPayment unified_qr_payment();
 	LSPS1Liquidity lsps1_liquidity();
+	// Alby: expose the LSPS2 opening fee menu so Hub can surface JIT limits to users.
 	LSPS2Liquidity lsps2_liquidity();
 	[Throws=NodeError]
 	void connect(PublicKey node_id, SocketAddress address, boolean persist);
@@ -297,6 +299,7 @@ interface LSPS1Liquidity {
 
 interface LSPS2Liquidity {
 	[Throws=NodeError]
+	// Alby: fetch the LSP's LSPS2 opening fee menu.
 	LSPS2GetInfoResponse request_opening_fee_params();
 };
 
@@ -312,6 +315,7 @@ dictionary LSPS2OpeningFeeParams {
 };
 
 dictionary LSPS2GetInfoResponse {
+	// Alby: return the raw LSPS2 fee menu so clients can read min_payment_size_msat.
 	sequence<LSPS2OpeningFeeParams> opening_fee_params_menu;
 };
 

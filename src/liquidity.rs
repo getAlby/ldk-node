@@ -1433,11 +1433,14 @@ type LSPS1PaymentInfo = crate::ffi::LSPS1PaymentInfo;
 
 /// Response to an LSPS2 `get_info` request.
 ///
+/// Alby: surfaced so Hub can read the LSP's min_payment_size_msat and other JIT limits.
+///
 /// See [bLIP-52 / LSPS2] for more information.
 ///
 /// [bLIP-52 / LSPS2]: https://github.com/lightning/blips/blob/master/blip-0052.md
 #[derive(Debug, Clone)]
 pub struct LSPS2GetInfoResponse {
+	/// Alby: the raw LSPS2 fee menu returned by the LSP.
 	/// The set of opening fee parameters offered by the LSP.
 	pub opening_fee_params_menu: Vec<LSPS2OpeningFeeParams>,
 }
@@ -1551,6 +1554,9 @@ impl LSPS1Liquidity {
 ///
 /// Should be retrieved by calling [`Node::lsps2_liquidity`].
 ///
+/// Alby: this provides direct access to the LSP's opening fee menu without forcing invoice
+/// creation first.
+///
 /// To open [bLIP-52 / LSPS2] JIT channels, please refer to
 /// [`Bolt11Payment::receive_via_jit_channel`].
 ///
@@ -1576,6 +1582,8 @@ impl LSPS2Liquidity {
 	}
 
 	/// Connects to the configured LSP and requests its current JIT channel opening fee parameters.
+	///
+	/// Alby: Hub uses this to display the effective LSPS2 payment-size limits to users.
 	///
 	/// This issues an `lsps2.get_info` request and returns the LSP's `opening_fee_params_menu`.
 	pub fn request_opening_fee_params(&self) -> Result<LSPS2GetInfoResponse, Error> {
@@ -1605,6 +1613,8 @@ impl LSPS2Liquidity {
 }
 
 /// Computes the LSPS2 opening fee for a given payment size and fee parameters.
+///
+/// Alby: exported for clients that want to estimate the fee for a selected LSPS2 offer.
 ///
 /// See [bLIP-52 / LSPS2] for more information.
 ///

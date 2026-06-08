@@ -132,6 +132,7 @@ use ffi::*;
 use gossip::GossipSource;
 use graph::NetworkGraph;
 pub use io::utils::generate_entropy_mnemonic;
+// Alby: export LSPS2 opening fee computation for local fee estimation in Hub.
 pub use liquidity::lsps2_compute_opening_fee_msat;
 use io::utils::write_node_metrics;
 use lightning::chain::BestBlock;
@@ -1048,6 +1049,7 @@ impl Node {
 
 	/// Returns a liquidity handler allowing to query [bLIP-52 / LSPS2] JIT channel parameters.
 	///
+	/// Alby: expose the LSPS2 opening fee menu so Hub can surface min/max payment sizes.
 	/// [bLIP-52 / LSPS2]: https://github.com/lightning/blips/blob/master/blip-0052.md
 	#[cfg(not(feature = "uniffi"))]
 	pub fn lsps2_liquidity(&self) -> LSPS2Liquidity {
@@ -1061,6 +1063,7 @@ impl Node {
 
 	/// Returns a liquidity handler allowing to query [bLIP-52 / LSPS2] JIT channel parameters.
 	///
+	/// Alby: expose the LSPS2 opening fee menu so Hub can surface min/max payment sizes.
 	/// [bLIP-52 / LSPS2]: https://github.com/lightning/blips/blob/master/blip-0052.md
 	#[cfg(feature = "uniffi")]
 	pub fn lsps2_liquidity(&self) -> Arc<LSPS2Liquidity> {
