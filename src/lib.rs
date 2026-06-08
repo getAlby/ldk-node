@@ -132,6 +132,8 @@ use ffi::*;
 use gossip::GossipSource;
 use graph::NetworkGraph;
 pub use io::utils::generate_entropy_mnemonic;
+// Alby: export LSPS2 opening fee computation for local fee estimation in Hub.
+pub use liquidity::lsps2_compute_opening_fee_msat;
 use io::utils::write_node_metrics;
 use lightning::chain::BestBlock;
 use lightning::events::bump_transaction::{Input, Wallet as LdkWallet};
@@ -144,7 +146,7 @@ use lightning::ln::msgs::SocketAddress;
 use lightning::routing::gossip::NodeAlias;
 use lightning::util::persist::KVStoreSync;
 use lightning_background_processor::process_events_async;
-use liquidity::{LSPS1Liquidity, LiquiditySource};
+use liquidity::{LSPS1Liquidity, LSPS2Liquidity, LiquiditySource};
 use logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use payment::asynchronous::static_invoice_store::StaticInvoiceStore;
@@ -1039,6 +1041,34 @@ impl Node {
 		Arc::new(LSPS1Liquidity::new(
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.wallet),
+			Arc::clone(&self.connection_manager),
+			self.liquidity_source.clone(),
+			Arc::clone(&self.logger),
+		))
+	}
+
+	/// Returns a liquidity handler allowing to query [bLIP-52 / LSPS2] JIT channel parameters.
+	///
+	/// Alby: expose the LSPS2 opening fee menu so Hub can surface min/max payment sizes.
+	/// [bLIP-52 / LSPS2]: https://github.com/lightning/blips/blob/master/blip-0052.md
+	#[cfg(not(feature = "uniffi"))]
+	pub fn lsps2_liquidity(&self) -> LSPS2Liquidity {
+		LSPS2Liquidity::new(
+			Arc::clone(&self.runtime),
+			Arc::clone(&self.connection_manager),
+			self.liquidity_source.clone(),
+			Arc::clone(&self.logger),
+		)
+	}
+
+	/// Returns a liquidity handler allowing to query [bLIP-52 / LSPS2] JIT channel parameters.
+	///
+	/// Alby: expose the LSPS2 opening fee menu so Hub can surface min/max payment sizes.
+	/// [bLIP-52 / LSPS2]: https://github.com/lightning/blips/blob/master/blip-0052.md
+	#[cfg(feature = "uniffi")]
+	pub fn lsps2_liquidity(&self) -> Arc<LSPS2Liquidity> {
+		Arc::new(LSPS2Liquidity::new(
+			Arc::clone(&self.runtime),
 			Arc::clone(&self.connection_manager),
 			self.liquidity_source.clone(),
 			Arc::clone(&self.logger),
