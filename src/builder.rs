@@ -255,6 +255,7 @@ impl std::error::Error for BuildError {}
 #[derive(Debug)]
 pub struct NodeBuilder {
 	config: Config,
+	tor_proxy_address: Option<core::net::SocketAddr>,
 	entropy_source_config: Option<EntropySourceConfig>,
 	chain_data_source_config: Option<ChainDataSourceConfig>,
 	gossip_source_config: Option<GossipSourceConfig>,
@@ -289,6 +290,7 @@ impl NodeBuilder {
 		let pathfinding_scores_sync_config = None;
 		Self {
 			config,
+			tor_proxy_address: None,
 			entropy_source_config,
 			chain_data_source_config,
 			gossip_source_config,
@@ -591,6 +593,16 @@ impl NodeBuilder {
 
 		self.config.announcement_addresses = Some(announcement_addresses);
 		Ok(self)
+	}
+
+	/// Set the address which [`Node`] will use as a Tor proxy to connect to peer OnionV3 addresses.
+	///
+	/// **Note**: If unset, connecting to peer OnionV3 addresses will fail.
+	///
+	/// [`tor_proxy_address`]: Config::tor_proxy_address
+	pub fn set_tor_proxy_address(&mut self, tor_proxy_address: core::net::SocketAddr) -> &mut Self {
+		self.tor_proxy_address = Some(tor_proxy_address);
+		self
 	}
 
 	/// Sets the node alias that will be used when broadcasting announcements to the gossip
@@ -985,6 +997,7 @@ impl NodeBuilder {
 			logger,
 			Arc::new(vss_store),
 			self.reset_state,
+			self.tor_proxy_address,
 		)
 	}
 
@@ -1037,6 +1050,7 @@ impl NodeBuilder {
 			logger,
 			kv_store,
 			self.reset_state,
+			self.tor_proxy_address,
 		)
 	}
 }
@@ -1304,6 +1318,19 @@ impl ArcedNodeBuilder {
 		self.inner.write().unwrap().set_announcement_addresses(announcement_addresses).map(|_| ())
 	}
 
+	/// Set the address which [`Node`] will use as a Tor proxy to connect to peer OnionV3 addresses.
+	///
+	/// The address should be in `host:port` format (e.g., `"127.0.0.1:9050"`).
+	///
+	/// **Note**: If unset, connecting to peer OnionV3 addresses will fail.
+	pub fn set_tor_proxy_address(&self, tor_proxy_address: String) -> Result<(), BuildError> {
+		let addr: core::net::SocketAddr = tor_proxy_address
+			.parse()
+			.map_err(|_| BuildError::InvalidListeningAddresses)?;
+		self.inner.write().unwrap().set_tor_proxy_address(addr);
+		Ok(())
+	}
+
 	/// Sets the node alias that will be used when broadcasting announcements to the gossip
 	/// network.
 	///
@@ -1416,6 +1443,7 @@ fn build_with_store_internal(
 	pathfinding_scores_sync_config: Option<&PathfindingScoresSyncConfig>,
 	async_payments_role: Option<AsyncPaymentsRole>, seed_bytes: [u8; 64], runtime: Arc<Runtime>,
 	logger: Arc<Logger>, kv_store: Arc<DynStore>, reset_state: Option<ResetState>,
+	tor_proxy_address: Option<core::net::SocketAddr>,
 ) -> Result<Node, BuildError> {
 	optionally_install_rustls_cryptoprovider();
 
@@ -2023,8 +2051,12 @@ fn build_with_store_internal(
 		Arc::clone(&runtime),
 	);
 
-	let connection_manager =
-		Arc::new(ConnectionManager::new(Arc::clone(&peer_manager), Arc::clone(&logger)));
+	let connection_manager = Arc::new(ConnectionManager::new(
+		Arc::clone(&peer_manager),
+		tor_proxy_address,
+		ephemeral_bytes,
+		Arc::clone(&logger),
+	));
 
 	let output_sweeper = match io::utils::read_output_sweeper(
 		Arc::clone(&tx_broadcaster),
