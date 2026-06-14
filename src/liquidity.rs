@@ -1573,10 +1573,8 @@ pub struct LSPS2Liquidity {
 
 impl LSPS2Liquidity {
 	pub(crate) fn new(
-		runtime: Arc<Runtime>,
-		connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
-		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
-		logger: Arc<Logger>,
+		runtime: Arc<Runtime>, connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
+		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>, logger: Arc<Logger>,
 	) -> Self {
 		Self { runtime, connection_manager, liquidity_source, logger }
 	}
@@ -1606,9 +1604,8 @@ impl LSPS2Liquidity {
 		log_info!(self.logger, "Connected to LSPS2 LSP {}@{}. ", lsp_node_id, lsp_address);
 
 		let liquidity_source = Arc::clone(&liquidity_source);
-		self.runtime.block_on(async move {
-			liquidity_source.lsps2_request_opening_fee_params().await
-		})
+		self.runtime
+			.block_on(async move { liquidity_source.lsps2_request_opening_fee_params().await })
 	}
 }
 
