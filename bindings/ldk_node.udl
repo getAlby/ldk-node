@@ -133,8 +133,8 @@ interface Node {
 	Config config();
 	Event? next_event();
 	Event wait_next_event();
-	// [Async]
-	// Event next_event_async();
+	[Async]
+	Event next_event_async();
 	[Throws=NodeError]
 	void event_handled();
 	PublicKey node_id();
