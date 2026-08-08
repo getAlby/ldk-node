@@ -5,8 +5,6 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use crate::types::TlvEntry;
-
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bitcoin::{BlockHash, Txid};
@@ -23,6 +21,7 @@ use lightning_types::string::UntrustedString;
 
 use crate::data_store::{StorableObject, StorableObjectId, StorableObjectUpdate};
 use crate::hex_utils;
+use crate::types::TlvEntry;
 
 /// Represents a payment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -570,7 +569,7 @@ pub(crate) struct PaymentDetailsUpdate {
 	pub counterparty_skimmed_fee_msat: Option<Option<u64>>,
 	pub direction: Option<PaymentDirection>,
 	pub status: Option<PaymentStatus>,
-	//pub fee_msat: Option<Option<u64>>, // old Alby field
+	// pub fee_msat: Option<Option<u64>>, // old Alby field
 	pub confirmation_status: Option<ConfirmationStatus>,
 }
 
