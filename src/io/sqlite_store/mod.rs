@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use lightning::io;
-
 use lightning::util::persist::{
 	KVStore, KVStoreSync, NETWORK_GRAPH_PERSISTENCE_KEY,
 	NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE, NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,

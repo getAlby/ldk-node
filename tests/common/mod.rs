@@ -100,7 +100,7 @@ macro_rules! expect_channel_ready_event {
 pub(crate) use expect_channel_ready_event;
 
 macro_rules! expect_splice_pending_event {
-	($node: expr, $counterparty_node_id: expr) => {{
+	($node:expr, $counterparty_node_id:expr) => {{
 		match $node.next_event_async().await {
 			ref e @ Event::SplicePending { new_funding_txo, counterparty_node_id, .. } => {
 				println!("{} got event {:?}", $node.node_id(), e);
@@ -1305,7 +1305,8 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 		+ invoice_amount_3_msat
 		+ determined_amount_msat
 		+ keysend_amount_msat)
-		/ 1000 - splice_out_sat;
+		/ 1000
+		- splice_out_sat;
 	let node_a_upper_bound_sat =
 		(premine_amount_sat - funding_amount_sat) + (funding_amount_sat - sum_of_all_payments_sat);
 	let node_a_lower_bound_sat = node_a_upper_bound_sat - onchain_fee_buffer_sat;
