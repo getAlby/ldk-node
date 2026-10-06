@@ -199,6 +199,8 @@ interface Bolt11Payment {
 	[Throws=NodeError]
 	PaymentId send([ByRef]Bolt11Invoice invoice, RouteParametersConfig? route_parameters);
 	[Throws=NodeError]
+	PaymentId send_with_first_hop([ByRef]Bolt11Invoice invoice, [ByRef]UserChannelId first_hop_user_channel_id, RouteParametersConfig? route_parameters);
+	[Throws=NodeError]
 	PaymentId send_using_amount([ByRef]Bolt11Invoice invoice, u64 amount_msat, RouteParametersConfig? route_parameters);
 	[Throws=NodeError]
 	void send_probes([ByRef]Bolt11Invoice invoice, RouteParametersConfig? route_parameters);
@@ -435,7 +437,7 @@ interface Event {
 	PaymentSuccessful(PaymentId? payment_id, PaymentHash payment_hash, PaymentPreimage? payment_preimage, u64? fee_paid_msat);
 	PaymentFailed(PaymentId? payment_id, PaymentHash? payment_hash, PaymentFailureReason? reason);
 	PaymentReceived(PaymentId? payment_id, PaymentHash payment_hash, u64 amount_msat, sequence<CustomTlvRecord> custom_records);
-	PaymentClaimable(PaymentId payment_id, PaymentHash payment_hash, u64 claimable_amount_msat, u32? claim_deadline, sequence<CustomTlvRecord> custom_records);
+	PaymentClaimable(PaymentId payment_id, PaymentHash payment_hash, u64 claimable_amount_msat, u32? claim_deadline, sequence<CustomTlvRecord> custom_records, sequence<ReceivingChannel> receiving_channels);
 	PaymentForwarded(ChannelId prev_channel_id, ChannelId next_channel_id, UserChannelId?
 	prev_user_channel_id, UserChannelId? next_user_channel_id, PublicKey? prev_node_id, PublicKey? next_node_id, u64? total_fee_earned_msat, u64? skimmed_fee_msat, boolean claim_from_onchain_tx, u64? outbound_amount_forwarded_msat);
 	ChannelPending(ChannelId channel_id, UserChannelId user_channel_id, ChannelId former_temporary_channel_id, PublicKey counterparty_node_id, OutPoint funding_txo);
@@ -443,6 +445,11 @@ interface Event {
 	ChannelClosed(ChannelId channel_id, UserChannelId user_channel_id, PublicKey? counterparty_node_id, ClosureReason? reason);
 	SplicePending(ChannelId channel_id, UserChannelId user_channel_id, PublicKey counterparty_node_id, OutPoint new_funding_txo);
 	SpliceFailed(ChannelId channel_id, UserChannelId user_channel_id, PublicKey counterparty_node_id, OutPoint? abandoned_funding_txo);
+};
+
+dictionary ReceivingChannel {
+	ChannelId channel_id;
+	UserChannelId? user_channel_id;
 };
 
 enum PaymentFailureReason {

@@ -14,9 +14,12 @@ use std::sync::{Arc, RwLock};
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use lightning::ln::channelmanager::{
-	Bolt11InvoiceParameters, Bolt11PaymentError, PaymentId, Retry, RetryableSendFailure,
+	Bolt11InvoiceParameters, Bolt11PaymentError, PaymentId, RecipientOnionFields, Retry,
+	RetryableSendFailure,
 };
-use lightning::routing::router::{PaymentParameters, RouteParameters, RouteParametersConfig};
+use lightning::routing::router::{
+	PaymentParameters, RouteParameters, RouteParametersConfig, Router as LdkRouter,
+};
 use lightning_invoice::{
 	Bolt11Invoice as LdkBolt11Invoice, Bolt11InvoiceDescription as LdkBolt11InvoiceDescription,
 };
@@ -35,7 +38,8 @@ use crate::payment::store::{
 };
 use crate::peer_store::{PeerInfo, PeerStore};
 use crate::runtime::Runtime;
-use crate::types::{ChannelManager, PaymentStore};
+use crate::types::{ChannelManager, PaymentStore, Router};
+use crate::UserChannelId;
 
 #[cfg(not(feature = "uniffi"))]
 type Bolt11Invoice = LdkBolt11Invoice;
@@ -56,6 +60,7 @@ type Bolt11InvoiceDescription = crate::ffi::Bolt11InvoiceDescription;
 pub struct Bolt11Payment {
 	runtime: Arc<Runtime>,
 	channel_manager: Arc<ChannelManager>,
+	router: Arc<Router>,
 	connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
 	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 	payment_store: Arc<PaymentStore>,
@@ -67,7 +72,7 @@ pub struct Bolt11Payment {
 
 impl Bolt11Payment {
 	pub(crate) fn new(
-		runtime: Arc<Runtime>, channel_manager: Arc<ChannelManager>,
+		runtime: Arc<Runtime>, channel_manager: Arc<ChannelManager>, router: Arc<Router>,
 		connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
 		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<Arc<Logger>>>,
@@ -76,6 +81,7 @@ impl Bolt11Payment {
 		Self {
 			runtime,
 			channel_manager,
+			router,
 			connection_manager,
 			liquidity_source,
 			payment_store,
@@ -84,6 +90,146 @@ impl Bolt11Payment {
 			is_running,
 			logger,
 		}
+	}
+
+	/// Send a fixed-amount invoice using exactly one local channel as the first hop.
+	///
+	/// Route construction receives only the selected channel. The resulting route is verified before
+	/// it is handed to [`ChannelManager::send_payment_with_route`], which disables automatic retries.
+	/// A failed attempt therefore never falls back to another local channel.
+	pub fn send_with_first_hop(
+		&self, invoice: &Bolt11Invoice, first_hop_user_channel_id: &UserChannelId,
+		route_parameters: Option<RouteParametersConfig>,
+	) -> Result<PaymentId, Error> {
+		if !*self.is_running.read().unwrap() {
+			return Err(Error::NotRunning);
+		}
+
+		let invoice = maybe_deref(invoice);
+		let amount_msat = invoice.amount_milli_satoshis().ok_or_else(|| {
+			log_error!(
+				self.logger,
+				"Pinned first-hop payments require a fixed-amount invoice."
+			);
+			Error::InvalidInvoice
+		})?;
+		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
+		let payment_id = PaymentId(invoice.payment_hash().to_byte_array());
+
+		if let Some(payment) = self.payment_store.get(&payment_id) {
+			if payment.status == PaymentStatus::Pending
+				|| payment.status == PaymentStatus::Succeeded
+			{
+				log_error!(self.logger, "Payment error: an invoice must not be paid twice.");
+				return Err(Error::DuplicatePayment);
+			}
+		}
+
+		let usable_channels = self.channel_manager.list_usable_channels();
+		let selected_channel = usable_channels
+			.iter()
+			.find(|channel| channel.user_channel_id == first_hop_user_channel_id.0)
+			.ok_or_else(|| {
+				log_error!(
+					self.logger,
+					"Selected first-hop channel {} is not usable.",
+					first_hop_user_channel_id
+				);
+				Error::InvalidChannelId
+			})?;
+
+		let route_parameters =
+			route_parameters.or(self.config.route_parameters).unwrap_or_default();
+		let payment_params = PaymentParameters::from_bolt11_invoice(invoice);
+		let mut route_params =
+			RouteParameters::from_payment_params_and_value(payment_params, amount_msat);
+		route_params.max_total_routing_fee_msat = route_parameters.max_total_routing_fee_msat;
+		route_params.payment_params.max_total_cltv_expiry_delta =
+			route_parameters.max_total_cltv_expiry_delta;
+		route_params.payment_params.max_path_count = route_parameters.max_path_count;
+		route_params.payment_params.max_channel_saturation_power_of_half =
+			route_parameters.max_channel_saturation_power_of_half;
+
+		let first_hops = [selected_channel];
+		let route = self
+			.router
+			.find_route_with_id(
+				&self.channel_manager.get_our_node_id(),
+				&route_params,
+				Some(&first_hops),
+				self.channel_manager.compute_inflight_htlcs(),
+				payment_hash,
+				payment_id,
+			)
+			.map_err(|e| {
+				log_error!(
+					self.logger,
+					"Failed to find a route through selected first-hop channel {}: {}",
+					first_hop_user_channel_id,
+					e
+				);
+				Error::PaymentSendingFailed
+			})?;
+
+		let route_uses_only_selected_first_hop = !route.paths.is_empty()
+			&& route.paths.iter().all(|path| {
+				path.hops.first().map_or(false, |first_hop| {
+					first_hop.pubkey == selected_channel.counterparty.node_id
+						&& (selected_channel.short_channel_id == Some(first_hop.short_channel_id)
+							|| selected_channel.outbound_scid_alias
+								== Some(first_hop.short_channel_id))
+				})
+			});
+		if !route_uses_only_selected_first_hop {
+			log_error!(
+				self.logger,
+				"Refused route that did not exclusively use selected first-hop channel {}.",
+				first_hop_user_channel_id
+			);
+			return Err(Error::PaymentSendingFailed);
+		}
+
+		let mut recipient_onion = RecipientOnionFields::secret_only(*invoice.payment_secret());
+		recipient_onion.payment_metadata = invoice.payment_metadata().cloned();
+
+		self.channel_manager
+			.send_payment_with_route(route, payment_hash, recipient_onion, payment_id)
+			.map_err(|e| {
+				log_error!(
+					self.logger,
+					"Failed to send payment through selected first-hop channel {}: {:?}",
+					first_hop_user_channel_id,
+					e
+				);
+				match e {
+					RetryableSendFailure::DuplicatePayment => Error::DuplicatePayment,
+					_ => Error::PaymentSendingFailed,
+				}
+			})?;
+
+		let kind = PaymentKind::Bolt11 {
+			hash: payment_hash,
+			preimage: None,
+			secret: Some(*invoice.payment_secret()),
+			bolt11_invoice: Some(invoice.to_string()),
+		};
+		let payment = PaymentDetails::new(
+			payment_id,
+			kind,
+			Some(amount_msat),
+			None,
+			PaymentDirection::Outbound,
+			PaymentStatus::Pending,
+		);
+		self.payment_store.insert(payment)?;
+
+		log_info!(
+			self.logger,
+			"Initiated sending {}msat through selected first-hop channel {}",
+			amount_msat,
+			first_hop_user_channel_id
+		);
+		Ok(payment_id)
 	}
 
 	/// Send a payment given an invoice.

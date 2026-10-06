@@ -18,7 +18,7 @@ use lightning::events::bump_transaction::BumpTransactionEvent;
 use lightning::events::{
 	ClosureReason, Event as LdkEvent, PaymentFailureReason, PaymentPurpose, ReplayEvent,
 };
-use lightning::impl_writeable_tlv_based_enum;
+use lightning::{impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
 use lightning::ln::channelmanager::{FailureCode, PaymentId};
 use lightning::ln::types::ChannelId;
 use lightning::routing::gossip::NodeId;
@@ -55,6 +55,20 @@ use crate::{
 	hex_utils, BumpTransactionEventHandler, ChannelManager, Error, Graph, PeerInfo, PeerStore,
 	UserChannelId,
 };
+
+/// Identifies one local channel over which a claimable payment part arrived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivingChannel {
+	/// The protocol-level channel identifier.
+	pub channel_id: ChannelId,
+	/// The stable user channel identifier, when LDK can associate one with the HTLC.
+	pub user_channel_id: Option<UserChannelId>,
+}
+
+impl_writeable_tlv_based!(ReceivingChannel, {
+	(0, channel_id, required),
+	(2, user_channel_id, option),
+});
 
 /// An event emitted by [`Node`], which should be handled by the user.
 ///
@@ -186,6 +200,11 @@ pub enum Event {
 		claim_deadline: Option<u32>,
 		/// Custom TLV records attached to the payment
 		custom_records: Vec<CustomTlvRecord>,
+		/// The local channels over which the claimable payment parts arrived.
+		///
+		/// All entries must match an application's required incoming channel before it claims a
+		/// channel-constrained payment.
+		receiving_channels: Vec<ReceivingChannel>,
 	},
 	/// A channel has been created and is pending confirmation on-chain.
 	ChannelPending {
@@ -303,6 +322,7 @@ impl_writeable_tlv_based_enum!(Event,
 		(4, claimable_amount_msat, required),
 		(6, claim_deadline, option),
 		(7, custom_records, optional_vec),
+		(8, receiving_channels, optional_vec),
 	},
 	(7, PaymentForwarded) => {
 		(0, prev_channel_id, required),
@@ -643,6 +663,7 @@ where
 				claim_deadline,
 				onion_fields,
 				counterparty_skimmed_fee_msat,
+				receiving_channel_ids,
 				..
 			} => {
 				let payment_id = PaymentId(payment_hash.0);
@@ -770,6 +791,13 @@ where
 									claimable_amount_msat: amount_msat,
 									claim_deadline,
 									custom_records,
+									receiving_channels: receiving_channel_ids
+										.iter()
+										.map(|(channel_id, user_channel_id)| ReceivingChannel {
+											channel_id: *channel_id,
+											user_channel_id: user_channel_id.map(UserChannelId),
+										})
+										.collect(),
 								};
 								match self.event_queue.add_event(event).await {
 									Ok(_) => return Ok(()),
@@ -1930,6 +1958,37 @@ mod tests {
 
 		event_queue.event_handled().await.unwrap();
 		assert_eq!(event_queue.next_event(), None);
+	}
+
+	#[tokio::test]
+	async fn payment_claimable_receiving_channels_persist() {
+		let store: Arc<DynStore> = Arc::new(InMemoryStore::new());
+		let logger = Arc::new(TestLogger::new());
+		let event_queue = Arc::new(EventQueue::new(Arc::clone(&store), Arc::clone(&logger)));
+		let expected_event = Event::PaymentClaimable {
+			payment_id: PaymentId([1u8; 32]),
+			payment_hash: PaymentHash([2u8; 32]),
+			claimable_amount_msat: 500_000,
+			claim_deadline: Some(840_000),
+			custom_records: Vec::new(),
+			receiving_channels: vec![ReceivingChannel {
+				channel_id: ChannelId([3u8; 32]),
+				user_channel_id: Some(UserChannelId(4)),
+			}],
+		};
+
+		event_queue.add_event(expected_event.clone()).await.unwrap();
+		let persisted_bytes = KVStore::read(
+			&*store,
+			EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_KEY,
+		)
+		.await
+		.unwrap();
+		let deser_event_queue =
+			EventQueue::read(&mut &persisted_bytes[..], (Arc::clone(&store), logger)).unwrap();
+		assert_eq!(deser_event_queue.next_event(), Some(expected_event));
 	}
 
 	#[tokio::test]

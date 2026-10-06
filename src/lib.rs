@@ -124,7 +124,7 @@ use config::{
 use connection::ConnectionManager;
 pub use error::Error as NodeError;
 use error::Error;
-pub use event::Event;
+pub use event::{Event, ReceivingChannel};
 use event::{EventHandler, EventQueue};
 use fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
 #[cfg(feature = "uniffi")]
@@ -877,6 +877,7 @@ impl Node {
 		Bolt11Payment::new(
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
+			Arc::clone(&self._router),
 			Arc::clone(&self.connection_manager),
 			self.liquidity_source.clone(),
 			Arc::clone(&self.payment_store),
@@ -895,6 +896,7 @@ impl Node {
 		Arc::new(Bolt11Payment::new(
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
+			Arc::clone(&self._router),
 			Arc::clone(&self.connection_manager),
 			self.liquidity_source.clone(),
 			Arc::clone(&self.payment_store),
