@@ -77,6 +77,46 @@ enum ChannelConstrainedClaimDecision {
 	Fail,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelConstrainedClaimOutcome {
+	NotConstrained,
+	Claimed,
+	Failed,
+}
+
+trait ChannelConstrainedClaimActions {
+	fn claim(&self, preimage: PaymentPreimage);
+	fn fail(&self, payment_hash: &PaymentHash);
+}
+
+impl ChannelConstrainedClaimActions for ChannelManager {
+	fn claim(&self, preimage: PaymentPreimage) {
+		self.claim_funds(preimage);
+	}
+
+	fn fail(&self, payment_hash: &PaymentHash) {
+		self.fail_htlc_backwards(payment_hash);
+	}
+}
+
+fn apply_channel_constrained_claim_decision<A: ChannelConstrainedClaimActions>(
+	actions: &A, payment_hash: &PaymentHash, decision: ChannelConstrainedClaimDecision,
+) -> ChannelConstrainedClaimOutcome {
+	match decision {
+		ChannelConstrainedClaimDecision::NotConstrained => {
+			ChannelConstrainedClaimOutcome::NotConstrained
+		},
+		ChannelConstrainedClaimDecision::Claim(preimage) => {
+			actions.claim(preimage);
+			ChannelConstrainedClaimOutcome::Claimed
+		},
+		ChannelConstrainedClaimDecision::Fail => {
+			actions.fail(payment_hash);
+			ChannelConstrainedClaimOutcome::Failed
+		},
+	}
+}
+
 fn channel_constrained_claim_decision(
 	kind: &PaymentKind, status: PaymentStatus, expected_amount_msat: Option<u64>,
 	actual_amount_msat: u64, receiving_channel_ids: &[(ChannelId, Option<u128>)],
@@ -835,27 +875,30 @@ where
 					// claim only after every MPP part is proven to have arrived through the exact
 					// required local channel. Apply the constraint even if ChannelManager unexpectedly
 					// knows the preimage.
-					match channel_constrained_claim_decision(
+					let claim_decision = channel_constrained_claim_decision(
 						&info.kind,
 						info.status,
 						info.amount_msat,
 						amount_msat,
 						receiving_channel_ids.as_slice(),
+					);
+					match apply_channel_constrained_claim_decision(
+						&*self.channel_manager,
+						&payment_hash,
+						claim_decision,
 					) {
-						ChannelConstrainedClaimDecision::Claim(preimage) => {
-							self.channel_manager.claim_funds(preimage);
+						ChannelConstrainedClaimOutcome::Claimed => {
 							log_info!(
 								self.logger,
 								"Claimed channel-constrained inbound payment through its required channel."
 							);
 							return Ok(());
 						},
-						ChannelConstrainedClaimDecision::Fail => {
+						ChannelConstrainedClaimOutcome::Failed => {
 							log_info!(
 								self.logger,
 								"Refused channel-constrained inbound payment because its amount, preimage state, or receiving channels did not match the persisted constraint."
 							);
-							self.channel_manager.fail_htlc_backwards(&payment_hash);
 							let update = PaymentDetailsUpdate {
 								status: Some(PaymentStatus::Failed),
 								..PaymentDetailsUpdate::new(payment_id)
@@ -872,7 +915,7 @@ where
 								},
 							}
 						},
-						ChannelConstrainedClaimDecision::NotConstrained => {},
+						ChannelConstrainedClaimOutcome::NotConstrained => {},
 					}
 
 					// If this is known by the store but ChannelManager doesn't know the preimage,
@@ -2033,6 +2076,22 @@ mod tests {
 	use super::*;
 	use crate::io::test_utils::InMemoryStore;
 
+	#[derive(Default)]
+	struct TestChannelConstrainedClaimActions {
+		claimed: Mutex<Vec<PaymentPreimage>>,
+		failed: Mutex<Vec<PaymentHash>>,
+	}
+
+	impl ChannelConstrainedClaimActions for TestChannelConstrainedClaimActions {
+		fn claim(&self, preimage: PaymentPreimage) {
+			self.claimed.lock().unwrap().push(preimage);
+		}
+
+		fn fail(&self, payment_hash: &PaymentHash) {
+			self.failed.lock().unwrap().push(*payment_hash);
+		}
+	}
+
 	#[tokio::test]
 	async fn event_queue_persistence() {
 		let store: Arc<DynStore> = Arc::new(InMemoryStore::new());
@@ -2227,6 +2286,46 @@ mod tests {
 			),
 			ChannelConstrainedClaimDecision::NotConstrained
 		);
+	}
+
+	#[test]
+	fn channel_constrained_claim_dispatches_exactly_one_action() {
+		let actions = TestChannelConstrainedClaimActions::default();
+		let payment_hash = PaymentHash([2u8; 32]);
+		let preimage = PaymentPreimage([3u8; 32]);
+
+		assert_eq!(
+			apply_channel_constrained_claim_decision(
+				&actions,
+				&payment_hash,
+				ChannelConstrainedClaimDecision::Claim(preimage),
+			),
+			ChannelConstrainedClaimOutcome::Claimed
+		);
+		assert_eq!(*actions.claimed.lock().unwrap(), vec![preimage]);
+		assert!(actions.failed.lock().unwrap().is_empty());
+
+		assert_eq!(
+			apply_channel_constrained_claim_decision(
+				&actions,
+				&payment_hash,
+				ChannelConstrainedClaimDecision::Fail,
+			),
+			ChannelConstrainedClaimOutcome::Failed
+		);
+		assert_eq!(*actions.claimed.lock().unwrap(), vec![preimage]);
+		assert_eq!(*actions.failed.lock().unwrap(), vec![payment_hash]);
+
+		assert_eq!(
+			apply_channel_constrained_claim_decision(
+				&actions,
+				&payment_hash,
+				ChannelConstrainedClaimDecision::NotConstrained,
+			),
+			ChannelConstrainedClaimOutcome::NotConstrained
+		);
+		assert_eq!(*actions.claimed.lock().unwrap(), vec![preimage]);
+		assert_eq!(*actions.failed.lock().unwrap(), vec![payment_hash]);
 	}
 
 	#[tokio::test]
