@@ -2087,8 +2087,9 @@ mod tests {
 		_reload_node, claim_payment_along_route, create_announced_chan_between_nodes,
 		create_announced_chan_between_nodes_with_value, create_chanmon_cfgs, create_network,
 		create_node_cfgs, create_node_chanmgrs, do_claim_payment_along_route,
-		fail_payment_along_route, pass_along_path, remove_first_msg_event_to_node,
-		test_default_channel_config, ClaimAlongRouteArgs, SendEvent, TEST_FINAL_CLTV,
+		fail_payment_along_route, pass_along_path, reconnect_nodes, remove_first_msg_event_to_node,
+		test_default_channel_config, ClaimAlongRouteArgs, ReconnectArgs, SendEvent,
+		TEST_FINAL_CLTV,
 	};
 	use lightning::ln::msgs::{BaseMessageHandler, ChannelMessageHandler, MessageSendEvent};
 	use lightning::reload_node;
@@ -2982,11 +2983,14 @@ mod tests {
 	}
 
 	#[test]
-	fn real_prepared_circular_payment_returns_through_exact_channel() {
+	fn real_prepared_circular_payment_recovers_in_flight_on_exact_channels() {
 		let chanmon_cfgs = create_chanmon_cfgs(3);
 		let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+		let persister;
+		let new_chain_monitor;
 		let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
-		let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+		let node_0_deserialized;
+		let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
 		let (_, _, first_channel_id, _) =
 			create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100_000, 0);
 		let (_, _, middle_channel_id, _) =
@@ -3033,8 +3037,8 @@ mod tests {
 			Vec::new(),
 			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
 			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
-			kv_store,
-			logger,
+			Arc::clone(&kv_store),
+			Arc::clone(&logger),
 		);
 		payment_store
 			.insert(crate::payment::prepared_circular_payment_details(
@@ -3124,27 +3128,87 @@ mod tests {
 			nodes[0].node.get_our_node_id(),
 		)
 		.unwrap();
+		let duplicate_execution = execution.clone();
+		let send_count = AtomicU16::new(0);
 		assert_eq!(
 			crate::payment::submit_prepared_circular_execution(
 				&payment_store,
 				execution,
 				|route, hash, onion, id| {
+					send_count.fetch_add(1, Ordering::AcqRel);
 					nodes[0].node.send_payment_with_route(route, hash, onion, id)
 				},
 			),
 			Ok(outbound_payment_id)
 		);
+		assert_eq!(send_count.load(Ordering::Acquire), 1);
 		lightning::check_added_monitors!(nodes[0], 1);
 
+		let channel_manager_bytes = nodes[0].node.encode();
+		let first_monitor_bytes = lightning::get_monitor!(nodes[0], first_channel_id).encode();
+		let last_monitor_bytes = lightning::get_monitor!(nodes[0], last_channel_id).encode();
+		nodes[1].node.peer_disconnected(nodes[0].node.get_our_node_id());
+		nodes[2].node.peer_disconnected(nodes[0].node.get_our_node_id());
+		reload_node!(
+			nodes[0],
+			channel_manager_bytes,
+			&[&first_monitor_bytes, &last_monitor_bytes],
+			persister,
+			new_chain_monitor,
+			node_0_deserialized
+		);
+		assert!(nodes[0].node.list_channels().iter().all(|channel| !channel.is_usable));
+		let reloaded_payments =
+			crate::io::utils::read_payments(Arc::clone(&kv_store), Arc::clone(&logger)).unwrap();
+		let reloaded_payment_store = PaymentStore::new(
+			reloaded_payments,
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			kv_store,
+			logger,
+		);
+		assert_eq!(
+			reloaded_payment_store.get(&PaymentId(payment_hash.0)).unwrap().status,
+			PaymentStatus::Pending
+		);
+		assert_eq!(
+			reloaded_payment_store.get(&outbound_payment_id).unwrap().status,
+			PaymentStatus::Pending
+		);
+		assert_eq!(
+			crate::payment::submit_prepared_circular_execution(
+				&reloaded_payment_store,
+				duplicate_execution,
+				|_, _, _, _| {
+					send_count.fetch_add(1, Ordering::AcqRel);
+					Ok(())
+				},
+			),
+			Err(Error::DuplicatePayment)
+		);
+		assert_eq!(send_count.load(Ordering::Acquire), 1);
+
+		let mut reconnect_destination = ReconnectArgs::new(&nodes[0], &nodes[2]);
+		reconnect_destination.send_channel_ready = (true, true);
+		reconnect_destination.send_announcement_sigs = (true, true);
+		reconnect_nodes(reconnect_destination);
+		let mut reconnect_source = ReconnectArgs::new(&nodes[0], &nodes[1]);
+		reconnect_source.send_channel_ready = (true, true);
+		reconnect_source.send_announcement_sigs = (true, true);
+		reconnect_source.pending_htlc_adds = (0, 1);
+		reconnect_nodes(reconnect_source);
+		nodes[1].node.process_pending_htlc_forwards();
+		lightning::check_added_monitors!(nodes[1], 1);
+
 		let path = &[&nodes[1], &nodes[2], &nodes[0]][..];
-		let mut messages = nodes[0].node.get_and_clear_pending_msg_events();
+		let mut messages = nodes[1].node.get_and_clear_pending_msg_events();
 		let claimable_event = pass_along_path(
-			&nodes[0],
-			path,
+			&nodes[1],
+			&path[1..],
 			amount_msat,
 			payment_hash,
 			Some(payment_secret),
-			remove_first_msg_event_to_node(&nodes[1].node.get_our_node_id(), &mut messages),
+			remove_first_msg_event_to_node(&nodes[2].node.get_our_node_id(), &mut messages),
 			true,
 			Some(payment_preimage),
 		)
