@@ -2088,9 +2088,9 @@ mod tests {
 		create_announced_chan_between_nodes_with_value, create_chanmon_cfgs, create_network,
 		create_node_cfgs, create_node_chanmgrs, do_claim_payment_along_route,
 		fail_payment_along_route, pass_along_path, remove_first_msg_event_to_node,
-		test_default_channel_config, ClaimAlongRouteArgs, TEST_FINAL_CLTV,
+		test_default_channel_config, ClaimAlongRouteArgs, SendEvent, TEST_FINAL_CLTV,
 	};
-	use lightning::ln::msgs::BaseMessageHandler;
+	use lightning::ln::msgs::{BaseMessageHandler, ChannelMessageHandler, MessageSendEvent};
 	use lightning::reload_node;
 	use lightning::util::test_utils::TestLogger;
 
@@ -3202,6 +3202,471 @@ mod tests {
 				assert_eq!(path.hops.last().unwrap().short_channel_id, last_hop_scid);
 			},
 			other => panic!("expected PaymentPathSuccessful, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn real_prepared_circular_mpp_keeps_both_exact_local_channels() {
+		let chanmon_cfgs = create_chanmon_cfgs(5);
+		let node_cfgs = create_node_cfgs(5, &chanmon_cfgs);
+		let node_chanmgrs = create_node_chanmgrs(5, &node_cfgs, &[None, None, None, None, None]);
+		let nodes = create_network(5, &node_cfgs, &node_chanmgrs);
+		let (_, _, first_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100_000, 0);
+		let (_, _, branch_a_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 1, 2, 100_000, 0);
+		let (_, _, branch_b_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 1, 3, 100_000, 0);
+		let (_, _, converge_a_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 2, 4, 100_000, 0);
+		let (_, _, converge_b_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 3, 4, 100_000, 0);
+		let (_, _, last_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 4, 0, 100_000, 0);
+
+		let local_channels = nodes[0].node.list_channels();
+		let first_channel =
+			local_channels.iter().find(|channel| channel.channel_id == first_channel_id).unwrap();
+		let last_channel =
+			local_channels.iter().find(|channel| channel.channel_id == last_channel_id).unwrap();
+		let first_hop_user_channel_id = UserChannelId(first_channel.user_channel_id);
+		let last_hop_user_channel_id = UserChannelId(last_channel.user_channel_id);
+		let first_hop_scid = first_channel.get_outbound_payment_scid().unwrap();
+		let branch_a_scid = nodes[1]
+			.node
+			.list_channels()
+			.into_iter()
+			.find(|channel| channel.channel_id == branch_a_channel_id)
+			.unwrap()
+			.get_outbound_payment_scid()
+			.unwrap();
+		let branch_b_scid = nodes[1]
+			.node
+			.list_channels()
+			.into_iter()
+			.find(|channel| channel.channel_id == branch_b_channel_id)
+			.unwrap()
+			.get_outbound_payment_scid()
+			.unwrap();
+		let converge_a_scid = nodes[2]
+			.node
+			.list_channels()
+			.into_iter()
+			.find(|channel| channel.channel_id == converge_a_channel_id)
+			.unwrap()
+			.get_outbound_payment_scid()
+			.unwrap();
+		let converge_b_scid = nodes[3]
+			.node
+			.list_channels()
+			.into_iter()
+			.find(|channel| channel.channel_id == converge_b_channel_id)
+			.unwrap()
+			.get_outbound_payment_scid()
+			.unwrap();
+		let last_hop_scid = last_channel.get_inbound_payment_scid().unwrap();
+
+		let amount_msat = 5_000_000;
+		let path_a_amount_msat = 3_000_000;
+		let path_b_amount_msat = 2_000_000;
+		let total_routing_fee_msat = 6_000;
+		let max_routing_fee_msat = 10_000;
+		let invoice = nodes[0]
+			.node
+			.create_bolt11_invoice(Bolt11InvoiceParameters {
+				amount_msats: Some(amount_msat),
+				..Default::default()
+			})
+			.unwrap();
+		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
+		let payment_secret = *invoice.payment_secret();
+		let payment_preimage =
+			nodes[0].node.get_payment_preimage(payment_hash, payment_secret).unwrap();
+		let operation_id = PaymentId([10u8; 32]);
+		let outbound_payment_id = crate::payment::derive_circular_outbound_payment_id(operation_id);
+
+		let kv_store: Arc<DynStore> = Arc::new(InMemoryStore::new());
+		let logger = Arc::new(Logger::new_log_facade());
+		let payment_store = PaymentStore::new(
+			Vec::new(),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			kv_store,
+			logger,
+		);
+		payment_store
+			.insert(crate::payment::prepared_circular_payment_details(
+				invoice.to_string(),
+				payment_hash,
+				payment_preimage,
+				payment_secret,
+				amount_msat,
+				crate::payment::CircularPaymentContext {
+					operation_id,
+					outbound_payment_id,
+					first_hop_user_channel_id,
+					last_hop_user_channel_id,
+					max_routing_fee_msat,
+				},
+			))
+			.unwrap();
+
+		let make_hop = |pubkey, short_channel_id, fee_msat| lightning::routing::router::RouteHop {
+			pubkey,
+			node_features: lightning::types::features::NodeFeatures::empty(),
+			short_channel_id,
+			channel_features: lightning::types::features::ChannelFeatures::empty(),
+			fee_msat,
+			cltv_expiry_delta: if pubkey == nodes[0].node.get_our_node_id() {
+				TEST_FINAL_CLTV as u32
+			} else {
+				48
+			},
+			maybe_announced_channel: true,
+		};
+		let route = lightning::routing::router::Route {
+			paths: vec![
+				lightning::routing::router::Path {
+					hops: vec![
+						make_hop(nodes[1].node.get_our_node_id(), first_hop_scid, 1_000),
+						make_hop(nodes[2].node.get_our_node_id(), branch_a_scid, 1_000),
+						make_hop(nodes[4].node.get_our_node_id(), converge_a_scid, 1_000),
+						make_hop(
+							nodes[0].node.get_our_node_id(),
+							last_hop_scid,
+							path_a_amount_msat,
+						),
+					],
+					blinded_tail: None,
+				},
+				lightning::routing::router::Path {
+					hops: vec![
+						make_hop(nodes[1].node.get_our_node_id(), first_hop_scid, 1_000),
+						make_hop(nodes[3].node.get_our_node_id(), branch_b_scid, 1_000),
+						make_hop(nodes[4].node.get_our_node_id(), converge_b_scid, 1_000),
+						make_hop(
+							nodes[0].node.get_our_node_id(),
+							last_hop_scid,
+							path_b_amount_msat,
+						),
+					],
+					blinded_tail: None,
+				},
+			],
+			route_params: None,
+		};
+		let quote_paths = route
+			.paths
+			.iter()
+			.map(|path| crate::CircularRoutePath {
+				hops: path
+					.hops
+					.iter()
+					.map(|hop| crate::CircularRouteHop {
+						node_id: hop.pubkey,
+						short_channel_id: hop.short_channel_id,
+						fee_msat: hop.fee_msat,
+						cltv_expiry_delta: hop.cltv_expiry_delta,
+					})
+					.collect(),
+				amount_msat: path.final_value_msat(),
+				fee_msat: path.fee_msat(),
+			})
+			.collect();
+		let quote = crate::CircularRouteQuote {
+			amount_msat,
+			total_routing_fee_msat,
+			first_hop_user_channel_id,
+			first_hop_short_channel_id: first_hop_scid,
+			last_hop_user_channel_id,
+			last_hop_short_channel_id: last_hop_scid,
+			paths: quote_paths,
+			route_bytes: route.encode(),
+		};
+		let execution = crate::payment::build_prepared_circular_execution(
+			&payment_store,
+			operation_id,
+			&quote,
+			nodes[1].node.get_our_node_id(),
+			first_hop_scid,
+			first_channel.outbound_capacity_msat,
+			nodes[4].node.get_our_node_id(),
+			last_hop_scid,
+			last_channel.inbound_capacity_msat,
+			nodes[0].node.get_our_node_id(),
+		)
+		.unwrap();
+		assert_eq!(
+			crate::payment::submit_prepared_circular_execution(
+				&payment_store,
+				execution,
+				|route, hash, onion, id| {
+					nodes[0].node.send_payment_with_route(route, hash, onion, id)
+				},
+			),
+			Ok(outbound_payment_id)
+		);
+		lightning::check_added_monitors!(nodes[0], 1);
+
+		let path_a = &[&nodes[1], &nodes[2], &nodes[4], &nodes[0]][..];
+		let path_b = &[&nodes[1], &nodes[3], &nodes[4], &nodes[0]][..];
+		let mut messages = nodes[0].node.get_and_clear_pending_msg_events();
+		assert_eq!(messages.len(), 1);
+		let first_part =
+			remove_first_msg_event_to_node(&nodes[1].node.get_our_node_id(), &mut messages);
+		let first_part = SendEvent::from_event(first_part);
+		assert_eq!(first_part.msgs.len(), 1);
+		nodes[1].node.handle_update_add_htlc(nodes[0].node.get_our_node_id(), &first_part.msgs[0]);
+		lightning::check_added_monitors!(nodes[1], 0);
+		nodes[1].node.handle_commitment_signed_batch_test(
+			nodes[0].node.get_our_node_id(),
+			&first_part.commitment_msg,
+		);
+		lightning::check_added_monitors!(nodes[1], 1);
+		let (first_revoke_and_ack, first_commitment_signed) =
+			lightning::get_revoke_commit_msgs!(nodes[1], nodes[0].node.get_our_node_id());
+		nodes[0].node.handle_revoke_and_ack(nodes[1].node.get_our_node_id(), &first_revoke_and_ack);
+		lightning::check_added_monitors!(nodes[0], 1);
+		let mut messages = nodes[0].node.get_and_clear_pending_msg_events();
+		assert_eq!(messages.len(), 1);
+		let second_part =
+			remove_first_msg_event_to_node(&nodes[1].node.get_our_node_id(), &mut messages);
+		nodes[0].node.handle_commitment_signed_batch_test(
+			nodes[1].node.get_our_node_id(),
+			&first_commitment_signed,
+		);
+		lightning::check_added_monitors!(nodes[0], 1);
+		let final_revoke_and_ack = lightning::get_event_msg!(
+			nodes[0],
+			MessageSendEvent::SendRevokeAndACK,
+			nodes[1].node.get_our_node_id()
+		);
+		nodes[1].node.handle_revoke_and_ack(nodes[0].node.get_our_node_id(), &final_revoke_and_ack);
+		lightning::check_added_monitors!(nodes[1], 1);
+		nodes[1].node.process_pending_htlc_forwards();
+		lightning::check_added_monitors!(nodes[1], 1);
+		let mut first_forward_messages = nodes[1].node.get_and_clear_pending_msg_events();
+		let first_forward = remove_first_msg_event_to_node(
+			&nodes[2].node.get_our_node_id(),
+			&mut first_forward_messages,
+		);
+		assert!(pass_along_path(
+			&nodes[1],
+			&path_a[1..],
+			path_a_amount_msat,
+			payment_hash,
+			Some(payment_secret),
+			first_forward,
+			false,
+			Some(payment_preimage),
+		)
+		.is_none());
+		let claimable_event = pass_along_path(
+			&nodes[0],
+			path_b,
+			amount_msat,
+			payment_hash,
+			Some(payment_secret),
+			second_part,
+			true,
+			Some(payment_preimage),
+		)
+		.unwrap();
+		let receiving_channels = match claimable_event {
+			LdkEvent::PaymentClaimable { receiving_channel_ids, .. } => receiving_channel_ids,
+			_ => panic!("expected PaymentClaimable"),
+		};
+		assert_eq!(receiving_channels.len(), 2);
+		assert!(receiving_channels
+			.iter()
+			.all(|(_, user_channel_id)| *user_channel_id == Some(last_hop_user_channel_id.0)));
+		let prepared = payment_store.get(&PaymentId(payment_hash.0)).unwrap();
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&prepared.kind,
+				prepared.status,
+				prepared.amount_msat,
+				amount_msat,
+				&receiving_channels,
+			),
+			ChannelConstrainedClaimDecision::Claim(payment_preimage)
+		);
+
+		nodes[0].node.claim_funds(payment_preimage);
+		let claimed_events = nodes[0].node.get_and_clear_pending_events();
+		assert_eq!(claimed_events.len(), 1, "{claimed_events:?}");
+		match &claimed_events[0] {
+			LdkEvent::PaymentClaimed {
+				payment_hash: claimed_hash,
+				amount_msat: claimed_amount_msat,
+				htlcs,
+				..
+			} => {
+				assert_eq!(*claimed_hash, payment_hash);
+				assert_eq!(*claimed_amount_msat, amount_msat);
+				assert_eq!(htlcs.len(), 2);
+				assert!(htlcs.iter().all(|htlc| {
+					htlc.user_channel_id == last_hop_user_channel_id.0
+						&& htlc.channel_id == last_channel_id
+				}));
+			},
+			other => panic!("expected PaymentClaimed, got {other:?}"),
+		}
+		lightning::check_added_monitors!(nodes[0], 2);
+
+		let parse_single_fulfill = |event| match event {
+			MessageSendEvent::UpdateHTLCs { node_id, updates, .. } => {
+				assert!(updates.update_add_htlcs.is_empty());
+				assert_eq!(updates.update_fulfill_htlcs.len(), 1);
+				assert!(updates.update_fail_htlcs.is_empty());
+				assert!(updates.update_fail_malformed_htlcs.is_empty());
+				assert!(updates.update_fee.is_none());
+				((updates.update_fulfill_htlcs[0].clone(), updates.commitment_signed), node_id)
+			},
+			other => panic!("expected a single fulfill update, got {other:?}"),
+		};
+		macro_rules! pass_fulfill_through_common_inbound_peer {
+			($settlement_event:expr, $next_node:expr, $expect_held_fulfill:expr) => {{
+				let ((fulfill, commitment_signed), target_node_id) =
+					parse_single_fulfill($settlement_event);
+				assert_eq!(target_node_id, nodes[4].node.get_our_node_id());
+				nodes[4].node.handle_update_fulfill_htlc(nodes[0].node.get_our_node_id(), fulfill);
+				lightning::check_added_monitors!(nodes[4], 1);
+				let forwarded_events = nodes[4].node.get_and_clear_pending_events();
+				assert_eq!(forwarded_events.len(), 1, "{forwarded_events:?}");
+				assert_eq!(
+					lightning::ln::functional_test_utils::expect_payment_forwarded(
+						forwarded_events.into_iter().next().unwrap(),
+						&nodes[4],
+						&$next_node,
+						&nodes[0],
+						Some(1_000),
+						None,
+						false,
+						false,
+						false,
+					),
+					Some(1_000)
+				);
+				let mut forward_messages = nodes[4].node.get_and_clear_pending_msg_events();
+				let forward = remove_first_msg_event_to_node(
+					&$next_node.node.get_our_node_id(),
+					&mut forward_messages,
+				);
+				assert!(forward_messages.is_empty());
+
+				nodes[4].node.handle_commitment_signed_batch_test(
+					nodes[0].node.get_our_node_id(),
+					&commitment_signed,
+				);
+				lightning::check_added_monitors!(nodes[4], 1);
+				let (revoke_and_ack, counterparty_commitment_signed) =
+					lightning::get_revoke_commit_msgs!(nodes[4], nodes[0].node.get_our_node_id());
+				nodes[0]
+					.node
+					.handle_revoke_and_ack(nodes[4].node.get_our_node_id(), &revoke_and_ack);
+				lightning::check_added_monitors!(nodes[0], 1);
+				let mut held_messages = nodes[0].node.get_and_clear_pending_msg_events();
+				let held_fulfill = if $expect_held_fulfill {
+					assert_eq!(held_messages.len(), 1);
+					Some(remove_first_msg_event_to_node(
+						&nodes[4].node.get_our_node_id(),
+						&mut held_messages,
+					))
+				} else {
+					assert!(held_messages.is_empty());
+					None
+				};
+				nodes[0].node.handle_commitment_signed_batch_test(
+					nodes[4].node.get_our_node_id(),
+					&counterparty_commitment_signed,
+				);
+				lightning::check_added_monitors!(nodes[0], 1);
+				let final_revoke_and_ack = lightning::get_event_msg!(
+					nodes[0],
+					MessageSendEvent::SendRevokeAndACK,
+					nodes[4].node.get_our_node_id()
+				);
+				nodes[4]
+					.node
+					.handle_revoke_and_ack(nodes[0].node.get_our_node_id(), &final_revoke_and_ack);
+				lightning::check_added_monitors!(nodes[4], 1);
+				(forward, held_fulfill)
+			}};
+		}
+
+		let mut settlement_messages = nodes[0].node.get_and_clear_pending_msg_events();
+		assert_eq!(settlement_messages.len(), 1);
+		let first_settlement_part = remove_first_msg_event_to_node(
+			&nodes[4].node.get_our_node_id(),
+			&mut settlement_messages,
+		);
+		let (first_forward, second_settlement_part) =
+			pass_fulfill_through_common_inbound_peer!(first_settlement_part, nodes[2], true);
+		let (second_forward, no_more_settlement_parts) = pass_fulfill_through_common_inbound_peer!(
+			second_settlement_part.unwrap(),
+			nodes[3],
+			false
+		);
+		assert!(no_more_settlement_parts.is_none());
+
+		let first_forward = parse_single_fulfill(first_forward);
+		let second_forward = parse_single_fulfill(second_forward);
+		let path_a_after_inbound_peer = &[&nodes[1], &nodes[2], &nodes[4]][..];
+		let path_b_after_inbound_peer = &[&nodes[1], &nodes[3], &nodes[4]][..];
+		let first_remaining_fee_msat =
+			lightning::ln::functional_test_utils::pass_claimed_payment_along_route_from_ev(
+				path_a_amount_msat,
+				vec![first_forward],
+				ClaimAlongRouteArgs::new(&nodes[0], &[path_a_after_inbound_peer], payment_preimage),
+			);
+		let mut settlement_events = nodes[0].node.get_and_clear_pending_events();
+		lightning::check_added_monitors!(nodes[0], 1);
+		let second_remaining_fee_msat =
+			lightning::ln::functional_test_utils::pass_claimed_payment_along_route_from_ev(
+				path_b_amount_msat,
+				vec![second_forward],
+				ClaimAlongRouteArgs::new(&nodes[0], &[path_b_after_inbound_peer], payment_preimage),
+			);
+		settlement_events.extend(nodes[0].node.get_and_clear_pending_events());
+		lightning::check_added_monitors!(nodes[0], 0);
+		assert_eq!(
+			first_remaining_fee_msat + second_remaining_fee_msat + 2_000,
+			total_routing_fee_msat
+		);
+		assert_eq!(settlement_events.len(), 3, "{settlement_events:?}");
+		match &settlement_events[0] {
+			LdkEvent::PaymentSent {
+				payment_id,
+				payment_preimage: settled_preimage,
+				payment_hash: settled_hash,
+				amount_msat: settled_amount_msat,
+				fee_paid_msat,
+				..
+			} => {
+				assert_eq!(*payment_id, Some(outbound_payment_id));
+				assert_eq!(*settled_preimage, payment_preimage);
+				assert_eq!(*settled_hash, payment_hash);
+				assert_eq!(*settled_amount_msat, Some(amount_msat));
+				assert_eq!(*fee_paid_msat, Some(total_routing_fee_msat));
+			},
+			other => panic!("expected PaymentSent, got {other:?}"),
+		}
+		for event in &settlement_events[1..] {
+			match event {
+				LdkEvent::PaymentPathSuccessful {
+					payment_id,
+					payment_hash: path_hash,
+					path,
+					..
+				} => {
+					assert_eq!(*payment_id, outbound_payment_id);
+					assert_eq!(*path_hash, Some(payment_hash));
+					assert_eq!(path.hops.first().unwrap().short_channel_id, first_hop_scid);
+					assert_eq!(path.hops.last().unwrap().short_channel_id, last_hop_scid);
+				},
+				other => panic!("expected PaymentPathSuccessful, got {other:?}"),
+			}
 		}
 	}
 
