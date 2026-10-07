@@ -9,8 +9,8 @@
 //!
 //! [BOLT 11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
 
-use std::sync::{Arc, RwLock};
 use std::str::FromStr;
+use std::sync::{Arc, RwLock};
 
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
@@ -19,7 +19,7 @@ use lightning::ln::channelmanager::{
 	RetryableSendFailure,
 };
 use lightning::routing::router::{
-	PaymentParameters, RouteHint, RouteHintHop, RouteParameters, RouteParametersConfig,
+	PaymentParameters, Route, RouteHint, RouteHintHop, RouteParameters, RouteParametersConfig,
 	Router as LdkRouter,
 };
 use lightning_invoice::{
@@ -48,9 +48,8 @@ use crate::types::{
 use crate::UserChannelId;
 
 fn circular_path_uses_exact_channels(
-	path: &lightning::routing::router::Path,
-	first_hop_node_id: bitcoin::secp256k1::PublicKey, first_hop_scid: u64,
-	synthetic_payee: bitcoin::secp256k1::PublicKey, last_hop_scid: u64,
+	path: &lightning::routing::router::Path, first_hop_node_id: bitcoin::secp256k1::PublicKey,
+	first_hop_scid: u64, synthetic_payee: bitcoin::secp256k1::PublicKey, last_hop_scid: u64,
 ) -> bool {
 	let first_matches = path.hops.first().map_or(false, |hop| {
 		hop.pubkey == first_hop_node_id && hop.short_channel_id == first_hop_scid
@@ -59,6 +58,39 @@ fn circular_path_uses_exact_channels(
 		hop.pubkey == synthetic_payee && hop.short_channel_id == last_hop_scid
 	});
 	first_matches && last_matches
+}
+
+/// Convert the synthetic pathfinding destination into the real local recipient while preserving
+/// the exact reviewed first- and last-hop channels. Clearing `route_params` is intentional:
+/// `send_payment_with_route` reconstructs fixed-route parameters from the real final hop and uses
+/// zero automatic retries, so no synthetic payee identity survives into payment construction.
+fn finalize_circular_route(
+	mut route: Route, first_hop_node_id: bitcoin::secp256k1::PublicKey, first_hop_scid: u64,
+	synthetic_payee: bitcoin::secp256k1::PublicKey, last_hop_scid: u64,
+	local_node_id: bitcoin::secp256k1::PublicKey,
+) -> Result<Route, Error> {
+	if route.paths.is_empty()
+		|| route.paths.iter().any(|path| {
+			path.blinded_tail.is_some()
+				|| !circular_path_uses_exact_channels(
+					path,
+					first_hop_node_id,
+					first_hop_scid,
+					synthetic_payee,
+					last_hop_scid,
+				)
+		}) {
+		return Err(Error::PaymentSendingFailed);
+	}
+
+	for path in &mut route.paths {
+		let last_hop = path.hops.last_mut().ok_or(Error::PaymentSendingFailed)?;
+		last_hop.pubkey = local_node_id;
+	}
+	// The original parameters name the synthetic payee and must never be used by a real send.
+	route.route_params = None;
+
+	Ok(route)
 }
 
 #[cfg(not(feature = "uniffi"))]
@@ -124,8 +156,7 @@ impl Bolt11Payment {
 	/// This method does not create an invoice, send a probe or HTLC, or write to the payment store.
 	pub fn quote_circular_route(
 		&self, amount_msat: u64, first_hop_user_channel_id: &UserChannelId,
-		last_hop_user_channel_id: &UserChannelId,
-		route_parameters: Option<RouteParametersConfig>,
+		last_hop_user_channel_id: &UserChannelId, route_parameters: Option<RouteParametersConfig>,
 	) -> Result<CircularRouteQuote, Error> {
 		if !*self.is_running.read().unwrap() {
 			return Err(Error::NotRunning);
@@ -226,8 +257,7 @@ impl Bolt11Payment {
 		)
 		.with_route_hints(vec![route_hint])
 		.expect("clear payment parameters accept clear route hints");
-		payment_params.max_total_cltv_expiry_delta =
-			route_parameters.max_total_cltv_expiry_delta;
+		payment_params.max_total_cltv_expiry_delta = route_parameters.max_total_cltv_expiry_delta;
 		payment_params.max_path_count = route_parameters.max_path_count;
 		payment_params.max_channel_saturation_power_of_half =
 			route_parameters.max_channel_saturation_power_of_half;
@@ -262,25 +292,22 @@ impl Bolt11Payment {
 				Error::PaymentSendingFailed
 			})?;
 
-		let route_is_exact = !route.paths.is_empty()
-			&& route.paths.iter().all(|path| {
-				circular_path_uses_exact_channels(
-					path,
-					first_hop.counterparty.node_id,
-					first_hop_scid,
-					synthetic_payee,
-					last_hop_scid,
-				)
-			});
-		if !route_is_exact {
+		let our_node_id = self.channel_manager.get_our_node_id();
+		let route = finalize_circular_route(
+			route,
+			first_hop.counterparty.node_id,
+			first_hop_scid,
+			synthetic_payee,
+			last_hop_scid,
+			our_node_id,
+		)
+		.map_err(|e| {
 			log_error!(
 				self.logger,
 				"Refused circular route that did not exclusively use the selected first and last hops."
 			);
-			return Err(Error::PaymentSendingFailed);
-		}
-
-		let our_node_id = self.channel_manager.get_our_node_id();
+			e
+		})?;
 		let paths = route
 			.paths
 			.iter()
@@ -288,13 +315,8 @@ impl Bolt11Payment {
 				hops: path
 					.hops
 					.iter()
-					.enumerate()
-					.map(|(index, hop)| CircularRouteHop {
-						node_id: if index + 1 == path.hops.len() {
-							our_node_id
-						} else {
-							hop.pubkey
-						},
+					.map(|hop| CircularRouteHop {
+						node_id: hop.pubkey,
 						short_channel_id: hop.short_channel_id,
 						fee_msat: hop.fee_msat,
 						cltv_expiry_delta: hop.cltv_expiry_delta,
@@ -331,10 +353,7 @@ impl Bolt11Payment {
 
 		let invoice = maybe_deref(invoice);
 		let amount_msat = invoice.amount_milli_satoshis().ok_or_else(|| {
-			log_error!(
-				self.logger,
-				"Pinned first-hop payments require a fixed-amount invoice."
-			);
+			log_error!(self.logger, "Pinned first-hop payments require a fixed-amount invoice.");
 			Error::InvalidInvoice
 		})?;
 		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
@@ -1345,33 +1364,75 @@ mod tests {
 		)
 		.unwrap();
 		let path = Path {
-			hops: vec![
-				route_hop(first_node, 41),
-				route_hop(synthetic_payee, 99),
-			],
+			hops: vec![route_hop(first_node, 41), route_hop(synthetic_payee, 99)],
 			blinded_tail: None,
 		};
 
-		assert!(circular_path_uses_exact_channels(
-			&path,
-			first_node,
-			41,
-			synthetic_payee,
-			99
-		));
-		assert!(!circular_path_uses_exact_channels(
-			&path,
-			first_node,
-			42,
-			synthetic_payee,
-			99
-		));
-		assert!(!circular_path_uses_exact_channels(
-			&path,
-			first_node,
-			41,
-			synthetic_payee,
-			100
-		));
+		assert!(circular_path_uses_exact_channels(&path, first_node, 41, synthetic_payee, 99));
+		assert!(!circular_path_uses_exact_channels(&path, first_node, 42, synthetic_payee, 99));
+		assert!(!circular_path_uses_exact_channels(&path, first_node, 41, synthetic_payee, 100));
+	}
+
+	#[test]
+	fn finalizing_circular_route_replaces_only_synthetic_terminal() {
+		let first_node = bitcoin::secp256k1::PublicKey::from_str(
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+		)
+		.unwrap();
+		let synthetic_payee = bitcoin::secp256k1::PublicKey::from_str(
+			"02c6047f9441ed7d6d3045406e95c07cd85a294d1b04c8fe6c9a5c3315b95c709e",
+		)
+		.unwrap();
+		let local_node = bitcoin::secp256k1::PublicKey::from_str(
+			"02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+		)
+		.unwrap();
+		let route_params = RouteParameters::from_payment_params_and_value(
+			PaymentParameters::from_node_id(synthetic_payee, 18),
+			20_000_000,
+		);
+		let route = Route {
+			paths: vec![Path {
+				hops: vec![route_hop(first_node, 41), route_hop(synthetic_payee, 99)],
+				blinded_tail: None,
+			}],
+			route_params: Some(route_params),
+		};
+
+		let finalized =
+			finalize_circular_route(route, first_node, 41, synthetic_payee, 99, local_node)
+				.unwrap();
+
+		assert_eq!(finalized.paths[0].hops[0].pubkey, first_node);
+		assert_eq!(finalized.paths[0].hops[0].short_channel_id, 41);
+		assert_eq!(finalized.paths[0].hops[1].pubkey, local_node);
+		assert_eq!(finalized.paths[0].hops[1].short_channel_id, 99);
+		assert!(finalized.route_params.is_none());
+	}
+
+	#[test]
+	fn finalizing_circular_route_rejects_any_channel_mismatch() {
+		let first_node = bitcoin::secp256k1::PublicKey::from_str(
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+		)
+		.unwrap();
+		let synthetic_payee = bitcoin::secp256k1::PublicKey::from_str(
+			"02c6047f9441ed7d6d3045406e95c07cd85a294d1b04c8fe6c9a5c3315b95c709e",
+		)
+		.unwrap();
+		let local_node = bitcoin::secp256k1::PublicKey::from_str(
+			"02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+		)
+		.unwrap();
+		let route = Route {
+			paths: vec![Path {
+				hops: vec![route_hop(first_node, 42), route_hop(synthetic_payee, 99)],
+				blinded_tail: None,
+			}],
+			route_params: None,
+		};
+
+		assert!(finalize_circular_route(route, first_node, 41, synthetic_payee, 99, local_node)
+			.is_err());
 	}
 }
