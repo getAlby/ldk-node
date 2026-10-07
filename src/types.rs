@@ -112,6 +112,9 @@ pub struct CircularRouteQuote {
 	pub last_hop_short_channel_id: u64,
 	/// The candidate paths. Every path is independently validated against both selected channels.
 	pub paths: Vec<CircularRoutePath>,
+	/// The complete finalized LDK route, including feature bits omitted from the human-readable
+	/// path summary. A future executor must decode and cross-check this before any send.
+	pub route_bytes: Vec<u8>,
 }
 
 /// A durably prepared circular payment that has not been sent.

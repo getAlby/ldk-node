@@ -22,6 +22,7 @@ use lightning::routing::router::{
 	PaymentParameters, Route, RouteHint, RouteHintHop, RouteParameters, RouteParametersConfig,
 	Router as LdkRouter,
 };
+use lightning::util::ser::{Readable, Writeable};
 use lightning_invoice::{
 	Bolt11Invoice as LdkBolt11Invoice, Bolt11InvoiceDescription as LdkBolt11InvoiceDescription,
 	DEFAULT_MIN_FINAL_CLTV_EXPIRY_DELTA,
@@ -143,6 +144,40 @@ fn finalize_circular_route(
 	}
 	// The original parameters name the synthetic payee and must never be used by a real send.
 	route.route_params = None;
+
+	Ok(route)
+}
+
+fn decode_and_validate_circular_quote_route(quote: &CircularRouteQuote) -> Result<Route, Error> {
+	let mut route_bytes = &quote.route_bytes[..];
+	let route = Route::read(&mut route_bytes).map_err(|_| Error::PaymentSendingFailed)?;
+	if !route_bytes.is_empty()
+		|| route.route_params.is_some()
+		|| route.get_total_amount() != quote.amount_msat
+		|| route.get_total_fees() != quote.total_routing_fee_msat
+		|| route.paths.len() != quote.paths.len()
+	{
+		return Err(Error::PaymentSendingFailed);
+	}
+
+	for (route_path, quoted_path) in route.paths.iter().zip(quote.paths.iter()) {
+		if route_path.blinded_tail.is_some()
+			|| route_path.final_value_msat() != quoted_path.amount_msat
+			|| route_path.fee_msat() != quoted_path.fee_msat
+			|| route_path.hops.len() != quoted_path.hops.len()
+		{
+			return Err(Error::PaymentSendingFailed);
+		}
+		for (route_hop, quoted_hop) in route_path.hops.iter().zip(quoted_path.hops.iter()) {
+			if route_hop.pubkey != quoted_hop.node_id
+				|| route_hop.short_channel_id != quoted_hop.short_channel_id
+				|| route_hop.fee_msat != quoted_hop.fee_msat
+				|| route_hop.cltv_expiry_delta != quoted_hop.cltv_expiry_delta
+			{
+				return Err(Error::PaymentSendingFailed);
+			}
+		}
+	}
 
 	Ok(route)
 }
@@ -383,6 +418,7 @@ impl Bolt11Payment {
 				fee_msat: path.fee_msat(),
 			})
 			.collect();
+		let route_bytes = route.encode();
 
 		Ok(CircularRouteQuote {
 			amount_msat,
@@ -392,6 +428,7 @@ impl Bolt11Payment {
 			last_hop_user_channel_id: *last_hop_user_channel_id,
 			last_hop_short_channel_id: last_hop_scid,
 			paths,
+			route_bytes,
 		})
 	}
 
@@ -1643,6 +1680,73 @@ mod tests {
 		assert_eq!(finalized.paths[0].hops[1].pubkey, local_node);
 		assert_eq!(finalized.paths[0].hops[1].short_channel_id, 99);
 		assert!(finalized.route_params.is_none());
+	}
+
+	#[test]
+	fn serialized_circular_route_preserves_features_and_must_match_quote() {
+		let first_node = bitcoin::secp256k1::PublicKey::from_str(
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+		)
+		.unwrap();
+		let local_node = bitcoin::secp256k1::PublicKey::from_str(
+			"02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+		)
+		.unwrap();
+		let mut first_hop = route_hop(first_node, 41);
+		first_hop.node_features = NodeFeatures::from_le_bytes(vec![0b10]);
+		first_hop.channel_features = ChannelFeatures::from_le_bytes(vec![0b01]);
+		first_hop.fee_msat = 1_000;
+		let mut last_hop = route_hop(local_node, 99);
+		last_hop.node_features = NodeFeatures::from_le_bytes(vec![0b100]);
+		last_hop.channel_features = ChannelFeatures::from_le_bytes(vec![0b1000]);
+		last_hop.fee_msat = 20_000_000;
+		let route = Route {
+			paths: vec![Path { hops: vec![first_hop, last_hop], blinded_tail: None }],
+			route_params: None,
+		};
+		let quote = CircularRouteQuote {
+			amount_msat: 20_000_000,
+			total_routing_fee_msat: 1_000,
+			first_hop_user_channel_id: UserChannelId(11),
+			first_hop_short_channel_id: 41,
+			last_hop_user_channel_id: UserChannelId(12),
+			last_hop_short_channel_id: 99,
+			paths: vec![CircularRoutePath {
+				hops: vec![
+					CircularRouteHop {
+						node_id: first_node,
+						short_channel_id: 41,
+						fee_msat: 1_000,
+						cltv_expiry_delta: 18,
+					},
+					CircularRouteHop {
+						node_id: local_node,
+						short_channel_id: 99,
+						fee_msat: 20_000_000,
+						cltv_expiry_delta: 18,
+					},
+				],
+				amount_msat: 20_000_000,
+				fee_msat: 1_000,
+			}],
+			route_bytes: route.encode(),
+		};
+
+		assert_eq!(decode_and_validate_circular_quote_route(&quote).unwrap(), route);
+
+		let mut mismatched_summary = quote.clone();
+		mismatched_summary.paths[0].hops[0].short_channel_id = 42;
+		assert_eq!(
+			decode_and_validate_circular_quote_route(&mismatched_summary),
+			Err(Error::PaymentSendingFailed)
+		);
+
+		let mut trailing_bytes = quote;
+		trailing_bytes.route_bytes.push(0);
+		assert_eq!(
+			decode_and_validate_circular_quote_route(&trailing_bytes),
+			Err(Error::PaymentSendingFailed)
+		);
 	}
 
 	#[test]

@@ -889,6 +889,7 @@ dictionary CircularRouteQuote {
 	UserChannelId last_hop_user_channel_id;
 	u64 last_hop_short_channel_id;
 	sequence<CircularRoutePath> paths;
+	sequence<u8> route_bytes;
 };
 
 dictionary PreparedCircularPayment {
