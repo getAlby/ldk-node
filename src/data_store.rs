@@ -72,6 +72,17 @@ where
 		Ok(updated)
 	}
 
+	pub(crate) fn insert_if_absent(&self, object: SO) -> Result<bool, Error> {
+		let mut locked_objects = self.objects.lock().unwrap();
+		if locked_objects.contains_key(&object.id()) {
+			return Ok(false);
+		}
+
+		self.persist(&object)?;
+		locked_objects.insert(object.id(), object);
+		Ok(true)
+	}
+
 	pub(crate) fn insert_or_update(&self, object: SO) -> Result<bool, Error> {
 		let mut locked_objects = self.objects.lock().unwrap();
 
