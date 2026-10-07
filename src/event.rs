@@ -132,6 +132,43 @@ fn handle_channel_constrained_claim<A: ChannelConstrainedClaimActions>(
 	Ok(outcome)
 }
 
+fn payment_claimed_store_update(
+	payment_id: PaymentId, purpose: PaymentPurpose, amount_msat: u64,
+) -> PaymentDetailsUpdate {
+	match purpose {
+		PaymentPurpose::Bolt11InvoicePayment { payment_preimage, payment_secret, .. }
+		| PaymentPurpose::Bolt12OfferPayment { payment_preimage, payment_secret, .. }
+		| PaymentPurpose::Bolt12RefundPayment { payment_preimage, payment_secret, .. } => {
+			PaymentDetailsUpdate {
+				preimage: Some(payment_preimage),
+				secret: Some(Some(payment_secret)),
+				amount_msat: Some(Some(amount_msat)),
+				status: Some(PaymentStatus::Succeeded),
+				..PaymentDetailsUpdate::new(payment_id)
+			}
+		},
+		PaymentPurpose::SpontaneousPayment(preimage) => PaymentDetailsUpdate {
+			preimage: Some(Some(preimage)),
+			amount_msat: Some(Some(amount_msat)),
+			status: Some(PaymentStatus::Succeeded),
+			..PaymentDetailsUpdate::new(payment_id)
+		},
+	}
+}
+
+fn payment_sent_store_update(
+	payment_id: PaymentId, payment_hash: PaymentHash, payment_preimage: PaymentPreimage,
+	fee_paid_msat: Option<u64>,
+) -> PaymentDetailsUpdate {
+	PaymentDetailsUpdate {
+		hash: Some(Some(payment_hash)),
+		preimage: Some(Some(payment_preimage)),
+		fee_paid_msat: Some(fee_paid_msat),
+		status: Some(PaymentStatus::Succeeded),
+		..PaymentDetailsUpdate::new(payment_id)
+	}
+}
+
 fn channel_constrained_claim_decision(
 	kind: &PaymentKind, status: PaymentStatus, expected_amount_msat: Option<u64>,
 	actual_amount_msat: u64, receiving_channel_ids: &[(ChannelId, Option<u128>)],
@@ -1156,45 +1193,7 @@ where
 					amount_msat,
 				);
 
-				let update = match purpose {
-					PaymentPurpose::Bolt11InvoicePayment {
-						payment_preimage,
-						payment_secret,
-						..
-					} => PaymentDetailsUpdate {
-						preimage: Some(payment_preimage),
-						secret: Some(Some(payment_secret)),
-						amount_msat: Some(Some(amount_msat)),
-						status: Some(PaymentStatus::Succeeded),
-						..PaymentDetailsUpdate::new(payment_id)
-					},
-					PaymentPurpose::Bolt12OfferPayment {
-						payment_preimage, payment_secret, ..
-					} => PaymentDetailsUpdate {
-						preimage: Some(payment_preimage),
-						secret: Some(Some(payment_secret)),
-						amount_msat: Some(Some(amount_msat)),
-						status: Some(PaymentStatus::Succeeded),
-						..PaymentDetailsUpdate::new(payment_id)
-					},
-					PaymentPurpose::Bolt12RefundPayment {
-						payment_preimage,
-						payment_secret,
-						..
-					} => PaymentDetailsUpdate {
-						preimage: Some(payment_preimage),
-						secret: Some(Some(payment_secret)),
-						amount_msat: Some(Some(amount_msat)),
-						status: Some(PaymentStatus::Succeeded),
-						..PaymentDetailsUpdate::new(payment_id)
-					},
-					PaymentPurpose::SpontaneousPayment(preimage) => PaymentDetailsUpdate {
-						preimage: Some(Some(preimage)),
-						amount_msat: Some(Some(amount_msat)),
-						status: Some(PaymentStatus::Succeeded),
-						..PaymentDetailsUpdate::new(payment_id)
-					},
-				};
+				let update = payment_claimed_store_update(payment_id, purpose, amount_msat);
 
 				match self.payment_store.update(&update) {
 					Ok(DataStoreUpdateResult::Updated) | Ok(DataStoreUpdateResult::Unchanged) => (
@@ -1249,14 +1248,12 @@ where
 					return Ok(());
 				};
 
-				let update = PaymentDetailsUpdate {
-					hash: Some(Some(payment_hash)),
-					preimage: Some(Some(payment_preimage)),
-					fee_paid_msat: Some(fee_paid_msat),
-					status: Some(PaymentStatus::Succeeded),
-					//fee_msat: Some(fee_paid_msat),
-					..PaymentDetailsUpdate::new(payment_id)
-				};
+				let update = payment_sent_store_update(
+					payment_id,
+					payment_hash,
+					payment_preimage,
+					fee_paid_msat,
+				);
 
 				match self.payment_store.update(&update) {
 					Ok(_) => {},
@@ -2394,6 +2391,121 @@ mod tests {
 		assert_eq!(reloaded.len(), 1);
 		assert_eq!(reloaded[0].id, payment_id);
 		assert_eq!(reloaded[0].status, PaymentStatus::Failed);
+	}
+
+	#[test]
+	fn circular_terminal_updates_are_distinct_and_idempotent_after_reload() {
+		let kv_store: Arc<DynStore> = Arc::new(InMemoryStore::new());
+		let logger = Arc::new(Logger::new_log_facade());
+		let payment_store = PaymentStore::new(
+			Vec::new(),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			Arc::clone(&kv_store),
+			Arc::clone(&logger),
+		);
+		let payment_hash = PaymentHash([2u8; 32]);
+		let inbound_payment_id = PaymentId(payment_hash.0);
+		let payment_preimage = PaymentPreimage([3u8; 32]);
+		let payment_secret = lightning_types::payment::PaymentSecret([4u8; 32]);
+		let operation_id = PaymentId([5u8; 32]);
+		let outbound_payment_id = crate::payment::derive_circular_outbound_payment_id(operation_id);
+		let first_hop_user_channel_id = UserChannelId(41);
+		let last_hop_user_channel_id = UserChannelId(42);
+		let amount_msat = 20_000_000;
+		let fee_paid_msat = 17_062;
+
+		payment_store
+			.insert(crate::payment::prepared_circular_payment_details(
+				"test-invoice".to_string(),
+				payment_hash,
+				payment_preimage,
+				payment_secret,
+				amount_msat,
+				crate::payment::CircularPaymentContext {
+					operation_id,
+					outbound_payment_id,
+					first_hop_user_channel_id,
+					last_hop_user_channel_id,
+					max_routing_fee_msat: 50_000,
+				},
+			))
+			.unwrap();
+		payment_store
+			.insert(PaymentDetails::new(
+				outbound_payment_id,
+				PaymentKind::Bolt11 {
+					hash: payment_hash,
+					preimage: None,
+					secret: Some(payment_secret),
+					bolt11_invoice: Some("test-invoice".to_string()),
+					required_receiving_channel_id: Some(last_hop_user_channel_id),
+					required_sending_channel_id: Some(first_hop_user_channel_id),
+					circular_operation_id: Some(operation_id),
+					circular_outbound_payment_id: Some(outbound_payment_id),
+					circular_max_routing_fee_msat: Some(50_000),
+				},
+				Some(amount_msat),
+				None,
+				PaymentDirection::Outbound,
+				PaymentStatus::Pending,
+			))
+			.unwrap();
+
+		let claimed_update = payment_claimed_store_update(
+			inbound_payment_id,
+			PaymentPurpose::Bolt11InvoicePayment {
+				payment_preimage: Some(payment_preimage),
+				payment_secret,
+			},
+			amount_msat,
+		);
+		let sent_update = payment_sent_store_update(
+			outbound_payment_id,
+			payment_hash,
+			payment_preimage,
+			Some(fee_paid_msat),
+		);
+		assert_eq!(payment_store.update(&claimed_update).unwrap(), DataStoreUpdateResult::Updated);
+		assert_eq!(payment_store.update(&sent_update).unwrap(), DataStoreUpdateResult::Updated);
+
+		let reloaded_payments =
+			crate::io::utils::read_payments(Arc::clone(&kv_store), Arc::clone(&logger)).unwrap();
+		assert_eq!(reloaded_payments.len(), 2);
+		let reloaded_store = PaymentStore::new(
+			reloaded_payments,
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			kv_store,
+			logger,
+		);
+		assert_eq!(
+			reloaded_store.update(&claimed_update).unwrap(),
+			DataStoreUpdateResult::Unchanged
+		);
+		assert_eq!(reloaded_store.update(&sent_update).unwrap(), DataStoreUpdateResult::Unchanged);
+
+		let inbound = reloaded_store.get(&inbound_payment_id).unwrap();
+		let outbound = reloaded_store.get(&outbound_payment_id).unwrap();
+		assert_ne!(inbound.id, outbound.id);
+		assert_eq!(inbound.direction, PaymentDirection::Inbound);
+		assert_eq!(outbound.direction, PaymentDirection::Outbound);
+		assert_eq!(inbound.status, PaymentStatus::Succeeded);
+		assert_eq!(outbound.status, PaymentStatus::Succeeded);
+		assert_eq!(inbound.amount_msat, Some(amount_msat));
+		assert_eq!(outbound.amount_msat, Some(amount_msat));
+		assert_eq!(inbound.fee_paid_msat, None);
+		assert_eq!(outbound.fee_paid_msat, Some(fee_paid_msat));
+		match (&inbound.kind, &outbound.kind) {
+			(
+				PaymentKind::Bolt11 { preimage: inbound_preimage, .. },
+				PaymentKind::Bolt11 { preimage: outbound_preimage, .. },
+			) => {
+				assert_eq!(*inbound_preimage, Some(payment_preimage));
+				assert_eq!(*outbound_preimage, Some(payment_preimage));
+			},
+			other => panic!("expected two BOLT 11 payment records, got {other:?}"),
+		}
 	}
 
 	#[test]
