@@ -2071,6 +2071,13 @@ mod tests {
 	use std::sync::atomic::{AtomicU16, Ordering};
 	use std::time::Duration;
 
+	use lightning::ln::channelmanager::RecipientOnionFields;
+	use lightning::ln::functional_test_utils::{
+		claim_payment_along_route, create_announced_chan_between_nodes, create_chanmon_cfgs,
+		create_network, create_node_cfgs, create_node_chanmgrs, fail_payment_along_route,
+		pass_along_path, remove_first_msg_event_to_node, ClaimAlongRouteArgs, TEST_FINAL_CLTV,
+	};
+	use lightning::ln::msgs::BaseMessageHandler;
 	use lightning::util::test_utils::TestLogger;
 
 	use super::*;
@@ -2326,6 +2333,124 @@ mod tests {
 		);
 		assert_eq!(*actions.claimed.lock().unwrap(), vec![preimage]);
 		assert_eq!(*actions.failed.lock().unwrap(), vec![payment_hash]);
+	}
+
+	#[test]
+	fn real_htlc_wrong_channel_fails_and_exact_channel_claims() {
+		let chanmon_cfgs = create_chanmon_cfgs(2);
+		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+		create_announced_chan_between_nodes(&nodes, 0, 1);
+
+		let amount_msat = 5_000_000;
+		let path = &[&nodes[1]][..];
+
+		let (wrong_route, wrong_hash, wrong_preimage, wrong_secret) =
+			lightning::get_route_and_payment_hash!(nodes[0], nodes[1], amount_msat);
+		nodes[0]
+			.node
+			.send_payment_with_route(
+				wrong_route,
+				wrong_hash,
+				RecipientOnionFields::secret_only(wrong_secret),
+				PaymentId(wrong_hash.0),
+			)
+			.unwrap();
+		lightning::check_added_monitors!(nodes[0], 1);
+		let mut wrong_messages = nodes[0].node.get_and_clear_pending_msg_events();
+		let wrong_event = pass_along_path(
+			&nodes[0],
+			path,
+			amount_msat,
+			wrong_hash,
+			Some(wrong_secret),
+			remove_first_msg_event_to_node(&nodes[1].node.get_our_node_id(), &mut wrong_messages),
+			true,
+			None,
+		)
+		.unwrap();
+		let wrong_receiving_channels = match wrong_event {
+			LdkEvent::PaymentClaimable { receiving_channel_ids, .. } => receiving_channel_ids,
+			_ => panic!("expected PaymentClaimable"),
+		};
+		let actual_user_channel_id =
+			wrong_receiving_channels[0].1.expect("test channel has a user channel ID");
+		let wrong_required_channel_id = UserChannelId(actual_user_channel_id.wrapping_add(1));
+		let wrong_kind =
+			test_circular_payment_kind(wrong_hash, wrong_preimage, wrong_required_channel_id);
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&wrong_kind,
+				PaymentStatus::Pending,
+				Some(amount_msat),
+				amount_msat,
+				&wrong_receiving_channels,
+			),
+			ChannelConstrainedClaimDecision::Fail
+		);
+		fail_payment_along_route(&nodes[0], &[path], false, wrong_hash);
+
+		let (exact_route, exact_hash, exact_preimage, exact_secret) =
+			lightning::get_route_and_payment_hash!(nodes[0], nodes[1], amount_msat);
+		nodes[0]
+			.node
+			.send_payment_with_route(
+				exact_route,
+				exact_hash,
+				RecipientOnionFields::secret_only(exact_secret),
+				PaymentId(exact_hash.0),
+			)
+			.unwrap();
+		lightning::check_added_monitors!(nodes[0], 1);
+		let mut exact_messages = nodes[0].node.get_and_clear_pending_msg_events();
+		let exact_event = pass_along_path(
+			&nodes[0],
+			path,
+			amount_msat,
+			exact_hash,
+			Some(exact_secret),
+			remove_first_msg_event_to_node(&nodes[1].node.get_our_node_id(), &mut exact_messages),
+			true,
+			None,
+		)
+		.unwrap();
+		let exact_receiving_channels = match exact_event {
+			LdkEvent::PaymentClaimable { receiving_channel_ids, .. } => receiving_channel_ids,
+			_ => panic!("expected PaymentClaimable"),
+		};
+		let exact_required_channel_id = UserChannelId(
+			exact_receiving_channels[0].1.expect("test channel has a user channel ID"),
+		);
+		let exact_kind =
+			test_circular_payment_kind(exact_hash, exact_preimage, exact_required_channel_id);
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&exact_kind,
+				PaymentStatus::Pending,
+				Some(amount_msat),
+				amount_msat,
+				&exact_receiving_channels,
+			),
+			ChannelConstrainedClaimDecision::Claim(exact_preimage)
+		);
+		claim_payment_along_route(ClaimAlongRouteArgs::new(&nodes[0], &[path], exact_preimage));
+	}
+
+	fn test_circular_payment_kind(
+		hash: PaymentHash, preimage: PaymentPreimage, required_channel_id: UserChannelId,
+	) -> PaymentKind {
+		PaymentKind::Bolt11 {
+			hash,
+			preimage: Some(preimage),
+			secret: None,
+			bolt11_invoice: None,
+			required_receiving_channel_id: Some(required_channel_id),
+			required_sending_channel_id: Some(UserChannelId(required_channel_id.0.wrapping_add(2))),
+			circular_operation_id: Some(PaymentId([4u8; 32])),
+			circular_outbound_payment_id: Some(PaymentId([5u8; 32])),
+			circular_max_routing_fee_msat: Some(1_000_000),
+		}
 	}
 
 	#[tokio::test]
