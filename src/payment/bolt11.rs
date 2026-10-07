@@ -435,21 +435,8 @@ impl Bolt11Payment {
 		let mut recipient_onion = RecipientOnionFields::secret_only(*invoice.payment_secret());
 		recipient_onion.payment_metadata = invoice.payment_metadata().cloned();
 
-		self.channel_manager
-			.send_payment_with_route(route, payment_hash, recipient_onion, payment_id)
-			.map_err(|e| {
-				log_error!(
-					self.logger,
-					"Failed to send payment through selected first-hop channel {}: {:?}",
-					first_hop_user_channel_id,
-					e
-				);
-				match e {
-					RetryableSendFailure::DuplicatePayment => Error::DuplicatePayment,
-					_ => Error::PaymentSendingFailed,
-				}
-			})?;
-
+		// Persist the exact payment constraint before handing any HTLC to ChannelManager. If this
+		// write fails, no value-moving call is made.
 		let kind = PaymentKind::Bolt11 {
 			hash: payment_hash,
 			preimage: None,
@@ -465,6 +452,35 @@ impl Bolt11Payment {
 			PaymentStatus::Pending,
 		);
 		self.payment_store.insert(payment)?;
+
+		if let Err(e) = self.channel_manager.send_payment_with_route(
+			route,
+			payment_hash,
+			recipient_onion,
+			payment_id,
+		) {
+			// DuplicatePayment can mean ChannelManager recovered an already in-flight attempt after
+			// restart. Preserve Pending in that case so recovery evidence is not overwritten.
+			if e != RetryableSendFailure::DuplicatePayment {
+				let update = PaymentDetailsUpdate {
+					status: Some(PaymentStatus::Failed),
+					..PaymentDetailsUpdate::new(payment_id)
+				};
+				self.payment_store.update(&update)?;
+			}
+			return Err({
+				log_error!(
+					self.logger,
+					"Failed to send payment through selected first-hop channel {}: {:?}",
+					first_hop_user_channel_id,
+					e
+				);
+				match e {
+					RetryableSendFailure::DuplicatePayment => Error::DuplicatePayment,
+					_ => Error::PaymentSendingFailed,
+				}
+			});
+		}
 
 		log_info!(
 			self.logger,
