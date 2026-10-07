@@ -64,6 +64,54 @@ impl WordCount {
 	}
 }
 
+/// A single hop in a quote-only circular Lightning route.
+///
+/// The final hop's `node_id` is the local node because a circular route returns to the sender.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CircularRouteHop {
+	/// The node reached by this hop.
+	pub node_id: PublicKey,
+	/// The short channel ID or channel alias used by this hop.
+	pub short_channel_id: u64,
+	/// The fee attributed to this hop in millisatoshis.
+	pub fee_msat: u64,
+	/// The CLTV delta attributed to this hop.
+	pub cltv_expiry_delta: u32,
+}
+
+/// One path in a quote-only circular Lightning route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CircularRoutePath {
+	/// The route hops, including the final hop back to the local node.
+	pub hops: Vec<CircularRouteHop>,
+	/// The principal delivered back to the local node in millisatoshis.
+	pub amount_msat: u64,
+	/// The routing fee for this path in millisatoshis.
+	pub fee_msat: u64,
+}
+
+/// A quote-only circular route pinned to exact local first- and last-hop channels.
+///
+/// Constructing this value does not send a probe, HTLC, or payment and does not mutate the payment
+/// store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CircularRouteQuote {
+	/// The requested principal in millisatoshis.
+	pub amount_msat: u64,
+	/// The total routing fee in millisatoshis.
+	pub total_routing_fee_msat: u64,
+	/// The exact local channel selected for the first hop.
+	pub first_hop_user_channel_id: UserChannelId,
+	/// The SCID or alias used for the first hop.
+	pub first_hop_short_channel_id: u64,
+	/// The exact local channel selected for the final hop.
+	pub last_hop_user_channel_id: UserChannelId,
+	/// The inbound SCID or alias used for the final hop.
+	pub last_hop_short_channel_id: u64,
+	/// The candidate paths. Every path is independently validated against both selected channels.
+	pub paths: Vec<CircularRoutePath>,
+}
+
 /// A supertrait that requires that a type implements both [`KVStore`] and [`KVStoreSync`] at the
 /// same time.
 pub trait SyncAndAsyncKVStore: KVStore + KVStoreSync {}

@@ -163,8 +163,8 @@ use types::{
 	OnionMessenger, PaymentStore, PeerManager, Router, Scorer, Sweeper, Wallet,
 };
 pub use types::{
-	ChannelDetails, ChannelMonitorSizeInfo, CustomTlvRecord, DynStore, KeyValue, PeerDetails,
-	SyncAndAsyncKVStore, UserChannelId, WordCount,
+	ChannelDetails, ChannelMonitorSizeInfo, CircularRouteHop, CircularRoutePath, CircularRouteQuote,
+	CustomTlvRecord, DynStore, KeyValue, PeerDetails, SyncAndAsyncKVStore, UserChannelId, WordCount,
 };
 pub use {
 	bip39, bitcoin, lightning, lightning_invoice, lightning_liquidity, lightning_types, tokio,

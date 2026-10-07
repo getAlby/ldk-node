@@ -10,6 +10,7 @@
 //! [BOLT 11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
 
 use std::sync::{Arc, RwLock};
+use std::str::FromStr;
 
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
@@ -18,12 +19,15 @@ use lightning::ln::channelmanager::{
 	RetryableSendFailure,
 };
 use lightning::routing::router::{
-	PaymentParameters, RouteParameters, RouteParametersConfig, Router as LdkRouter,
+	PaymentParameters, RouteHint, RouteHintHop, RouteParameters, RouteParametersConfig,
+	Router as LdkRouter,
 };
 use lightning_invoice::{
 	Bolt11Invoice as LdkBolt11Invoice, Bolt11InvoiceDescription as LdkBolt11InvoiceDescription,
+	DEFAULT_MIN_FINAL_CLTV_EXPIRY_DELTA,
 };
 use lightning_types::payment::{PaymentHash, PaymentPreimage};
+use lightning_types::routing::RoutingFees;
 
 use crate::config::{Config, LDK_PAYMENT_RETRY_TIMEOUT};
 use crate::connection::ConnectionManager;
@@ -38,8 +42,24 @@ use crate::payment::store::{
 };
 use crate::peer_store::{PeerInfo, PeerStore};
 use crate::runtime::Runtime;
-use crate::types::{ChannelManager, PaymentStore, Router};
+use crate::types::{
+	ChannelManager, CircularRouteHop, CircularRoutePath, CircularRouteQuote, PaymentStore, Router,
+};
 use crate::UserChannelId;
+
+fn circular_path_uses_exact_channels(
+	path: &lightning::routing::router::Path,
+	first_hop_node_id: bitcoin::secp256k1::PublicKey, first_hop_scid: u64,
+	synthetic_payee: bitcoin::secp256k1::PublicKey, last_hop_scid: u64,
+) -> bool {
+	let first_matches = path.hops.first().map_or(false, |hop| {
+		hop.pubkey == first_hop_node_id && hop.short_channel_id == first_hop_scid
+	});
+	let last_matches = path.hops.last().map_or(false, |hop| {
+		hop.pubkey == synthetic_payee && hop.short_channel_id == last_hop_scid
+	});
+	first_matches && last_matches
+}
 
 #[cfg(not(feature = "uniffi"))]
 type Bolt11Invoice = LdkBolt11Invoice;
@@ -90,6 +110,210 @@ impl Bolt11Payment {
 			is_running,
 			logger,
 		}
+	}
+
+	/// Find a circular route pinned to exact local first- and last-hop channels without sending
+	/// anything.
+	///
+	/// LDK intentionally rejects ordinary route searches whose payer and payee are the same node.
+	/// To make this a pure pathfinding operation, this method searches toward an unreachable
+	/// synthetic payee behind the selected inbound channel, then replaces that synthetic terminal
+	/// identity with the local node in the returned quote. The selected inbound SCID still comes
+	/// from the exact local channel and every path is validated before it is returned.
+	///
+	/// This method does not create an invoice, send a probe or HTLC, or write to the payment store.
+	pub fn quote_circular_route(
+		&self, amount_msat: u64, first_hop_user_channel_id: &UserChannelId,
+		last_hop_user_channel_id: &UserChannelId,
+		route_parameters: Option<RouteParametersConfig>,
+	) -> Result<CircularRouteQuote, Error> {
+		if !*self.is_running.read().unwrap() {
+			return Err(Error::NotRunning);
+		}
+		if amount_msat == 0 {
+			return Err(Error::InvalidAmount);
+		}
+		if first_hop_user_channel_id == last_hop_user_channel_id {
+			log_error!(self.logger, "Circular route requires two distinct local channels.");
+			return Err(Error::InvalidChannelId);
+		}
+
+		let usable_channels = self.channel_manager.list_usable_channels();
+		let first_hop = usable_channels
+			.iter()
+			.find(|channel| channel.user_channel_id == first_hop_user_channel_id.0)
+			.ok_or_else(|| {
+				log_error!(
+					self.logger,
+					"Selected circular-route first-hop channel {} is not usable.",
+					first_hop_user_channel_id
+				);
+				Error::InvalidChannelId
+			})?;
+		let first_hop_scid = first_hop.get_outbound_payment_scid().ok_or_else(|| {
+			log_error!(self.logger, "Selected circular-route first hop has no outbound SCID.");
+			Error::InvalidChannelId
+		})?;
+
+		let channels = self.channel_manager.list_channels();
+		let last_hop = channels
+			.iter()
+			.find(|channel| channel.user_channel_id == last_hop_user_channel_id.0)
+			.ok_or_else(|| {
+				log_error!(
+					self.logger,
+					"Selected circular-route last-hop channel {} was not found.",
+					last_hop_user_channel_id
+				);
+				Error::InvalidChannelId
+			})?;
+		if !last_hop.is_usable {
+			log_error!(
+				self.logger,
+				"Selected circular-route last-hop channel {} is not usable.",
+				last_hop_user_channel_id
+			);
+			return Err(Error::InvalidChannelId);
+		}
+		if last_hop.inbound_capacity_msat < amount_msat {
+			log_error!(
+				self.logger,
+				"Selected circular-route last-hop channel {} has insufficient inbound capacity.",
+				last_hop_user_channel_id
+			);
+			return Err(Error::InsufficientFunds);
+		}
+		let last_hop_scid = last_hop.get_inbound_payment_scid().ok_or_else(|| {
+			log_error!(self.logger, "Selected circular-route last hop has no inbound SCID.");
+			Error::InvalidChannelId
+		})?;
+		let forwarding_info = last_hop.counterparty.forwarding_info.as_ref().ok_or_else(|| {
+			log_error!(
+				self.logger,
+				"Selected circular-route last hop has no counterparty forwarding policy."
+			);
+			Error::InvalidChannelId
+		})?;
+
+		// This is secp256k1's generator public key (private key 1). It is intentionally unusable as
+		// a real destination here. Exact final-hop validation below ensures pathfinding can only use
+		// it behind the selected local inbound channel.
+		let synthetic_payee = bitcoin::secp256k1::PublicKey::from_str(
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+		)
+		.expect("hard-coded synthetic payee public key is valid");
+		if synthetic_payee == self.channel_manager.get_our_node_id() {
+			log_error!(self.logger, "Synthetic circular-route payee collides with local node ID.");
+			return Err(Error::InvalidNodeId);
+		}
+
+		let route_hint = RouteHint(vec![RouteHintHop {
+			src_node_id: last_hop.counterparty.node_id,
+			short_channel_id: last_hop_scid,
+			fees: RoutingFees {
+				base_msat: forwarding_info.fee_base_msat,
+				proportional_millionths: forwarding_info.fee_proportional_millionths,
+			},
+			cltv_expiry_delta: forwarding_info.cltv_expiry_delta,
+			htlc_minimum_msat: last_hop.inbound_htlc_minimum_msat,
+			htlc_maximum_msat: last_hop.inbound_htlc_maximum_msat,
+		}]);
+		let route_parameters =
+			route_parameters.or(self.config.route_parameters).unwrap_or_default();
+		let mut payment_params = PaymentParameters::from_node_id(
+			synthetic_payee,
+			DEFAULT_MIN_FINAL_CLTV_EXPIRY_DELTA as u32,
+		)
+		.with_route_hints(vec![route_hint])
+		.expect("clear payment parameters accept clear route hints");
+		payment_params.max_total_cltv_expiry_delta =
+			route_parameters.max_total_cltv_expiry_delta;
+		payment_params.max_path_count = route_parameters.max_path_count;
+		payment_params.max_channel_saturation_power_of_half =
+			route_parameters.max_channel_saturation_power_of_half;
+		let mut route_params =
+			RouteParameters::from_payment_params_and_value(payment_params, amount_msat);
+		route_params.max_total_routing_fee_msat = route_parameters.max_total_routing_fee_msat;
+
+		let mut quote_material = Vec::with_capacity(16 + 16 + 8);
+		quote_material.extend_from_slice(&first_hop.user_channel_id.to_be_bytes());
+		quote_material.extend_from_slice(&last_hop.user_channel_id.to_be_bytes());
+		quote_material.extend_from_slice(&amount_msat.to_be_bytes());
+		let quote_hash = Sha256::hash(&quote_material).to_byte_array();
+		let first_hops = [first_hop];
+		let route = self
+			.router
+			.find_route_with_id(
+				&self.channel_manager.get_our_node_id(),
+				&route_params,
+				Some(&first_hops),
+				self.channel_manager.compute_inflight_htlcs(),
+				PaymentHash(quote_hash),
+				PaymentId(quote_hash),
+			)
+			.map_err(|e| {
+				log_error!(
+					self.logger,
+					"Failed to quote circular route from channel {} to channel {}: {}",
+					first_hop_user_channel_id,
+					last_hop_user_channel_id,
+					e
+				);
+				Error::PaymentSendingFailed
+			})?;
+
+		let route_is_exact = !route.paths.is_empty()
+			&& route.paths.iter().all(|path| {
+				circular_path_uses_exact_channels(
+					path,
+					first_hop.counterparty.node_id,
+					first_hop_scid,
+					synthetic_payee,
+					last_hop_scid,
+				)
+			});
+		if !route_is_exact {
+			log_error!(
+				self.logger,
+				"Refused circular route that did not exclusively use the selected first and last hops."
+			);
+			return Err(Error::PaymentSendingFailed);
+		}
+
+		let our_node_id = self.channel_manager.get_our_node_id();
+		let paths = route
+			.paths
+			.iter()
+			.map(|path| CircularRoutePath {
+				hops: path
+					.hops
+					.iter()
+					.enumerate()
+					.map(|(index, hop)| CircularRouteHop {
+						node_id: if index + 1 == path.hops.len() {
+							our_node_id
+						} else {
+							hop.pubkey
+						},
+						short_channel_id: hop.short_channel_id,
+						fee_msat: hop.fee_msat,
+						cltv_expiry_delta: hop.cltv_expiry_delta,
+					})
+					.collect(),
+				amount_msat: path.final_value_msat(),
+				fee_msat: path.fee_msat(),
+			})
+			.collect();
+
+		Ok(CircularRouteQuote {
+			amount_msat,
+			total_routing_fee_msat: route.get_total_fees(),
+			first_hop_user_channel_id: *first_hop_user_channel_id,
+			first_hop_short_channel_id: first_hop_scid,
+			last_hop_user_channel_id: *last_hop_user_channel_id,
+			last_hop_short_channel_id: last_hop_scid,
+			paths,
+		})
 	}
 
 	/// Send a fixed-amount invoice using exactly one local channel as the first hop.
@@ -1089,5 +1313,65 @@ impl Bolt11Payment {
 			})?;
 
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use lightning::routing::router::{Path, RouteHop};
+	use lightning::types::features::{ChannelFeatures, NodeFeatures};
+
+	fn route_hop(pubkey: bitcoin::secp256k1::PublicKey, short_channel_id: u64) -> RouteHop {
+		RouteHop {
+			pubkey,
+			node_features: NodeFeatures::empty(),
+			short_channel_id,
+			channel_features: ChannelFeatures::empty(),
+			fee_msat: 0,
+			cltv_expiry_delta: 18,
+			maybe_announced_channel: true,
+		}
+	}
+
+	#[test]
+	fn circular_path_validation_requires_both_exact_channel_scids() {
+		let first_node = bitcoin::secp256k1::PublicKey::from_str(
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+		)
+		.unwrap();
+		let synthetic_payee = bitcoin::secp256k1::PublicKey::from_str(
+			"02c6047f9441ed7d6d3045406e95c07cd85a294d1b04c8fe6c9a5c3315b95c709e",
+		)
+		.unwrap();
+		let path = Path {
+			hops: vec![
+				route_hop(first_node, 41),
+				route_hop(synthetic_payee, 99),
+			],
+			blinded_tail: None,
+		};
+
+		assert!(circular_path_uses_exact_channels(
+			&path,
+			first_node,
+			41,
+			synthetic_payee,
+			99
+		));
+		assert!(!circular_path_uses_exact_channels(
+			&path,
+			first_node,
+			42,
+			synthetic_payee,
+			99
+		));
+		assert!(!circular_path_uses_exact_channels(
+			&path,
+			first_node,
+			41,
+			synthetic_payee,
+			100
+		));
 	}
 }
