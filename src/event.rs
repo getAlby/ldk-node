@@ -2081,13 +2081,17 @@ mod tests {
 	use std::sync::atomic::{AtomicU16, Ordering};
 	use std::time::Duration;
 
-	use lightning::ln::channelmanager::RecipientOnionFields;
+	use bitcoin::hashes::Hash as _;
+	use lightning::ln::channelmanager::{Bolt11InvoiceParameters, RecipientOnionFields};
 	use lightning::ln::functional_test_utils::{
-		claim_payment_along_route, create_announced_chan_between_nodes, create_chanmon_cfgs,
-		create_network, create_node_cfgs, create_node_chanmgrs, fail_payment_along_route,
-		pass_along_path, remove_first_msg_event_to_node, ClaimAlongRouteArgs, TEST_FINAL_CLTV,
+		_reload_node, claim_payment_along_route, create_announced_chan_between_nodes,
+		create_announced_chan_between_nodes_with_value, create_chanmon_cfgs, create_network,
+		create_node_cfgs, create_node_chanmgrs, fail_payment_along_route, pass_along_path,
+		remove_first_msg_event_to_node, test_default_channel_config, ClaimAlongRouteArgs,
+		TEST_FINAL_CLTV,
 	};
 	use lightning::ln::msgs::BaseMessageHandler;
+	use lightning::reload_node;
 	use lightning::util::test_utils::TestLogger;
 
 	use super::*;
@@ -2389,6 +2393,126 @@ mod tests {
 		assert_eq!(reloaded.len(), 1);
 		assert_eq!(reloaded[0].id, payment_id);
 		assert_eq!(reloaded[0].status, PaymentStatus::Failed);
+	}
+
+	#[test]
+	fn pending_prepared_operation_and_channel_manager_state_survive_restart() {
+		let chanmon_cfgs = create_chanmon_cfgs(3);
+		let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+		let persister;
+		let new_chain_monitor;
+		let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
+		let node_1_deserialized;
+		let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+		let (_, _, first_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 1, 0, 100_000, 0);
+		let (_, _, last_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 2, 1, 100_000, 0);
+
+		let channels = nodes[1].node.list_channels();
+		let first_hop_user_channel_id = UserChannelId(
+			channels
+				.iter()
+				.find(|channel| channel.channel_id == first_channel_id)
+				.unwrap()
+				.user_channel_id,
+		);
+		let last_hop_user_channel_id = UserChannelId(
+			channels
+				.iter()
+				.find(|channel| channel.channel_id == last_channel_id)
+				.unwrap()
+				.user_channel_id,
+		);
+		assert_ne!(first_hop_user_channel_id, last_hop_user_channel_id);
+
+		let amount_msat = 20_000_000;
+		let max_routing_fee_msat = 1_000_000;
+		let invoice = nodes[1]
+			.node
+			.create_bolt11_invoice(Bolt11InvoiceParameters {
+				amount_msats: Some(amount_msat),
+				..Default::default()
+			})
+			.unwrap();
+		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
+		let payment_secret = *invoice.payment_secret();
+		let payment_preimage =
+			nodes[1].node.get_payment_preimage(payment_hash, payment_secret).unwrap();
+		let payment_id = PaymentId(payment_hash.0);
+		let operation_id = PaymentId([7u8; 32]);
+		let outbound_payment_id = crate::payment::derive_circular_outbound_payment_id(operation_id);
+
+		let kv_store: Arc<DynStore> = Arc::new(InMemoryStore::new());
+		let logger = Arc::new(Logger::new_log_facade());
+		let payment_store = PaymentStore::new(
+			Vec::new(),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			Arc::clone(&kv_store),
+			Arc::clone(&logger),
+		);
+		let payment = crate::payment::prepared_circular_payment_details(
+			invoice.to_string(),
+			payment_hash,
+			payment_preimage,
+			payment_secret,
+			amount_msat,
+			crate::payment::CircularPaymentContext {
+				operation_id,
+				outbound_payment_id,
+				first_hop_user_channel_id,
+				last_hop_user_channel_id,
+				max_routing_fee_msat,
+			},
+		);
+		payment_store.insert(payment.clone()).unwrap();
+		assert!(nodes[1].node.list_recent_payments().is_empty());
+
+		let channel_manager_bytes = nodes[1].node.encode();
+		let first_monitor_bytes = lightning::get_monitor!(nodes[1], first_channel_id).encode();
+		let last_monitor_bytes = lightning::get_monitor!(nodes[1], last_channel_id).encode();
+		reload_node!(
+			nodes[1],
+			channel_manager_bytes,
+			&[&first_monitor_bytes, &last_monitor_bytes],
+			persister,
+			new_chain_monitor,
+			node_1_deserialized
+		);
+
+		assert_eq!(
+			nodes[1].node.get_payment_preimage(payment_hash, payment_secret).unwrap(),
+			payment_preimage
+		);
+		let reloaded_channels = nodes[1].node.list_channels();
+		let reloaded_first_channel = reloaded_channels
+			.iter()
+			.find(|channel| channel.channel_id == first_channel_id)
+			.unwrap();
+		assert_eq!(reloaded_first_channel.user_channel_id, first_hop_user_channel_id.0);
+		assert!(!reloaded_first_channel.is_usable);
+		let reloaded_last_channel =
+			reloaded_channels.iter().find(|channel| channel.channel_id == last_channel_id).unwrap();
+		assert_eq!(reloaded_last_channel.user_channel_id, last_hop_user_channel_id.0);
+		assert!(!reloaded_last_channel.is_usable);
+		assert!(nodes[1].node.list_recent_payments().is_empty());
+
+		let reloaded_payments =
+			crate::io::utils::read_payments(Arc::clone(&kv_store), Arc::clone(&logger)).unwrap();
+		assert_eq!(reloaded_payments, vec![payment.clone()]);
+		let reloaded_payment_store = PaymentStore::new(
+			reloaded_payments,
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			kv_store,
+			logger,
+		);
+		assert!(crate::payment::circular_operation_is_prepared(
+			&reloaded_payment_store,
+			operation_id,
+		));
+		assert_eq!(reloaded_payment_store.get(&payment_id), Some(payment));
 	}
 
 	#[test]

@@ -16,6 +16,10 @@ pub(crate) mod store;
 mod unified_qr;
 
 pub use bolt11::Bolt11Payment;
+pub(crate) use bolt11::{
+	circular_operation_is_prepared, derive_circular_outbound_payment_id,
+	prepared_circular_payment_details, CircularPaymentContext,
+};
 pub use bolt12::Bolt12Payment;
 pub use onchain::OnchainPayment;
 pub use spontaneous::SpontaneousPayment;
