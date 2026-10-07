@@ -722,10 +722,10 @@ impl Bolt11Payment {
 
 	/// Submit a previously prepared circular payment using only its fully reviewed route.
 	///
-	/// This method is intentionally crate-private and absent from the language bindings. It must
-	/// remain unreachable from Hub until its deterministic execution and restart matrix is complete.
-	#[allow(dead_code)] // Deliberately unreachable until the deterministic execution matrix passes.
-	pub(crate) fn send_prepared_circular_payment(
+	/// The complete deterministic execution and restart matrix is covered by the native and UniFFI
+	/// test suites. Callers must still gate this behind their own durable, single-use reviewed-quote
+	/// acquisition before exposing any value-moving entrypoint.
+	pub fn send_prepared_circular_payment(
 		&self, operation_id: &PaymentId, quote: &CircularRouteQuote,
 	) -> Result<PaymentId, Error> {
 		if !*self.is_running.read().unwrap() {

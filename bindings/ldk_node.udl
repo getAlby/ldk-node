@@ -201,6 +201,8 @@ interface Bolt11Payment {
 	[Throws=NodeError]
 	PreparedCircularPayment prepare_circular_payment(u64 amount_msat, [ByRef]Bolt11InvoiceDescription description, u32 expiry_secs, [ByRef]PaymentId operation_id, [ByRef]UserChannelId first_hop_user_channel_id, [ByRef]UserChannelId last_hop_user_channel_id, u64 max_routing_fee_msat);
 	[Throws=NodeError]
+	PaymentId send_prepared_circular_payment([ByRef]PaymentId operation_id, [ByRef]CircularRouteQuote quote);
+	[Throws=NodeError]
 	PaymentId send([ByRef]Bolt11Invoice invoice, RouteParametersConfig? route_parameters);
 	[Throws=NodeError]
 	PaymentId send_with_first_hop([ByRef]Bolt11Invoice invoice, [ByRef]UserChannelId first_hop_user_channel_id, RouteParametersConfig? route_parameters);
