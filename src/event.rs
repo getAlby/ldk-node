@@ -117,6 +117,21 @@ fn apply_channel_constrained_claim_decision<A: ChannelConstrainedClaimActions>(
 	}
 }
 
+fn handle_channel_constrained_claim<A: ChannelConstrainedClaimActions>(
+	actions: &A, payment_store: &PaymentStore, payment_id: PaymentId, payment_hash: &PaymentHash,
+	decision: ChannelConstrainedClaimDecision,
+) -> Result<ChannelConstrainedClaimOutcome, Error> {
+	let outcome = apply_channel_constrained_claim_decision(actions, payment_hash, decision);
+	if outcome == ChannelConstrainedClaimOutcome::Failed {
+		let update = PaymentDetailsUpdate {
+			status: Some(PaymentStatus::Failed),
+			..PaymentDetailsUpdate::new(payment_id)
+		};
+		payment_store.update(&update)?;
+	}
+	Ok(outcome)
+}
+
 fn channel_constrained_claim_decision(
 	kind: &PaymentKind, status: PaymentStatus, expected_amount_msat: Option<u64>,
 	actual_amount_msat: u64, receiving_channel_ids: &[(ChannelId, Option<u128>)],
@@ -882,11 +897,20 @@ where
 						amount_msat,
 						receiving_channel_ids.as_slice(),
 					);
-					match apply_channel_constrained_claim_decision(
+					let claim_outcome = match handle_channel_constrained_claim(
 						&*self.channel_manager,
+						&self.payment_store,
+						payment_id,
 						&payment_hash,
 						claim_decision,
 					) {
+						Ok(outcome) => outcome,
+						Err(e) => {
+							log_error!(self.logger, "Failed to access payment store: {}", e);
+							return Err(ReplayEvent());
+						},
+					};
+					match claim_outcome {
 						ChannelConstrainedClaimOutcome::Claimed => {
 							log_info!(
 								self.logger,
@@ -899,21 +923,7 @@ where
 								self.logger,
 								"Refused channel-constrained inbound payment because its amount, preimage state, or receiving channels did not match the persisted constraint."
 							);
-							let update = PaymentDetailsUpdate {
-								status: Some(PaymentStatus::Failed),
-								..PaymentDetailsUpdate::new(payment_id)
-							};
-							match self.payment_store.update(&update) {
-								Ok(_) => return Ok(()),
-								Err(e) => {
-									log_error!(
-										self.logger,
-										"Failed to access payment store: {}",
-										e
-									);
-									return Err(ReplayEvent());
-								},
-							}
+							return Ok(());
 						},
 						ChannelConstrainedClaimOutcome::NotConstrained => {},
 					}
@@ -2082,6 +2092,9 @@ mod tests {
 
 	use super::*;
 	use crate::io::test_utils::InMemoryStore;
+	use crate::io::{
+		PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+	};
 
 	#[derive(Default)]
 	struct TestChannelConstrainedClaimActions {
@@ -2333,6 +2346,49 @@ mod tests {
 		);
 		assert_eq!(*actions.claimed.lock().unwrap(), vec![preimage]);
 		assert_eq!(*actions.failed.lock().unwrap(), vec![payment_hash]);
+	}
+
+	#[test]
+	fn rejected_constrained_claim_persists_failed_state_for_reload() {
+		let kv_store: Arc<DynStore> = Arc::new(InMemoryStore::new());
+		let logger = Arc::new(Logger::new_log_facade());
+		let payment_store = PaymentStore::new(
+			Vec::new(),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			Arc::clone(&kv_store),
+			Arc::clone(&logger),
+		);
+		let payment_hash = PaymentHash([2u8; 32]);
+		let payment_id = PaymentId(payment_hash.0);
+		let payment = PaymentDetails::new(
+			payment_id,
+			test_circular_payment_kind(payment_hash, PaymentPreimage([3u8; 32]), UserChannelId(42)),
+			Some(20_000_000),
+			None,
+			PaymentDirection::Inbound,
+			PaymentStatus::Pending,
+		);
+		payment_store.insert(payment).unwrap();
+
+		let actions = TestChannelConstrainedClaimActions::default();
+		assert_eq!(
+			handle_channel_constrained_claim(
+				&actions,
+				&payment_store,
+				payment_id,
+				&payment_hash,
+				ChannelConstrainedClaimDecision::Fail,
+			)
+			.unwrap(),
+			ChannelConstrainedClaimOutcome::Failed
+		);
+		assert_eq!(*actions.failed.lock().unwrap(), vec![payment_hash]);
+
+		let reloaded = crate::io::utils::read_payments(kv_store, logger).unwrap();
+		assert_eq!(reloaded.len(), 1);
+		assert_eq!(reloaded[0].id, payment_id);
+		assert_eq!(reloaded[0].status, PaymentStatus::Failed);
 	}
 
 	#[test]
