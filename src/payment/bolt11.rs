@@ -442,6 +442,7 @@ impl Bolt11Payment {
 			preimage: None,
 			secret: Some(*invoice.payment_secret()),
 			bolt11_invoice: Some(invoice.to_string()),
+			required_receiving_channel_id: None,
 		};
 		let payment = PaymentDetails::new(
 			payment_id,
@@ -536,6 +537,7 @@ impl Bolt11Payment {
 					preimage: None,
 					secret: payment_secret,
 					bolt11_invoice: Some(invoice.to_string()),
+					required_receiving_channel_id: None,
 				};
 				let payment = PaymentDetails::new(
 					payment_id,
@@ -566,6 +568,7 @@ impl Bolt11Payment {
 							preimage: None,
 							secret: payment_secret,
 							bolt11_invoice: Some(invoice.to_string()),
+							required_receiving_channel_id: None,
 						};
 						let payment = PaymentDetails::new(
 							payment_id,
@@ -648,6 +651,7 @@ impl Bolt11Payment {
 					preimage: None,
 					bolt11_invoice: Some(invoice.to_string()),
 					secret: payment_secret,
+					required_receiving_channel_id: None,
 				};
 
 				let payment = PaymentDetails::new(
@@ -680,6 +684,7 @@ impl Bolt11Payment {
 							preimage: None,
 							secret: payment_secret,
 							bolt11_invoice: Some(invoice.to_string()),
+							required_receiving_channel_id: None,
 						};
 						let payment = PaymentDetails::new(
 							payment_id,
@@ -995,6 +1000,7 @@ impl Bolt11Payment {
 			preimage,
 			secret: Some(payment_secret.clone()),
 			bolt11_invoice: Some(invoice.to_string()),
+			required_receiving_channel_id: None,
 		};
 		let payment = PaymentDetails::new(
 			id,

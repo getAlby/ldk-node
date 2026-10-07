@@ -18,7 +18,6 @@ use lightning::events::bump_transaction::BumpTransactionEvent;
 use lightning::events::{
 	ClosureReason, Event as LdkEvent, PaymentFailureReason, PaymentPurpose, ReplayEvent,
 };
-use lightning::{impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
 use lightning::ln::channelmanager::{FailureCode, PaymentId};
 use lightning::ln::types::ChannelId;
 use lightning::routing::gossip::NodeId;
@@ -28,6 +27,7 @@ use lightning::util::config::{
 use lightning::util::errors::APIError;
 use lightning::util::persist::KVStore;
 use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
+use lightning::{impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
 use lightning_liquidity::lsps2::utils::compute_opening_fee;
 use lightning_types::payment::{PaymentHash, PaymentPreimage};
 use rand::{rng, Rng};
@@ -69,6 +69,41 @@ impl_writeable_tlv_based!(ReceivingChannel, {
 	(0, channel_id, required),
 	(2, user_channel_id, option),
 });
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelConstrainedClaimDecision {
+	NotConstrained,
+	Claim(PaymentPreimage),
+	Fail,
+}
+
+fn channel_constrained_claim_decision(
+	kind: &PaymentKind, status: PaymentStatus, expected_amount_msat: Option<u64>,
+	actual_amount_msat: u64, receiving_channel_ids: &[(ChannelId, Option<u128>)],
+) -> ChannelConstrainedClaimDecision {
+	let (preimage, required_channel_id) = match kind {
+		PaymentKind::Bolt11 {
+			preimage,
+			required_receiving_channel_id: Some(required_channel_id),
+			..
+		} => (preimage, required_channel_id),
+		_ => return ChannelConstrainedClaimDecision::NotConstrained,
+	};
+
+	let amount_matches =
+		expected_amount_msat.map(|expected| actual_amount_msat == expected).unwrap_or(false);
+	let every_part_matches = !receiving_channel_ids.is_empty()
+		&& receiving_channel_ids
+			.iter()
+			.all(|(_, user_channel_id)| *user_channel_id == Some(required_channel_id.0));
+
+	match preimage
+		.filter(|_| status == PaymentStatus::Pending && amount_matches && every_part_matches)
+	{
+		Some(preimage) => ChannelConstrainedClaimDecision::Claim(preimage),
+		None => ChannelConstrainedClaimDecision::Fail,
+	}
+}
 
 /// An event emitted by [`Node`], which should be handled by the user.
 ///
@@ -768,51 +803,99 @@ where
 						}
 					}
 
-					// If this is known by the store but ChannelManager doesn't know the preimage,
-					// the payment has been registered via `_for_hash` variants and needs to be manually claimed via
-					// user interaction.
-					match info.kind {
-						PaymentKind::Bolt11 { preimage, .. }
-						| PaymentKind::Bolt11Jit { preimage, .. } => {
-							if purpose.preimage().is_none() {
-								debug_assert!(
-									preimage.is_none(),
-									"We would have registered the preimage if we knew"
-								);
-
-								let custom_records = onion_fields
-									.map(|cf| {
-										cf.custom_tlvs().into_iter().map(|tlv| tlv.into()).collect()
-									})
-									.unwrap_or_default();
-								let event = Event::PaymentClaimable {
-									payment_id,
-									payment_hash,
-									claimable_amount_msat: amount_msat,
-									claim_deadline,
-									custom_records,
-									receiving_channels: receiving_channel_ids
-										.iter()
-										.map(|(channel_id, user_channel_id)| ReceivingChannel {
-											channel_id: *channel_id,
-											user_channel_id: user_channel_id.map(UserChannelId),
-										})
-										.collect(),
-								};
-								match self.event_queue.add_event(event).await {
-									Ok(_) => return Ok(()),
-									Err(e) => {
-										log_error!(
-											self.logger,
-											"Failed to push to event queue: {}",
-											e
-										);
-										return Err(ReplayEvent());
-									},
-								};
+					// A prepared circular payment keeps its preimage in the payment store and may
+					// claim only after every MPP part is proven to have arrived through the exact
+					// required local channel. Apply the constraint even if ChannelManager unexpectedly
+					// knows the preimage.
+					match channel_constrained_claim_decision(
+						&info.kind,
+						info.status,
+						info.amount_msat,
+						amount_msat,
+						receiving_channel_ids.as_slice(),
+					) {
+						ChannelConstrainedClaimDecision::Claim(preimage) => {
+							self.channel_manager.claim_funds(preimage);
+							log_info!(
+								self.logger,
+								"Claimed channel-constrained inbound payment through its required channel."
+							);
+							return Ok(());
+						},
+						ChannelConstrainedClaimDecision::Fail => {
+							log_info!(
+								self.logger,
+								"Refused channel-constrained inbound payment because its amount, preimage state, or receiving channels did not match the persisted constraint."
+							);
+							self.channel_manager.fail_htlc_backwards(&payment_hash);
+							let update = PaymentDetailsUpdate {
+								status: Some(PaymentStatus::Failed),
+								..PaymentDetailsUpdate::new(payment_id)
+							};
+							match self.payment_store.update(&update) {
+								Ok(_) => return Ok(()),
+								Err(e) => {
+									log_error!(
+										self.logger,
+										"Failed to access payment store: {}",
+										e
+									);
+									return Err(ReplayEvent());
+								},
 							}
 						},
-						_ => {},
+						ChannelConstrainedClaimDecision::NotConstrained => {},
+					}
+
+					// If this is known by the store but ChannelManager doesn't know the preimage,
+					// the payment has been registered via a `_for_hash` variant. Ordinary payments
+					// are surfaced for manual claiming.
+					let manually_claimable = match info.kind {
+						PaymentKind::Bolt11 { preimage, required_receiving_channel_id, .. }
+							if purpose.preimage().is_none() =>
+						{
+							debug_assert!(required_receiving_channel_id.is_none());
+							debug_assert!(
+								preimage.is_none(),
+								"Ordinary manual-claim payments must not persist a preimage"
+							);
+							true
+						},
+						PaymentKind::Bolt11Jit { preimage, .. } if purpose.preimage().is_none() => {
+							debug_assert!(
+								preimage.is_none(),
+								"We would have registered the preimage if we knew"
+							);
+							true
+						},
+						_ => false,
+					};
+
+					if manually_claimable {
+						let custom_records = onion_fields
+							.map(|cf| cf.custom_tlvs().into_iter().map(|tlv| tlv.into()).collect())
+							.unwrap_or_default();
+						let event = Event::PaymentClaimable {
+							payment_id,
+							payment_hash,
+							claimable_amount_msat: amount_msat,
+							claim_deadline,
+							custom_records,
+							receiving_channels: receiving_channel_ids
+								.iter()
+								.map(|(channel_id, user_channel_id)| ReceivingChannel {
+									channel_id: *channel_id,
+									user_channel_id: user_channel_id.map(UserChannelId),
+								})
+								.collect(),
+						};
+						match self.event_queue.add_event(event).await {
+							Ok(_) => return Ok(()),
+							Err(e) => {
+								log_error!(self.logger, "Failed to push to event queue: {}", e);
+								return Err(ReplayEvent());
+							},
+						};
 					}
 				} else if counterparty_skimmed_fee_msat > 0 {
 					// We only ever authorize an LSP to withhold a fee for JIT-channel payments we
@@ -1989,6 +2072,114 @@ mod tests {
 		let deser_event_queue =
 			EventQueue::read(&mut &persisted_bytes[..], (Arc::clone(&store), logger)).unwrap();
 		assert_eq!(deser_event_queue.next_event(), Some(expected_event));
+	}
+
+	#[test]
+	fn channel_constrained_claim_requires_amount_preimage_and_every_exact_mpp_part() {
+		let preimage = PaymentPreimage([3u8; 32]);
+		let constrained = PaymentKind::Bolt11 {
+			hash: PaymentHash([2u8; 32]),
+			preimage: Some(preimage),
+			secret: None,
+			bolt11_invoice: None,
+			required_receiving_channel_id: Some(UserChannelId(42)),
+		};
+		let exact_parts = vec![(ChannelId([1u8; 32]), Some(42)), (ChannelId([2u8; 32]), Some(42))];
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&constrained,
+				PaymentStatus::Pending,
+				Some(20_000_000),
+				20_000_000,
+				&exact_parts
+			),
+			ChannelConstrainedClaimDecision::Claim(preimage)
+		);
+
+		let mixed_parts = vec![(ChannelId([1u8; 32]), Some(42)), (ChannelId([2u8; 32]), Some(43))];
+		let unidentified_part = vec![(ChannelId([1u8; 32]), None)];
+		for non_matching_parts in [&mixed_parts[..], &unidentified_part[..], &[]] {
+			assert_eq!(
+				channel_constrained_claim_decision(
+					&constrained,
+					PaymentStatus::Pending,
+					Some(20_000_000),
+					20_000_000,
+					non_matching_parts,
+				),
+				ChannelConstrainedClaimDecision::Fail
+			);
+		}
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&constrained,
+				PaymentStatus::Pending,
+				Some(20_000_000),
+				19_999_999,
+				&exact_parts
+			),
+			ChannelConstrainedClaimDecision::Fail
+		);
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&constrained,
+				PaymentStatus::Pending,
+				Some(20_000_000),
+				20_000_001,
+				&exact_parts,
+			),
+			ChannelConstrainedClaimDecision::Fail
+		);
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&constrained,
+				PaymentStatus::Pending,
+				None,
+				20_000_000,
+				&exact_parts,
+			),
+			ChannelConstrainedClaimDecision::Fail
+		);
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&constrained,
+				PaymentStatus::Failed,
+				Some(20_000_000),
+				20_000_000,
+				&exact_parts,
+			),
+			ChannelConstrainedClaimDecision::Fail
+		);
+
+		let mut missing_preimage = constrained.clone();
+		if let PaymentKind::Bolt11 { preimage, .. } = &mut missing_preimage {
+			*preimage = None;
+		}
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&missing_preimage,
+				PaymentStatus::Pending,
+				Some(20_000_000),
+				20_000_000,
+				&exact_parts,
+			),
+			ChannelConstrainedClaimDecision::Fail
+		);
+
+		let mut unconstrained = constrained;
+		if let PaymentKind::Bolt11 { required_receiving_channel_id, .. } = &mut unconstrained {
+			*required_receiving_channel_id = None;
+		}
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&unconstrained,
+				PaymentStatus::Pending,
+				Some(20_000_000),
+				20_000_000,
+				&exact_parts,
+			),
+			ChannelConstrainedClaimDecision::NotConstrained
+		);
 	}
 
 	#[tokio::test]

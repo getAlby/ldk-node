@@ -162,7 +162,13 @@ impl Readable for PaymentDetails {
 						lsp_fee_limits,
 					}
 				} else {
-					PaymentKind::Bolt11 { hash, preimage, secret, bolt11_invoice: None }
+					PaymentKind::Bolt11 {
+						hash,
+						preimage,
+						secret,
+						bolt11_invoice: None,
+						required_receiving_channel_id: None,
+					}
 				}
 			} else {
 				PaymentKind::Spontaneous { hash, preimage, custom_tlvs: Vec::new() }
@@ -389,6 +395,9 @@ pub enum PaymentKind {
 		secret: Option<PaymentSecret>,
 		/// The invoice that was paid.
 		bolt11_invoice: Option<String>,
+		/// If set, an inbound manually-claimable payment may only be claimed when every HTLC part
+		/// arrived through this exact local channel. Used by prepared circular rebalances.
+		required_receiving_channel_id: Option<crate::UserChannelId>,
 	},
 	/// A [BOLT 11] payment intended to open an [bLIP-52 / LSPS 2] just-in-time channel.
 	///
@@ -497,6 +506,7 @@ impl_writeable_tlv_based_enum!(PaymentKind,
 		(2, preimage, option),
 		(4, secret, option),
 		(131072, bolt11_invoice, option),
+		(131074, required_receiving_channel_id, option),
 	},
 	(4, Bolt11Jit) => {
 		(0, hash, required),
@@ -714,7 +724,13 @@ mod tests {
 			);
 
 			match bolt11_decoded.kind {
-				PaymentKind::Bolt11 { hash: h, preimage: p, secret: s, bolt11_invoice: None } => {
+				PaymentKind::Bolt11 {
+					hash: h,
+					preimage: p,
+					secret: s,
+					bolt11_invoice: None,
+					required_receiving_channel_id: None,
+				} => {
 					assert_eq!(hash, h);
 					assert_eq!(preimage, p);
 					assert_eq!(secret, s);
@@ -812,5 +828,27 @@ mod tests {
 				},
 			}
 		}
+	}
+
+	#[test]
+	fn channel_constrained_bolt11_payment_roundtrips() {
+		let payment = PaymentDetails::new(
+			PaymentId([1u8; 32]),
+			PaymentKind::Bolt11 {
+				hash: PaymentHash([2u8; 32]),
+				preimage: Some(PaymentPreimage([3u8; 32])),
+				secret: Some(PaymentSecret([4u8; 32])),
+				bolt11_invoice: Some("prepared-circular-invoice".to_string()),
+				required_receiving_channel_id: Some(crate::UserChannelId(42)),
+			},
+			Some(20_000_000),
+			None,
+			PaymentDirection::Inbound,
+			PaymentStatus::Pending,
+		);
+
+		let encoded = payment.encode();
+		let decoded = PaymentDetails::read(&mut Cursor::new(encoded)).unwrap();
+		assert_eq!(decoded, payment);
 	}
 }
