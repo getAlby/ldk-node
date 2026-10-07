@@ -2493,6 +2493,91 @@ mod tests {
 		claim_payment_along_route(ClaimAlongRouteArgs::new(&nodes[0], &[path], exact_preimage));
 	}
 
+	#[test]
+	fn real_mpp_split_across_mixed_incoming_channels_fails() {
+		let chanmon_cfgs = create_chanmon_cfgs(4);
+		let node_cfgs = create_node_cfgs(4, &chanmon_cfgs);
+		let node_chanmgrs = create_node_chanmgrs(4, &node_cfgs, &[None, None, None, None]);
+		let nodes = create_network(4, &node_cfgs, &node_chanmgrs);
+		create_announced_chan_between_nodes(&nodes, 0, 1);
+		create_announced_chan_between_nodes(&nodes, 0, 2);
+		create_announced_chan_between_nodes(&nodes, 1, 3);
+		create_announced_chan_between_nodes(&nodes, 2, 3);
+
+		let amount_msat = 15_000_000;
+		let path_a = &[&nodes[1], &nodes[3]][..];
+		let path_b = &[&nodes[2], &nodes[3]][..];
+		let (route, payment_hash, payment_preimage, payment_secret) =
+			lightning::get_route_and_payment_hash!(nodes[0], nodes[3], amount_msat);
+		assert_eq!(route.paths.len(), 2);
+		nodes[0]
+			.node
+			.send_payment_with_route(
+				route,
+				payment_hash,
+				RecipientOnionFields::secret_only(payment_secret),
+				PaymentId(payment_hash.0),
+			)
+			.unwrap();
+		lightning::check_added_monitors!(nodes[0], 2);
+		let mut messages = nodes[0].node.get_and_clear_pending_msg_events();
+		assert_eq!(messages.len(), 2);
+
+		let first_message =
+			remove_first_msg_event_to_node(&path_a[0].node.get_our_node_id(), &mut messages);
+		assert!(pass_along_path(
+			&nodes[0],
+			path_a,
+			amount_msat,
+			payment_hash,
+			Some(payment_secret),
+			first_message,
+			false,
+			None,
+		)
+		.is_none());
+		let second_message =
+			remove_first_msg_event_to_node(&path_b[0].node.get_our_node_id(), &mut messages);
+		let claimable_event = pass_along_path(
+			&nodes[0],
+			path_b,
+			amount_msat,
+			payment_hash,
+			Some(payment_secret),
+			second_message,
+			true,
+			None,
+		)
+		.unwrap();
+		let receiving_channels = match claimable_event {
+			LdkEvent::PaymentClaimable { receiving_channel_ids, .. } => receiving_channel_ids,
+			_ => panic!("expected PaymentClaimable"),
+		};
+		assert_eq!(receiving_channels.len(), 2);
+		let first_user_channel_id =
+			receiving_channels[0].1.expect("first MPP part has a user channel ID");
+		let second_user_channel_id =
+			receiving_channels[1].1.expect("second MPP part has a user channel ID");
+		assert_ne!(first_user_channel_id, second_user_channel_id);
+
+		let kind = test_circular_payment_kind(
+			payment_hash,
+			payment_preimage,
+			UserChannelId(first_user_channel_id),
+		);
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&kind,
+				PaymentStatus::Pending,
+				Some(amount_msat),
+				amount_msat,
+				&receiving_channels,
+			),
+			ChannelConstrainedClaimDecision::Fail
+		);
+		fail_payment_along_route(&nodes[0], &[path_a, path_b], false, payment_hash);
+	}
+
 	fn test_circular_payment_kind(
 		hash: PaymentHash, preimage: PaymentPreimage, required_channel_id: UserChannelId,
 	) -> PaymentKind {
