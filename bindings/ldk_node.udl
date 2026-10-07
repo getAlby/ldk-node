@@ -199,6 +199,8 @@ interface Bolt11Payment {
 	[Throws=NodeError]
 	CircularRouteQuote quote_circular_route(u64 amount_msat, [ByRef]UserChannelId first_hop_user_channel_id, [ByRef]UserChannelId last_hop_user_channel_id, RouteParametersConfig? route_parameters);
 	[Throws=NodeError]
+	PreparedCircularPayment prepare_circular_payment(u64 amount_msat, [ByRef]Bolt11InvoiceDescription description, u32 expiry_secs, [ByRef]PaymentId operation_id, [ByRef]UserChannelId first_hop_user_channel_id, [ByRef]UserChannelId last_hop_user_channel_id, u64 max_routing_fee_msat);
+	[Throws=NodeError]
 	PaymentId send([ByRef]Bolt11Invoice invoice, RouteParametersConfig? route_parameters);
 	[Throws=NodeError]
 	PaymentId send_with_first_hop([ByRef]Bolt11Invoice invoice, [ByRef]UserChannelId first_hop_user_channel_id, RouteParametersConfig? route_parameters);
@@ -489,7 +491,7 @@ interface ClosureReason {
 [Enum]
 interface PaymentKind {
 	Onchain(Txid txid, ConfirmationStatus status);
-	Bolt11(PaymentHash hash, PaymentPreimage? preimage, PaymentSecret? secret, string? bolt11_invoice, UserChannelId? required_receiving_channel_id);
+	Bolt11(PaymentHash hash, PaymentPreimage? preimage, PaymentSecret? secret, string? bolt11_invoice, UserChannelId? required_receiving_channel_id, UserChannelId? required_sending_channel_id, PaymentId? circular_operation_id, PaymentId? circular_outbound_payment_id, u64? circular_max_routing_fee_msat);
 	Bolt11Jit(PaymentHash hash, PaymentPreimage? preimage, PaymentSecret? secret, u64? counterparty_skimmed_fee_msat, LSPFeeLimits lsp_fee_limits);
 	Bolt12Offer(PaymentHash? hash, PaymentPreimage? preimage, PaymentSecret? secret, OfferId offer_id, UntrustedString? payer_note, u64? quantity);
 	Bolt12Refund(PaymentHash? hash, PaymentPreimage? preimage, PaymentSecret? secret, UntrustedString? payer_note, u64? quantity);
@@ -887,6 +889,19 @@ dictionary CircularRouteQuote {
 	UserChannelId last_hop_user_channel_id;
 	u64 last_hop_short_channel_id;
 	sequence<CircularRoutePath> paths;
+};
+
+dictionary PreparedCircularPayment {
+	string bolt11_invoice;
+	PaymentHash payment_hash;
+	PaymentId operation_id;
+	PaymentId outbound_payment_id;
+	u64 amount_msat;
+	u64 max_routing_fee_msat;
+	UserChannelId first_hop_user_channel_id;
+	u64 first_hop_short_channel_id;
+	UserChannelId last_hop_user_channel_id;
+	u64 last_hop_short_channel_id;
 };
 
 [Traits=(Debug, Display, Eq)]

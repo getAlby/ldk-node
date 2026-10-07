@@ -168,6 +168,10 @@ impl Readable for PaymentDetails {
 						secret,
 						bolt11_invoice: None,
 						required_receiving_channel_id: None,
+						required_sending_channel_id: None,
+						circular_operation_id: None,
+						circular_outbound_payment_id: None,
+						circular_max_routing_fee_msat: None,
 					}
 				}
 			} else {
@@ -398,6 +402,14 @@ pub enum PaymentKind {
 		/// If set, an inbound manually-claimable payment may only be claimed when every HTLC part
 		/// arrived through this exact local channel. Used by prepared circular rebalances.
 		required_receiving_channel_id: Option<crate::UserChannelId>,
+		/// The exact local first-hop channel reserved for a prepared circular rebalance.
+		required_sending_channel_id: Option<crate::UserChannelId>,
+		/// The caller-supplied durable binding to the reviewed circular operation.
+		circular_operation_id: Option<PaymentId>,
+		/// The distinct payment identifier reserved for the future outbound leg.
+		circular_outbound_payment_id: Option<PaymentId>,
+		/// The maximum routing fee allowed for the future outbound leg.
+		circular_max_routing_fee_msat: Option<u64>,
 	},
 	/// A [BOLT 11] payment intended to open an [bLIP-52 / LSPS 2] just-in-time channel.
 	///
@@ -507,6 +519,10 @@ impl_writeable_tlv_based_enum!(PaymentKind,
 		(4, secret, option),
 		(131072, bolt11_invoice, option),
 		(131074, required_receiving_channel_id, option),
+		(131076, required_sending_channel_id, option),
+		(131078, circular_operation_id, option),
+		(131080, circular_outbound_payment_id, option),
+		(131082, circular_max_routing_fee_msat, option),
 	},
 	(4, Bolt11Jit) => {
 		(0, hash, required),
@@ -730,6 +746,10 @@ mod tests {
 					secret: s,
 					bolt11_invoice: None,
 					required_receiving_channel_id: None,
+					required_sending_channel_id: None,
+					circular_operation_id: None,
+					circular_outbound_payment_id: None,
+					circular_max_routing_fee_msat: None,
 				} => {
 					assert_eq!(hash, h);
 					assert_eq!(preimage, p);
@@ -840,6 +860,10 @@ mod tests {
 				secret: Some(PaymentSecret([4u8; 32])),
 				bolt11_invoice: Some("prepared-circular-invoice".to_string()),
 				required_receiving_channel_id: Some(crate::UserChannelId(42)),
+				required_sending_channel_id: Some(crate::UserChannelId(41)),
+				circular_operation_id: Some(PaymentId([5u8; 32])),
+				circular_outbound_payment_id: Some(PaymentId([6u8; 32])),
+				circular_max_routing_fee_msat: Some(1_000_000),
 			},
 			Some(20_000_000),
 			None,

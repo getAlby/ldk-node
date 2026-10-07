@@ -13,6 +13,7 @@ use bitcoin::OutPoint;
 use lightning::chain::chainmonitor;
 use lightning::impl_writeable_tlv_based;
 use lightning::ln::channel_state::ChannelDetails as LdkChannelDetails;
+use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::msgs::{RoutingMessageHandler, SocketAddress};
 use lightning::ln::peer_handler::IgnoringMessageHandler;
 use lightning::ln::types::ChannelId;
@@ -26,6 +27,7 @@ use lightning::util::sweep::OutputSweeper;
 use lightning_block_sync::gossip::{GossipVerifier, UtxoSource};
 use lightning_liquidity::utils::time::DefaultTimeProvider;
 use lightning_net_tokio::SocketDescriptor;
+use lightning_types::payment::PaymentHash;
 
 use crate::chain::ChainSource;
 use crate::config::ChannelConfig;
@@ -110,6 +112,33 @@ pub struct CircularRouteQuote {
 	pub last_hop_short_channel_id: u64,
 	/// The candidate paths. Every path is independently validated against both selected channels.
 	pub paths: Vec<CircularRoutePath>,
+}
+
+/// A durably prepared circular payment that has not been sent.
+///
+/// The invoice preimage remains in the payment store and is intentionally not included here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedCircularPayment {
+	/// The fixed-amount BOLT 11 invoice registered for the inbound leg.
+	pub bolt11_invoice: String,
+	/// The invoice payment hash and inbound payment-store identifier.
+	pub payment_hash: PaymentHash,
+	/// The caller-supplied durable binding to the reviewed operation.
+	pub operation_id: PaymentId,
+	/// A distinct identifier reserved for the future outbound leg.
+	pub outbound_payment_id: PaymentId,
+	/// The exact principal to return through the inbound leg.
+	pub amount_msat: u64,
+	/// The maximum routing fee allowed for the future outbound leg.
+	pub max_routing_fee_msat: u64,
+	/// The exact local channel required for the future first hop.
+	pub first_hop_user_channel_id: UserChannelId,
+	/// The SCID or alias currently usable for the future first hop.
+	pub first_hop_short_channel_id: u64,
+	/// The exact local channel required for the inbound final hop.
+	pub last_hop_user_channel_id: UserChannelId,
+	/// The inbound SCID or alias currently usable for the final hop.
+	pub last_hop_short_channel_id: u64,
 }
 
 /// A supertrait that requires that a type implements both [`KVStore`] and [`KVStoreSync`] at the

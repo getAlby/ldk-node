@@ -81,12 +81,37 @@ fn channel_constrained_claim_decision(
 	kind: &PaymentKind, status: PaymentStatus, expected_amount_msat: Option<u64>,
 	actual_amount_msat: u64, receiving_channel_ids: &[(ChannelId, Option<u128>)],
 ) -> ChannelConstrainedClaimDecision {
-	let (preimage, required_channel_id) = match kind {
+	let (preimage, required_channel_id, circular_metadata_matches) = match kind {
 		PaymentKind::Bolt11 {
+			hash,
 			preimage,
 			required_receiving_channel_id: Some(required_channel_id),
+			required_sending_channel_id,
+			circular_operation_id,
+			circular_outbound_payment_id,
+			circular_max_routing_fee_msat,
 			..
-		} => (preimage, required_channel_id),
+		} => {
+			let metadata_matches = match (
+				required_sending_channel_id,
+				circular_operation_id,
+				circular_outbound_payment_id,
+				circular_max_routing_fee_msat,
+			) {
+				(
+					Some(required_sending_channel_id),
+					Some(operation_id),
+					Some(outbound_payment_id),
+					Some(_),
+				) => {
+					required_sending_channel_id != required_channel_id
+						&& operation_id != outbound_payment_id
+						&& outbound_payment_id.0 != hash.0
+				},
+				_ => false,
+			};
+			(preimage, required_channel_id, metadata_matches)
+		},
 		_ => return ChannelConstrainedClaimDecision::NotConstrained,
 	};
 
@@ -97,9 +122,12 @@ fn channel_constrained_claim_decision(
 			.iter()
 			.all(|(_, user_channel_id)| *user_channel_id == Some(required_channel_id.0));
 
-	match preimage
-		.filter(|_| status == PaymentStatus::Pending && amount_matches && every_part_matches)
-	{
+	match preimage.filter(|_| {
+		status == PaymentStatus::Pending
+			&& circular_metadata_matches
+			&& amount_matches
+			&& every_part_matches
+	}) {
 		Some(preimage) => ChannelConstrainedClaimDecision::Claim(preimage),
 		None => ChannelConstrainedClaimDecision::Fail,
 	}
@@ -2083,6 +2111,10 @@ mod tests {
 			secret: None,
 			bolt11_invoice: None,
 			required_receiving_channel_id: Some(UserChannelId(42)),
+			required_sending_channel_id: Some(UserChannelId(41)),
+			circular_operation_id: Some(PaymentId([4u8; 32])),
+			circular_outbound_payment_id: Some(PaymentId([5u8; 32])),
+			circular_max_routing_fee_msat: Some(1_000_000),
 		};
 		let exact_parts = vec![(ChannelId([1u8; 32]), Some(42)), (ChannelId([2u8; 32]), Some(42))];
 		assert_eq!(
@@ -2158,6 +2190,21 @@ mod tests {
 		assert_eq!(
 			channel_constrained_claim_decision(
 				&missing_preimage,
+				PaymentStatus::Pending,
+				Some(20_000_000),
+				20_000_000,
+				&exact_parts,
+			),
+			ChannelConstrainedClaimDecision::Fail
+		);
+
+		let mut missing_operation = constrained.clone();
+		if let PaymentKind::Bolt11 { circular_operation_id, .. } = &mut missing_operation {
+			*circular_operation_id = None;
+		}
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&missing_operation,
 				PaymentStatus::Pending,
 				Some(20_000_000),
 				20_000_000,

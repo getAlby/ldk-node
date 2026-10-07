@@ -10,7 +10,7 @@
 //! [BOLT 11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
 
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
@@ -43,9 +43,25 @@ use crate::payment::store::{
 use crate::peer_store::{PeerInfo, PeerStore};
 use crate::runtime::Runtime;
 use crate::types::{
-	ChannelManager, CircularRouteHop, CircularRoutePath, CircularRouteQuote, PaymentStore, Router,
+	ChannelManager, CircularRouteHop, CircularRoutePath, CircularRouteQuote, PaymentStore,
+	PreparedCircularPayment, Router,
 };
 use crate::UserChannelId;
+
+#[derive(Clone, Copy)]
+pub(crate) struct CircularPaymentContext {
+	operation_id: PaymentId,
+	outbound_payment_id: PaymentId,
+	first_hop_user_channel_id: UserChannelId,
+	last_hop_user_channel_id: UserChannelId,
+	max_routing_fee_msat: u64,
+}
+
+fn derive_circular_outbound_payment_id(operation_id: PaymentId) -> PaymentId {
+	let mut material = b"ldk-node circular outbound payment id v1".to_vec();
+	material.extend_from_slice(&operation_id.0);
+	PaymentId(Sha256::hash(&material).to_byte_array())
+}
 
 fn circular_path_uses_exact_channels(
 	path: &lightning::routing::router::Path, first_hop_node_id: bitcoin::secp256k1::PublicKey,
@@ -119,6 +135,7 @@ pub struct Bolt11Payment {
 	peer_store: Arc<PeerStore<Arc<Logger>>>,
 	config: Arc<Config>,
 	is_running: Arc<RwLock<bool>>,
+	circular_payment_lock: Arc<Mutex<()>>,
 	logger: Arc<Logger>,
 }
 
@@ -128,7 +145,8 @@ impl Bolt11Payment {
 		connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
 		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<Arc<Logger>>>,
-		config: Arc<Config>, is_running: Arc<RwLock<bool>>, logger: Arc<Logger>,
+		config: Arc<Config>, is_running: Arc<RwLock<bool>>, circular_payment_lock: Arc<Mutex<()>>,
+		logger: Arc<Logger>,
 	) -> Self {
 		Self {
 			runtime,
@@ -140,6 +158,7 @@ impl Bolt11Payment {
 			peer_store,
 			config,
 			is_running,
+			circular_payment_lock,
 			logger,
 		}
 	}
@@ -338,6 +357,104 @@ impl Bolt11Payment {
 		})
 	}
 
+	/// Create and durably record the inbound leg of a circular payment without sending anything.
+	///
+	/// The returned invoice is bound to the exact amount, both selected local channels, the routing
+	/// fee limit, and a caller-supplied operation ID. The preimage is persisted but not returned.
+	/// A distinct outbound payment ID is reserved deterministically for later execution.
+	pub fn prepare_circular_payment(
+		&self, amount_msat: u64, description: &Bolt11InvoiceDescription, expiry_secs: u32,
+		operation_id: &PaymentId, first_hop_user_channel_id: &UserChannelId,
+		last_hop_user_channel_id: &UserChannelId, max_routing_fee_msat: u64,
+	) -> Result<PreparedCircularPayment, Error> {
+		if !*self.is_running.read().unwrap() {
+			return Err(Error::NotRunning);
+		}
+		if amount_msat == 0 {
+			return Err(Error::InvalidAmount);
+		}
+		if first_hop_user_channel_id == last_hop_user_channel_id {
+			return Err(Error::InvalidChannelId);
+		}
+		let max_total_debit_msat =
+			amount_msat.checked_add(max_routing_fee_msat).ok_or(Error::InvalidAmount)?;
+		let _preparation_guard = self.circular_payment_lock.lock().unwrap();
+
+		let existing_operation = self.payment_store.list_filter(|payment| {
+			matches!(
+				payment.kind,
+				PaymentKind::Bolt11 { circular_operation_id: Some(existing), .. }
+					if existing == *operation_id
+			)
+		});
+		if !existing_operation.is_empty() {
+			return Err(Error::DuplicatePayment);
+		}
+		let outbound_payment_id = derive_circular_outbound_payment_id(*operation_id);
+		if outbound_payment_id == *operation_id {
+			return Err(Error::InvalidPaymentId);
+		}
+		if self.payment_store.get(&outbound_payment_id).is_some() {
+			return Err(Error::DuplicatePayment);
+		}
+
+		let usable_channels = self.channel_manager.list_usable_channels();
+		let first_hop = usable_channels
+			.iter()
+			.find(|channel| channel.user_channel_id == first_hop_user_channel_id.0)
+			.ok_or(Error::InvalidChannelId)?;
+		if first_hop.outbound_capacity_msat < max_total_debit_msat {
+			return Err(Error::InsufficientFunds);
+		}
+		let first_hop_short_channel_id =
+			first_hop.get_outbound_payment_scid().ok_or(Error::InvalidChannelId)?;
+
+		let channels = self.channel_manager.list_channels();
+		let last_hop = channels
+			.iter()
+			.find(|channel| channel.user_channel_id == last_hop_user_channel_id.0)
+			.ok_or(Error::InvalidChannelId)?;
+		if !last_hop.is_usable {
+			return Err(Error::InvalidChannelId);
+		}
+		if last_hop.inbound_capacity_msat < amount_msat {
+			return Err(Error::InsufficientFunds);
+		}
+		let last_hop_short_channel_id =
+			last_hop.get_inbound_payment_scid().ok_or(Error::InvalidChannelId)?;
+
+		let circular_context = CircularPaymentContext {
+			operation_id: *operation_id,
+			outbound_payment_id,
+			first_hop_user_channel_id: *first_hop_user_channel_id,
+			last_hop_user_channel_id: *last_hop_user_channel_id,
+			max_routing_fee_msat,
+		};
+		let description = maybe_try_convert_enum(description)?;
+		let invoice = self.receive_inner(
+			Some(amount_msat),
+			&description,
+			expiry_secs,
+			None,
+			None,
+			Some(circular_context),
+		)?;
+		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
+
+		Ok(PreparedCircularPayment {
+			bolt11_invoice: invoice.to_string(),
+			payment_hash,
+			operation_id: *operation_id,
+			outbound_payment_id,
+			amount_msat,
+			max_routing_fee_msat,
+			first_hop_user_channel_id: *first_hop_user_channel_id,
+			first_hop_short_channel_id,
+			last_hop_user_channel_id: *last_hop_user_channel_id,
+			last_hop_short_channel_id,
+		})
+	}
+
 	/// Send a fixed-amount invoice using exactly one local channel as the first hop.
 	///
 	/// Route construction receives only the selected channel. The resulting route is verified before
@@ -443,6 +560,10 @@ impl Bolt11Payment {
 			secret: Some(*invoice.payment_secret()),
 			bolt11_invoice: Some(invoice.to_string()),
 			required_receiving_channel_id: None,
+			required_sending_channel_id: None,
+			circular_operation_id: None,
+			circular_outbound_payment_id: None,
+			circular_max_routing_fee_msat: None,
 		};
 		let payment = PaymentDetails::new(
 			payment_id,
@@ -538,6 +659,10 @@ impl Bolt11Payment {
 					secret: payment_secret,
 					bolt11_invoice: Some(invoice.to_string()),
 					required_receiving_channel_id: None,
+					required_sending_channel_id: None,
+					circular_operation_id: None,
+					circular_outbound_payment_id: None,
+					circular_max_routing_fee_msat: None,
 				};
 				let payment = PaymentDetails::new(
 					payment_id,
@@ -569,6 +694,10 @@ impl Bolt11Payment {
 							secret: payment_secret,
 							bolt11_invoice: Some(invoice.to_string()),
 							required_receiving_channel_id: None,
+							required_sending_channel_id: None,
+							circular_operation_id: None,
+							circular_outbound_payment_id: None,
+							circular_max_routing_fee_msat: None,
 						};
 						let payment = PaymentDetails::new(
 							payment_id,
@@ -652,6 +781,10 @@ impl Bolt11Payment {
 					bolt11_invoice: Some(invoice.to_string()),
 					secret: payment_secret,
 					required_receiving_channel_id: None,
+					required_sending_channel_id: None,
+					circular_operation_id: None,
+					circular_outbound_payment_id: None,
+					circular_max_routing_fee_msat: None,
 				};
 
 				let payment = PaymentDetails::new(
@@ -685,6 +818,10 @@ impl Bolt11Payment {
 							secret: payment_secret,
 							bolt11_invoice: Some(invoice.to_string()),
 							required_receiving_channel_id: None,
+							required_sending_channel_id: None,
+							circular_operation_id: None,
+							circular_outbound_payment_id: None,
+							circular_max_routing_fee_msat: None,
 						};
 						let payment = PaymentDetails::new(
 							payment_id,
@@ -823,7 +960,7 @@ impl Bolt11Payment {
 	) -> Result<Bolt11Invoice, Error> {
 		let description = maybe_try_convert_enum(description)?;
 		let invoice =
-			self.receive_inner(Some(amount_msat), &description, expiry_secs, None, None)?;
+			self.receive_inner(Some(amount_msat), &description, expiry_secs, None, None, None)?;
 		Ok(maybe_wrap(invoice))
 	}
 
@@ -851,6 +988,7 @@ impl Bolt11Payment {
 			&description,
 			expiry_secs,
 			Some(payment_hash),
+			None,
 			None,
 		)?;
 		Ok(maybe_wrap(invoice))
@@ -883,6 +1021,7 @@ impl Bolt11Payment {
 			expiry_secs,
 			Some(payment_hash),
 			Some(min_cltv_expiry_delta),
+			None,
 		)?;
 		Ok(maybe_wrap(invoice))
 	}
@@ -895,7 +1034,7 @@ impl Bolt11Payment {
 		&self, description: &Bolt11InvoiceDescription, expiry_secs: u32,
 	) -> Result<Bolt11Invoice, Error> {
 		let description = maybe_try_convert_enum(description)?;
-		let invoice = self.receive_inner(None, &description, expiry_secs, None, None)?;
+		let invoice = self.receive_inner(None, &description, expiry_secs, None, None, None)?;
 		Ok(maybe_wrap(invoice))
 	}
 
@@ -918,7 +1057,7 @@ impl Bolt11Payment {
 	) -> Result<Bolt11Invoice, Error> {
 		let description = maybe_try_convert_enum(description)?;
 		let invoice =
-			self.receive_inner(None, &description, expiry_secs, Some(payment_hash), None)?;
+			self.receive_inner(None, &description, expiry_secs, Some(payment_hash), None, None)?;
 		Ok(maybe_wrap(invoice))
 	}
 
@@ -949,6 +1088,7 @@ impl Bolt11Payment {
 			expiry_secs,
 			Some(payment_hash),
 			Some(min_cltv_expiry_delta),
+			None,
 		)?;
 		Ok(maybe_wrap(invoice))
 	}
@@ -956,8 +1096,13 @@ impl Bolt11Payment {
 	pub(crate) fn receive_inner(
 		&self, amount_msat: Option<u64>, invoice_description: &LdkBolt11InvoiceDescription,
 		expiry_secs: u32, manual_claim_payment_hash: Option<PaymentHash>,
-		min_cltv_expiry_delta: Option<u16>,
+		min_cltv_expiry_delta: Option<u16>, circular_context: Option<CircularPaymentContext>,
 	) -> Result<LdkBolt11Invoice, Error> {
+		if circular_context.is_some()
+			&& (amount_msat.is_none() || manual_claim_payment_hash.is_some())
+		{
+			return Err(Error::InvalidAmount);
+		}
 		let invoice = {
 			let invoice_params = Bolt11InvoiceParameters {
 				amount_msats: amount_msat,
@@ -969,10 +1114,7 @@ impl Bolt11Payment {
 			};
 
 			match self.channel_manager.create_bolt11_invoice(invoice_params) {
-				Ok(inv) => {
-					log_info!(self.logger, "Invoice created: {}", inv);
-					inv
-				},
+				Ok(inv) => inv,
 				Err(e) => {
 					log_error!(self.logger, "Failed to create invoice: {}", e);
 					return Err(Error::InvoiceCreationFailed);
@@ -983,6 +1125,15 @@ impl Bolt11Payment {
 		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
 		let payment_secret = invoice.payment_secret();
 		let id = PaymentId(payment_hash.0);
+		if circular_context
+			.map(|context| {
+				context.operation_id == context.outbound_payment_id
+					|| context.outbound_payment_id == id
+			})
+			.unwrap_or(false)
+		{
+			return Err(Error::InvalidPaymentId);
+		}
 		let preimage = if manual_claim_payment_hash.is_none() {
 			// If the user hasn't registered a custom payment hash, we're positive ChannelManager
 			// will know the preimage at this point.
@@ -995,12 +1146,39 @@ impl Bolt11Payment {
 		} else {
 			None
 		};
+		if circular_context.is_some() && preimage.is_none() {
+			log_error!(self.logger, "Failed to persist prepared circular payment preimage.");
+			return Err(Error::PersistenceFailed);
+		}
+		if circular_context.is_some() && self.payment_store.get(&id).is_some() {
+			return Err(Error::DuplicatePayment);
+		}
+		let (
+			required_receiving_channel_id,
+			required_sending_channel_id,
+			circular_operation_id,
+			circular_outbound_payment_id,
+			circular_max_routing_fee_msat,
+		) = match circular_context {
+			Some(context) => (
+				Some(context.last_hop_user_channel_id),
+				Some(context.first_hop_user_channel_id),
+				Some(context.operation_id),
+				Some(context.outbound_payment_id),
+				Some(context.max_routing_fee_msat),
+			),
+			None => (None, None, None, None, None),
+		};
 		let kind = PaymentKind::Bolt11 {
 			hash: payment_hash,
 			preimage,
 			secret: Some(payment_secret.clone()),
 			bolt11_invoice: Some(invoice.to_string()),
-			required_receiving_channel_id: None,
+			required_receiving_channel_id,
+			required_sending_channel_id,
+			circular_operation_id,
+			circular_outbound_payment_id,
+			circular_max_routing_fee_msat,
 		};
 		let payment = PaymentDetails::new(
 			id,
@@ -1012,6 +1190,7 @@ impl Bolt11Payment {
 		);
 
 		self.payment_store.insert(payment)?;
+		log_info!(self.logger, "Invoice created for payment hash {}.", payment_hash);
 
 		Ok(invoice)
 	}
@@ -1393,6 +1572,16 @@ mod tests {
 		assert!(circular_path_uses_exact_channels(&path, first_node, 41, synthetic_payee, 99));
 		assert!(!circular_path_uses_exact_channels(&path, first_node, 42, synthetic_payee, 99));
 		assert!(!circular_path_uses_exact_channels(&path, first_node, 41, synthetic_payee, 100));
+	}
+
+	#[test]
+	fn circular_outbound_payment_id_is_deterministic_and_domain_separated() {
+		let operation_id = PaymentId([7u8; 32]);
+		let outbound_payment_id = derive_circular_outbound_payment_id(operation_id);
+
+		assert_eq!(outbound_payment_id, derive_circular_outbound_payment_id(operation_id));
+		assert_ne!(outbound_payment_id, operation_id);
+		assert_ne!(outbound_payment_id, PaymentId([0u8; 32]));
 	}
 
 	#[test]

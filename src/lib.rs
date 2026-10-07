@@ -163,8 +163,9 @@ use types::{
 	OnionMessenger, PaymentStore, PeerManager, Router, Scorer, Sweeper, Wallet,
 };
 pub use types::{
-	ChannelDetails, ChannelMonitorSizeInfo, CircularRouteHop, CircularRoutePath, CircularRouteQuote,
-	CustomTlvRecord, DynStore, KeyValue, PeerDetails, SyncAndAsyncKVStore, UserChannelId, WordCount,
+	ChannelDetails, ChannelMonitorSizeInfo, CircularRouteHop, CircularRoutePath,
+	CircularRouteQuote, CustomTlvRecord, DynStore, KeyValue, PeerDetails, PreparedCircularPayment,
+	SyncAndAsyncKVStore, UserChannelId, WordCount,
 };
 pub use {
 	bip39, bitcoin, lightning, lightning_invoice, lightning_liquidity, lightning_types, tokio,
@@ -209,6 +210,7 @@ pub struct Node {
 	peer_store: Arc<PeerStore<Arc<Logger>>>,
 	payment_store: Arc<PaymentStore>,
 	is_running: Arc<RwLock<bool>>,
+	circular_payment_lock: Arc<Mutex<()>>,
 	node_metrics: Arc<RwLock<NodeMetrics>>,
 	om_mailbox: Option<Arc<OnionMessageMailbox>>,
 	async_payments_role: Option<AsyncPaymentsRole>,
@@ -884,6 +886,7 @@ impl Node {
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.config),
 			Arc::clone(&self.is_running),
+			Arc::clone(&self.circular_payment_lock),
 			Arc::clone(&self.logger),
 		)
 	}
@@ -903,6 +906,7 @@ impl Node {
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.config),
 			Arc::clone(&self.is_running),
+			Arc::clone(&self.circular_payment_lock),
 			Arc::clone(&self.logger),
 		))
 	}
