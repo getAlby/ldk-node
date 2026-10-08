@@ -64,6 +64,7 @@ pub(crate) fn derive_circular_outbound_payment_id(operation_id: PaymentId) -> Pa
 	PaymentId(Sha256::hash(&material).to_byte_array())
 }
 
+#[cfg(test)]
 pub(crate) fn circular_operation_is_prepared(
 	payment_store: &PaymentStore, operation_id: PaymentId,
 ) -> bool {
