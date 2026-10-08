@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use lightning::ln::channelmanager::{
-	Bolt11InvoiceParameters, Bolt11PaymentError, PaymentId, RecipientOnionFields, Retry,
-	RetryableSendFailure,
+	Bolt11InvoiceParameters, Bolt11PaymentError, PaymentId, RecentPaymentDetails,
+	RecipientOnionFields, Retry, RetryableSendFailure,
 };
 use lightning::routing::router::{
 	PaymentParameters, Route, RouteHint, RouteHintHop, RouteParameters, RouteParametersConfig,
@@ -192,6 +192,15 @@ pub(crate) struct PreparedCircularExecution {
 	pub(crate) outbound_payment: PaymentDetails,
 }
 
+fn existing_pending_outbound_matches(existing: &PaymentDetails, expected: &PaymentDetails) -> bool {
+	existing.id == expected.id
+		&& existing.kind == expected.kind
+		&& existing.amount_msat == expected.amount_msat
+		&& existing.fee_paid_msat.is_none()
+		&& existing.direction == PaymentDirection::Outbound
+		&& existing.status == PaymentStatus::Pending
+}
+
 pub(crate) fn submit_prepared_circular_execution<F>(
 	payment_store: &PaymentStore, execution: PreparedCircularExecution, send: F,
 ) -> Result<PaymentId, Error>
@@ -203,8 +212,12 @@ where
 		PaymentId,
 	) -> Result<(), RetryableSendFailure>,
 {
-	if !payment_store.insert_if_absent(execution.outbound_payment)? {
-		return Err(Error::DuplicatePayment);
+	if !payment_store.insert_if_absent(execution.outbound_payment.clone())? {
+		let existing =
+			payment_store.get(&execution.outbound_payment_id).ok_or(Error::PersistenceFailed)?;
+		if !existing_pending_outbound_matches(&existing, &execution.outbound_payment) {
+			return Err(Error::DuplicatePayment);
+		}
 	}
 	let mut recipient_onion = RecipientOnionFields::secret_only(execution.payment_secret);
 	recipient_onion.payment_metadata = execution.payment_metadata;
@@ -229,10 +242,10 @@ where
 				return Err(Error::PersistenceFailed);
 			}
 		}
-		return Err(match e {
-			RetryableSendFailure::DuplicatePayment => Error::DuplicatePayment,
-			_ => Error::PaymentSendingFailed,
-		});
+		if e == RetryableSendFailure::DuplicatePayment {
+			return Ok(execution.outbound_payment_id);
+		}
+		return Err(Error::PaymentSendingFailed);
 	}
 
 	Ok(execution.outbound_payment_id)
@@ -263,11 +276,12 @@ pub(crate) fn build_prepared_circular_execution(
 	}
 
 	let prepared_matches = payment_store.list_filter(|payment| {
-		matches!(
+		payment.direction == PaymentDirection::Inbound
+			&& matches!(
 			payment.kind,
 			PaymentKind::Bolt11 { circular_operation_id: Some(existing), .. }
 				if existing == operation_id
-		)
+			)
 	});
 	if prepared_matches.is_empty() {
 		return Err(Error::InvalidPaymentId);
@@ -322,7 +336,6 @@ pub(crate) fn build_prepared_circular_execution(
 		|| required_receiving_channel_id != quote.last_hop_user_channel_id
 		|| outbound_payment_id != derive_circular_outbound_payment_id(operation_id)
 		|| quote.total_routing_fee_msat > max_routing_fee_msat
-		|| payment_store.get(&outbound_payment_id).is_some()
 	{
 		return Err(Error::InvalidPaymentId);
 	}
@@ -368,6 +381,11 @@ pub(crate) fn build_prepared_circular_execution(
 		PaymentDirection::Outbound,
 		PaymentStatus::Pending,
 	);
+	if let Some(existing) = payment_store.get(&outbound_payment_id) {
+		if !existing_pending_outbound_matches(&existing, &outbound_payment) {
+			return Err(Error::InvalidPaymentId);
+		}
+	}
 
 	Ok(PreparedCircularExecution {
 		route,
@@ -377,6 +395,144 @@ pub(crate) fn build_prepared_circular_execution(
 		outbound_payment_id,
 		outbound_payment,
 	})
+}
+
+pub(crate) fn recover_existing_circular_payment(
+	payment_store: &PaymentStore, operation_id: PaymentId, quote: &CircularRouteQuote,
+	recent_payments: &[RecentPaymentDetails],
+) -> Result<Option<PaymentId>, Error> {
+	let outbound_payment_id = derive_circular_outbound_payment_id(operation_id);
+	let Some(outbound) = payment_store.get(&outbound_payment_id) else {
+		return Ok(None);
+	};
+	let prepared_matches = payment_store.list_filter(|payment| {
+		payment.direction == PaymentDirection::Inbound
+			&& matches!(
+			payment.kind,
+			PaymentKind::Bolt11 { circular_operation_id: Some(existing), .. }
+				if existing == operation_id
+			)
+	});
+	if prepared_matches.len() != 1 {
+		return Err(Error::InvalidPaymentId);
+	}
+	let prepared = &prepared_matches[0];
+	let (payment_hash, payment_preimage, payment_secret, bolt11_invoice, max_routing_fee_msat) =
+		match &prepared.kind {
+			PaymentKind::Bolt11 {
+				hash,
+				preimage: Some(preimage),
+				secret: Some(secret),
+				bolt11_invoice: Some(invoice),
+				required_receiving_channel_id: Some(receiving_channel_id),
+				required_sending_channel_id: Some(sending_channel_id),
+				circular_operation_id: Some(stored_operation_id),
+				circular_outbound_payment_id: Some(stored_outbound_payment_id),
+				circular_max_routing_fee_msat: Some(max_routing_fee_msat),
+			} if *stored_operation_id == operation_id
+				&& *stored_outbound_payment_id == outbound_payment_id
+				&& *sending_channel_id == quote.first_hop_user_channel_id
+				&& *receiving_channel_id == quote.last_hop_user_channel_id =>
+			{
+				(*hash, *preimage, *secret, invoice, *max_routing_fee_msat)
+			},
+			_ => return Err(Error::InvalidPaymentId),
+		};
+	if prepared.id != PaymentId(payment_hash.0)
+		|| prepared.direction != PaymentDirection::Inbound
+		|| prepared.amount_msat != Some(quote.amount_msat)
+		|| PaymentHash(Sha256::hash(&payment_preimage.0).to_byte_array()) != payment_hash
+		|| quote.total_routing_fee_msat > max_routing_fee_msat
+	{
+		return Err(Error::InvalidPaymentId);
+	}
+	let invoice = LdkBolt11Invoice::from_str(bolt11_invoice).map_err(|_| Error::InvalidInvoice)?;
+	if PaymentHash(invoice.payment_hash().to_byte_array()) != payment_hash
+		|| invoice.amount_milli_satoshis() != Some(quote.amount_msat)
+		|| *invoice.payment_secret() != payment_secret
+	{
+		return Err(Error::InvalidInvoice);
+	}
+	match &outbound.kind {
+		PaymentKind::Bolt11 {
+			hash,
+			preimage,
+			secret: Some(secret),
+			bolt11_invoice: Some(outbound_invoice),
+			required_receiving_channel_id: Some(receiving_channel_id),
+			required_sending_channel_id: Some(sending_channel_id),
+			circular_operation_id: Some(stored_operation_id),
+			circular_outbound_payment_id: Some(stored_outbound_payment_id),
+			circular_max_routing_fee_msat: Some(stored_max_routing_fee_msat),
+		} if *hash == payment_hash
+			&& preimage.map_or(true, |existing| existing == payment_preimage)
+			&& *secret == payment_secret
+			&& outbound_invoice == bolt11_invoice
+			&& *receiving_channel_id == quote.last_hop_user_channel_id
+			&& *sending_channel_id == quote.first_hop_user_channel_id
+			&& *stored_operation_id == operation_id
+			&& *stored_outbound_payment_id == outbound_payment_id
+			&& *stored_max_routing_fee_msat == max_routing_fee_msat => {},
+		_ => return Err(Error::InvalidPaymentId),
+	}
+	if outbound.id != outbound_payment_id
+		|| outbound.direction != PaymentDirection::Outbound
+		|| outbound.amount_msat != Some(quote.amount_msat)
+	{
+		return Err(Error::InvalidPaymentId);
+	}
+	match outbound.status {
+		PaymentStatus::Succeeded => {
+			if prepared.status == PaymentStatus::Failed {
+				return Err(Error::InvalidPaymentId);
+			}
+			return Ok(Some(outbound_payment_id));
+		},
+		PaymentStatus::Failed => return Err(Error::PaymentSendingFailed),
+		PaymentStatus::Pending => {
+			if prepared.status != PaymentStatus::Pending || outbound.fee_paid_msat.is_some() {
+				return Err(Error::InvalidPaymentId);
+			}
+		},
+	}
+
+	for payment in recent_payments {
+		match payment {
+			RecentPaymentDetails::Pending {
+				payment_id,
+				payment_hash: tracked_hash,
+				total_msat,
+			} if *payment_id == outbound_payment_id => {
+				if *tracked_hash != payment_hash || *total_msat != quote.amount_msat {
+					return Err(Error::InvalidPaymentId);
+				}
+				return Ok(Some(outbound_payment_id));
+			},
+			RecentPaymentDetails::Fulfilled { payment_id, payment_hash: tracked_hash }
+				if *payment_id == outbound_payment_id =>
+			{
+				if tracked_hash.map_or(true, |hash| hash != payment_hash) {
+					return Err(Error::InvalidPaymentId);
+				}
+				return Ok(Some(outbound_payment_id));
+			},
+			RecentPaymentDetails::Abandoned { payment_id, payment_hash: tracked_hash }
+				if *payment_id == outbound_payment_id =>
+			{
+				if *tracked_hash != payment_hash {
+					return Err(Error::InvalidPaymentId);
+				}
+				return Err(Error::PaymentSendingFailed);
+			},
+			RecentPaymentDetails::AwaitingInvoice { payment_id }
+				if *payment_id == outbound_payment_id =>
+			{
+				return Err(Error::InvalidPaymentId);
+			},
+			_ => {},
+		}
+	}
+	Ok(None)
 }
 
 #[cfg(not(feature = "uniffi"))]
@@ -732,6 +888,19 @@ impl Bolt11Payment {
 			return Err(Error::NotRunning);
 		}
 		let _execution_guard = self.circular_payment_lock.lock().unwrap();
+		if let Some(outbound_payment_id) = recover_existing_circular_payment(
+			&self.payment_store,
+			*operation_id,
+			quote,
+			&self.channel_manager.list_recent_payments(),
+		)? {
+			log_info!(
+				self.logger,
+				"Recovered existing prepared circular payment {} without creating another payment.",
+				operation_id,
+			);
+			return Ok(outbound_payment_id);
+		}
 
 		let usable_channels = self.channel_manager.list_usable_channels();
 		let first_hop = usable_channels

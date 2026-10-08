@@ -19,7 +19,7 @@ pub use bolt11::Bolt11Payment;
 pub(crate) use bolt11::{
 	build_prepared_circular_execution, circular_operation_is_prepared,
 	derive_circular_outbound_payment_id, prepared_circular_payment_details,
-	submit_prepared_circular_execution, CircularPaymentContext,
+	recover_existing_circular_payment, submit_prepared_circular_execution, CircularPaymentContext,
 };
 pub use bolt12::Bolt12Payment;
 pub use onchain::OnchainPayment;

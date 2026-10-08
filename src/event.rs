@@ -2079,7 +2079,9 @@ mod tests {
 	use std::time::Duration;
 
 	use bitcoin::hashes::Hash as _;
-	use lightning::ln::channelmanager::{Bolt11InvoiceParameters, RecipientOnionFields};
+	use lightning::ln::channelmanager::{
+		Bolt11InvoiceParameters, RecentPaymentDetails, RecipientOnionFields,
+	};
 	use lightning::ln::functional_test_utils::{
 		_reload_node, claim_payment_along_route, create_announced_chan_between_nodes,
 		create_announced_chan_between_nodes_with_value, create_chanmon_cfgs, create_network,
@@ -2850,17 +2852,116 @@ mod tests {
 		);
 		assert_eq!(send_count.load(Ordering::Acquire), 1);
 		assert_eq!(
+			crate::payment::recover_existing_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				&quote,
+				&[],
+			),
+			Ok(None)
+		);
+		assert_eq!(
+			crate::payment::recover_existing_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				&quote,
+				&[RecentPaymentDetails::Pending {
+					payment_id: outbound_payment_id,
+					payment_hash,
+					total_msat: amount_msat,
+				}],
+			),
+			Ok(Some(outbound_payment_id))
+		);
+		assert_eq!(
+			crate::payment::recover_existing_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				&quote,
+				&[RecentPaymentDetails::Pending {
+					payment_id: outbound_payment_id,
+					payment_hash: PaymentHash([11u8; 32]),
+					total_msat: amount_msat,
+				}],
+			),
+			Err(Error::InvalidPaymentId)
+		);
+		assert_eq!(
+			crate::payment::recover_existing_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				&quote,
+				&[RecentPaymentDetails::Pending {
+					payment_id: outbound_payment_id,
+					payment_hash,
+					total_msat: amount_msat + 1,
+				}],
+			),
+			Err(Error::InvalidPaymentId)
+		);
+		reloaded_payment_store
+			.update(&PaymentDetailsUpdate {
+				status: Some(PaymentStatus::Failed),
+				..PaymentDetailsUpdate::new(payment_id)
+			})
+			.unwrap();
+		assert_eq!(
+			crate::payment::recover_existing_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				&quote,
+				&[],
+			),
+			Err(Error::InvalidPaymentId)
+		);
+		reloaded_payment_store
+			.update(&PaymentDetailsUpdate {
+				status: Some(PaymentStatus::Pending),
+				..PaymentDetailsUpdate::new(payment_id)
+			})
+			.unwrap();
+		assert_eq!(
 			crate::payment::submit_prepared_circular_execution(
 				&reloaded_payment_store,
 				duplicate_execution,
 				|_, _, _, _| {
 					send_count.fetch_add(1, Ordering::AcqRel);
-					Ok(())
+					Err(lightning::ln::channelmanager::RetryableSendFailure::DuplicatePayment)
 				},
 			),
-			Err(Error::DuplicatePayment)
+			Ok(outbound_payment_id)
 		);
-		assert_eq!(send_count.load(Ordering::Acquire), 1);
+		assert_eq!(send_count.load(Ordering::Acquire), 2);
+		reloaded_payment_store
+			.update(&PaymentDetailsUpdate {
+				status: Some(PaymentStatus::Succeeded),
+				..PaymentDetailsUpdate::new(outbound_payment_id)
+			})
+			.unwrap();
+		assert_eq!(
+			crate::payment::recover_existing_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				&quote,
+				&[],
+			),
+			Ok(Some(outbound_payment_id))
+		);
+		reloaded_payment_store
+			.update(&PaymentDetailsUpdate {
+				status: Some(PaymentStatus::Failed),
+				..PaymentDetailsUpdate::new(outbound_payment_id)
+			})
+			.unwrap();
+		assert_eq!(
+			crate::payment::recover_existing_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				&quote,
+				&[],
+			),
+			Err(Error::PaymentSendingFailed)
+		);
 
 		reloaded_payment_store.remove(&outbound_payment_id).unwrap();
 		assert_eq!(
@@ -2874,7 +2975,7 @@ mod tests {
 			),
 			Err(Error::PaymentSendingFailed)
 		);
-		assert_eq!(send_count.load(Ordering::Acquire), 2);
+		assert_eq!(send_count.load(Ordering::Acquire), 3);
 		assert_eq!(reloaded_payment_store.get(&payment_id).unwrap().status, PaymentStatus::Failed);
 		assert_eq!(
 			reloaded_payment_store.get(&outbound_payment_id).unwrap().status,
@@ -2897,9 +2998,9 @@ mod tests {
 					Err(lightning::ln::channelmanager::RetryableSendFailure::DuplicatePayment)
 				},
 			),
-			Err(Error::DuplicatePayment)
+			Ok(outbound_payment_id)
 		);
-		assert_eq!(send_count.load(Ordering::Acquire), 3);
+		assert_eq!(send_count.load(Ordering::Acquire), 4);
 		assert_eq!(reloaded_payment_store.get(&payment_id).unwrap().status, PaymentStatus::Pending);
 		assert_eq!(
 			reloaded_payment_store.get(&outbound_payment_id).unwrap().status,
@@ -3287,18 +3388,39 @@ mod tests {
 			reloaded_payment_store.get(&outbound_payment_id).unwrap().status,
 			PaymentStatus::Pending
 		);
+		let recent_payments = nodes[0].node.list_recent_payments();
+		assert!(recent_payments.iter().any(|payment| matches!(
+			payment,
+			RecentPaymentDetails::Pending {
+				payment_id,
+				payment_hash: tracked_hash,
+				total_msat,
+			} if *payment_id == outbound_payment_id
+				&& *tracked_hash == payment_hash
+				&& *total_msat == amount_msat
+		)));
+		assert_eq!(
+			crate::payment::recover_existing_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				&quote,
+				&recent_payments,
+			),
+			Ok(Some(outbound_payment_id))
+		);
 		assert_eq!(
 			crate::payment::submit_prepared_circular_execution(
 				&reloaded_payment_store,
 				duplicate_execution,
-				|_, _, _, _| {
+				|route, hash, onion, id| {
 					send_count.fetch_add(1, Ordering::AcqRel);
-					Ok(())
+					nodes[0].node.send_payment_with_route(route, hash, onion, id)
 				},
 			),
-			Err(Error::DuplicatePayment)
+			Ok(outbound_payment_id)
 		);
-		assert_eq!(send_count.load(Ordering::Acquire), 1);
+		assert_eq!(send_count.load(Ordering::Acquire), 2);
+		lightning::check_added_monitors!(nodes[0], 0);
 
 		let mut reconnect_destination = ReconnectArgs::new(&nodes[0], &nodes[2]);
 		reconnect_destination.send_channel_ready = (true, true);
