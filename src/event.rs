@@ -2827,6 +2827,62 @@ mod tests {
 			operation_id,
 		));
 		assert_eq!(reloaded_payment_store.get(&payment_id), Some(payment));
+		let recovered_preparation = crate::payment::recover_prepared_circular_payment(
+			&reloaded_payment_store,
+			operation_id,
+			amount_msat,
+			first_hop_user_channel_id,
+			first_hop_scid,
+			last_hop_user_channel_id,
+			last_hop_scid,
+			max_routing_fee_msat,
+		)
+		.unwrap()
+		.unwrap();
+		assert_eq!(recovered_preparation.bolt11_invoice, invoice.to_string());
+		assert_eq!(recovered_preparation.payment_hash, payment_hash);
+		assert_eq!(recovered_preparation.operation_id, operation_id);
+		assert_eq!(recovered_preparation.outbound_payment_id, outbound_payment_id);
+		assert_eq!(recovered_preparation.first_hop_short_channel_id, first_hop_scid);
+		assert_eq!(recovered_preparation.last_hop_short_channel_id, last_hop_scid);
+		assert_eq!(
+			crate::payment::recover_prepared_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				amount_msat + 1,
+				first_hop_user_channel_id,
+				first_hop_scid,
+				last_hop_user_channel_id,
+				last_hop_scid,
+				max_routing_fee_msat,
+			),
+			Err(Error::InvalidPaymentId)
+		);
+		assert_eq!(
+			crate::payment::recover_prepared_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				amount_msat,
+				first_hop_user_channel_id,
+				first_hop_scid,
+				last_hop_user_channel_id,
+				last_hop_scid,
+				max_routing_fee_msat + 1,
+			),
+			Err(Error::InvalidPaymentId)
+		);
+		assert!(crate::payment::recover_prepared_circular_payment(
+			&expired_store,
+			expired_operation_id,
+			amount_msat,
+			first_hop_user_channel_id,
+			first_hop_scid,
+			last_hop_user_channel_id,
+			last_hop_scid,
+			max_routing_fee_msat,
+		)
+		.unwrap()
+		.is_some());
 
 		let send_count = AtomicU16::new(0);
 		let duplicate_execution = execution.clone();

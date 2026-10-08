@@ -102,6 +102,85 @@ pub(crate) fn prepared_circular_payment_details(
 	)
 }
 
+pub(crate) fn recover_prepared_circular_payment(
+	payment_store: &PaymentStore, operation_id: PaymentId, amount_msat: u64,
+	first_hop_user_channel_id: UserChannelId, first_hop_short_channel_id: u64,
+	last_hop_user_channel_id: UserChannelId, last_hop_short_channel_id: u64,
+	max_routing_fee_msat: u64,
+) -> Result<Option<PreparedCircularPayment>, Error> {
+	let operation_matches = payment_store.list_filter(|payment| {
+		matches!(
+			payment.kind,
+			PaymentKind::Bolt11 { circular_operation_id: Some(existing), .. }
+				if existing == operation_id
+		)
+	});
+	if operation_matches.is_empty() {
+		return Ok(None);
+	}
+	let prepared_matches: Vec<_> = operation_matches
+		.iter()
+		.filter(|payment| payment.direction == PaymentDirection::Inbound)
+		.collect();
+	if prepared_matches.len() != 1 {
+		return Err(Error::InvalidPaymentId);
+	}
+	let prepared = prepared_matches[0];
+	let outbound_payment_id = derive_circular_outbound_payment_id(operation_id);
+	let (payment_hash, payment_preimage, payment_secret, bolt11_invoice) = match &prepared.kind {
+		PaymentKind::Bolt11 {
+			hash,
+			preimage: Some(preimage),
+			secret: Some(secret),
+			bolt11_invoice: Some(invoice),
+			required_receiving_channel_id: Some(receiving_channel_id),
+			required_sending_channel_id: Some(sending_channel_id),
+			circular_operation_id: Some(stored_operation_id),
+			circular_outbound_payment_id: Some(stored_outbound_payment_id),
+			circular_max_routing_fee_msat: Some(stored_max_routing_fee_msat),
+		} if *stored_operation_id == operation_id
+			&& *stored_outbound_payment_id == outbound_payment_id
+			&& *sending_channel_id == first_hop_user_channel_id
+			&& *receiving_channel_id == last_hop_user_channel_id
+			&& *stored_max_routing_fee_msat == max_routing_fee_msat =>
+		{
+			(*hash, *preimage, *secret, invoice.clone())
+		},
+		_ => return Err(Error::InvalidPaymentId),
+	};
+	if prepared.id != PaymentId(payment_hash.0)
+		|| prepared.amount_msat != Some(amount_msat)
+		|| prepared.fee_paid_msat.is_some()
+		|| PaymentHash(Sha256::hash(&payment_preimage.0).to_byte_array()) != payment_hash
+	{
+		return Err(Error::InvalidPaymentId);
+	}
+	match prepared.status {
+		PaymentStatus::Failed => return Err(Error::PaymentSendingFailed),
+		PaymentStatus::Pending | PaymentStatus::Succeeded => {},
+	}
+	let invoice = LdkBolt11Invoice::from_str(&bolt11_invoice).map_err(|_| Error::InvalidInvoice)?;
+	if PaymentHash(invoice.payment_hash().to_byte_array()) != payment_hash
+		|| invoice.amount_milli_satoshis() != Some(amount_msat)
+		|| *invoice.payment_secret() != payment_secret
+	{
+		return Err(Error::InvalidInvoice);
+	}
+
+	Ok(Some(PreparedCircularPayment {
+		bolt11_invoice,
+		payment_hash,
+		operation_id,
+		outbound_payment_id,
+		amount_msat,
+		max_routing_fee_msat,
+		first_hop_user_channel_id,
+		first_hop_short_channel_id,
+		last_hop_user_channel_id,
+		last_hop_short_channel_id,
+	}))
+}
+
 fn circular_path_uses_exact_channels(
 	path: &lightning::routing::router::Path, first_hop_node_id: bitcoin::secp256k1::PublicKey,
 	first_hop_scid: u64, synthetic_payee: bitcoin::secp256k1::PublicKey, last_hop_scid: u64,
@@ -808,15 +887,9 @@ impl Bolt11Payment {
 			amount_msat.checked_add(max_routing_fee_msat).ok_or(Error::InvalidAmount)?;
 		let _preparation_guard = self.circular_payment_lock.lock().unwrap();
 
-		if circular_operation_is_prepared(&self.payment_store, *operation_id) {
-			return Err(Error::DuplicatePayment);
-		}
 		let outbound_payment_id = derive_circular_outbound_payment_id(*operation_id);
 		if outbound_payment_id == *operation_id {
 			return Err(Error::InvalidPaymentId);
-		}
-		if self.payment_store.get(&outbound_payment_id).is_some() {
-			return Err(Error::DuplicatePayment);
 		}
 
 		let usable_channels = self.channel_manager.list_usable_channels();
@@ -843,6 +916,26 @@ impl Bolt11Payment {
 		}
 		let last_hop_short_channel_id =
 			last_hop.get_inbound_payment_scid().ok_or(Error::InvalidChannelId)?;
+		if let Some(prepared) = recover_prepared_circular_payment(
+			&self.payment_store,
+			*operation_id,
+			amount_msat,
+			*first_hop_user_channel_id,
+			first_hop_short_channel_id,
+			*last_hop_user_channel_id,
+			last_hop_short_channel_id,
+			max_routing_fee_msat,
+		)? {
+			log_info!(
+				self.logger,
+				"Recovered existing prepared circular payment {} without creating another invoice.",
+				operation_id,
+			);
+			return Ok(prepared);
+		}
+		if self.payment_store.get(&outbound_payment_id).is_some() {
+			return Err(Error::DuplicatePayment);
+		}
 
 		let circular_context = CircularPaymentContext {
 			operation_id: *operation_id,
