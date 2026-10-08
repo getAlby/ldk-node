@@ -934,6 +934,9 @@ impl Bolt11Payment {
 			);
 			return Ok(prepared);
 		}
+		if expiry_secs == 0 {
+			return Err(Error::InvalidInvoice);
+		}
 		if self.payment_store.get(&outbound_payment_id).is_some() {
 			return Err(Error::DuplicatePayment);
 		}
