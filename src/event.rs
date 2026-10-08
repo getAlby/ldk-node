@@ -12,6 +12,7 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 use bitcoin::blockdata::locktime::absolute::LockTime;
+use bitcoin::hashes::Hash as _;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Amount, OutPoint};
 use lightning::events::bump_transaction::BumpTransactionEvent;
@@ -167,6 +168,107 @@ fn payment_sent_store_update(
 		status: Some(PaymentStatus::Succeeded),
 		..PaymentDetailsUpdate::new(payment_id)
 	}
+}
+
+fn fail_circular_payment_records(
+	payment_store: &PaymentStore, outbound_payment_id: PaymentId,
+	event_payment_hash: Option<PaymentHash>,
+) -> Result<bool, Error> {
+	let Some(outbound) = payment_store.get(&outbound_payment_id) else {
+		return Ok(false);
+	};
+	let (
+		payment_hash,
+		outbound_preimage,
+		payment_secret,
+		bolt11_invoice,
+		required_receiving_channel_id,
+		required_sending_channel_id,
+		operation_id,
+		max_routing_fee_msat,
+	) = match &outbound.kind {
+		PaymentKind::Bolt11 {
+			hash,
+			preimage,
+			secret: Some(secret),
+			bolt11_invoice: Some(invoice),
+			required_receiving_channel_id: Some(receiving_channel_id),
+			required_sending_channel_id: Some(sending_channel_id),
+			circular_operation_id: Some(operation_id),
+			circular_outbound_payment_id: Some(stored_outbound_payment_id),
+			circular_max_routing_fee_msat: Some(max_routing_fee_msat),
+		} if *stored_outbound_payment_id == outbound_payment_id => (
+			*hash,
+			*preimage,
+			*secret,
+			invoice,
+			*receiving_channel_id,
+			*sending_channel_id,
+			*operation_id,
+			*max_routing_fee_msat,
+		),
+		_ => return Ok(false),
+	};
+	if outbound.id != outbound_payment_id
+		|| outbound.direction != PaymentDirection::Outbound
+		|| outbound.amount_msat.is_none()
+		|| outbound.fee_paid_msat.is_some()
+		|| outbound.status == PaymentStatus::Succeeded
+		|| crate::payment::derive_circular_outbound_payment_id(operation_id) != outbound_payment_id
+		|| event_payment_hash.map_or(false, |hash| hash != payment_hash)
+	{
+		return Err(Error::InvalidPaymentId);
+	}
+
+	let inbound_payment_id = PaymentId(payment_hash.0);
+	let inbound = payment_store.get(&inbound_payment_id).ok_or(Error::InvalidPaymentId)?;
+	let inbound_preimage = match &inbound.kind {
+		PaymentKind::Bolt11 {
+			hash,
+			preimage: Some(preimage),
+			secret: Some(secret),
+			bolt11_invoice: Some(invoice),
+			required_receiving_channel_id: Some(receiving_channel_id),
+			required_sending_channel_id: Some(sending_channel_id),
+			circular_operation_id: Some(stored_operation_id),
+			circular_outbound_payment_id: Some(stored_outbound_payment_id),
+			circular_max_routing_fee_msat: Some(stored_max_routing_fee_msat),
+		} if *hash == payment_hash
+			&& *secret == payment_secret
+			&& invoice == bolt11_invoice
+			&& *receiving_channel_id == required_receiving_channel_id
+			&& *sending_channel_id == required_sending_channel_id
+			&& *stored_operation_id == operation_id
+			&& *stored_outbound_payment_id == outbound_payment_id
+			&& *stored_max_routing_fee_msat == max_routing_fee_msat =>
+		{
+			*preimage
+		},
+		_ => return Err(Error::InvalidPaymentId),
+	};
+	if inbound.id != inbound_payment_id
+		|| inbound.direction != PaymentDirection::Inbound
+		|| inbound.amount_msat != outbound.amount_msat
+		|| inbound.fee_paid_msat.is_some()
+		|| inbound.status == PaymentStatus::Succeeded
+		|| outbound_preimage.map_or(false, |preimage| preimage != inbound_preimage)
+		|| PaymentHash(bitcoin::hashes::sha256::Hash::hash(&inbound_preimage.0).to_byte_array())
+			!= payment_hash
+	{
+		return Err(Error::InvalidPaymentId);
+	}
+
+	let outbound_update = PaymentDetailsUpdate {
+		status: Some(PaymentStatus::Failed),
+		..PaymentDetailsUpdate::new(outbound_payment_id)
+	};
+	let inbound_update = PaymentDetailsUpdate {
+		status: Some(PaymentStatus::Failed),
+		..PaymentDetailsUpdate::new(inbound_payment_id)
+	};
+	payment_store.update(&outbound_update)?;
+	payment_store.update(&inbound_update)?;
+	Ok(true)
 }
 
 fn channel_constrained_claim_decision(
@@ -1315,18 +1417,28 @@ where
 					reason
 				);
 
-				let update = PaymentDetailsUpdate {
-					hash: Some(payment_hash),
-					status: Some(PaymentStatus::Failed),
-					..PaymentDetailsUpdate::new(payment_id)
-				};
-				match self.payment_store.update(&update) {
-					Ok(_) => {},
+				match fail_circular_payment_records(&self.payment_store, payment_id, payment_hash) {
+					Ok(true) => {},
+					Ok(false) => {
+						let update = PaymentDetailsUpdate {
+							hash: Some(payment_hash),
+							status: Some(PaymentStatus::Failed),
+							..PaymentDetailsUpdate::new(payment_id)
+						};
+						if let Err(e) = self.payment_store.update(&update) {
+							log_error!(self.logger, "Failed to access payment store: {}", e);
+							return Err(ReplayEvent());
+						}
+					},
 					Err(e) => {
-						log_error!(self.logger, "Failed to access payment store: {}", e);
+						log_error!(
+							self.logger,
+							"Failed to persist both circular payment failure records: {}",
+							e
+						);
 						return Err(ReplayEvent());
 					},
-				};
+				}
 
 				let event =
 					Event::PaymentFailed { payment_id: Some(payment_id), payment_hash, reason };
@@ -2508,6 +2620,157 @@ mod tests {
 			},
 			other => panic!("expected two BOLT 11 payment records, got {other:?}"),
 		}
+	}
+
+	#[test]
+	fn circular_failure_marks_both_exact_records_and_replays_idempotently() {
+		let kv_store: Arc<DynStore> = Arc::new(InMemoryStore::new());
+		let logger = Arc::new(Logger::new_log_facade());
+		let payment_store = PaymentStore::new(
+			Vec::new(),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			Arc::clone(&kv_store),
+			Arc::clone(&logger),
+		);
+		let payment_preimage = PaymentPreimage([13u8; 32]);
+		let payment_hash =
+			PaymentHash(bitcoin::hashes::sha256::Hash::hash(&payment_preimage.0).to_byte_array());
+		let inbound_payment_id = PaymentId(payment_hash.0);
+		let payment_secret = lightning_types::payment::PaymentSecret([14u8; 32]);
+		let operation_id = PaymentId([15u8; 32]);
+		let outbound_payment_id = crate::payment::derive_circular_outbound_payment_id(operation_id);
+		let first_hop_user_channel_id = UserChannelId(51);
+		let last_hop_user_channel_id = UserChannelId(52);
+		let amount_msat = 20_000_000;
+		let max_routing_fee_msat = 50_000;
+
+		payment_store
+			.insert(crate::payment::prepared_circular_payment_details(
+				"failure-test-invoice".to_string(),
+				payment_hash,
+				payment_preimage,
+				payment_secret,
+				amount_msat,
+				crate::payment::CircularPaymentContext {
+					operation_id,
+					outbound_payment_id,
+					first_hop_user_channel_id,
+					last_hop_user_channel_id,
+					max_routing_fee_msat,
+				},
+			))
+			.unwrap();
+		payment_store
+			.insert(PaymentDetails::new(
+				outbound_payment_id,
+				PaymentKind::Bolt11 {
+					hash: payment_hash,
+					preimage: None,
+					secret: Some(payment_secret),
+					bolt11_invoice: Some("failure-test-invoice".to_string()),
+					required_receiving_channel_id: Some(last_hop_user_channel_id),
+					required_sending_channel_id: Some(first_hop_user_channel_id),
+					circular_operation_id: Some(operation_id),
+					circular_outbound_payment_id: Some(outbound_payment_id),
+					circular_max_routing_fee_msat: Some(max_routing_fee_msat),
+				},
+				Some(amount_msat),
+				None,
+				PaymentDirection::Outbound,
+				PaymentStatus::Pending,
+			))
+			.unwrap();
+
+		assert_eq!(
+			fail_circular_payment_records(&payment_store, outbound_payment_id, Some(payment_hash),),
+			Ok(true)
+		);
+		assert_eq!(payment_store.get(&inbound_payment_id).unwrap().status, PaymentStatus::Failed);
+		assert_eq!(payment_store.get(&outbound_payment_id).unwrap().status, PaymentStatus::Failed);
+
+		let reloaded_payments =
+			crate::io::utils::read_payments(Arc::clone(&kv_store), Arc::clone(&logger)).unwrap();
+		let reloaded_store = PaymentStore::new(
+			reloaded_payments,
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			kv_store,
+			logger,
+		);
+		assert_eq!(
+			fail_circular_payment_records(&reloaded_store, outbound_payment_id, Some(payment_hash),),
+			Ok(true)
+		);
+		assert_eq!(reloaded_store.get(&inbound_payment_id).unwrap().status, PaymentStatus::Failed);
+		assert_eq!(reloaded_store.get(&outbound_payment_id).unwrap().status, PaymentStatus::Failed);
+	}
+
+	#[test]
+	fn circular_failure_rejects_mismatched_inbound_binding_without_updates() {
+		let kv_store: Arc<DynStore> = Arc::new(InMemoryStore::new());
+		let logger = Arc::new(Logger::new_log_facade());
+		let payment_store = PaymentStore::new(
+			Vec::new(),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			kv_store,
+			logger,
+		);
+		let payment_preimage = PaymentPreimage([16u8; 32]);
+		let payment_hash =
+			PaymentHash(bitcoin::hashes::sha256::Hash::hash(&payment_preimage.0).to_byte_array());
+		let inbound_payment_id = PaymentId(payment_hash.0);
+		let payment_secret = lightning_types::payment::PaymentSecret([17u8; 32]);
+		let operation_id = PaymentId([18u8; 32]);
+		let outbound_payment_id = crate::payment::derive_circular_outbound_payment_id(operation_id);
+		let first_hop_user_channel_id = UserChannelId(61);
+		let inbound_last_hop_user_channel_id = UserChannelId(62);
+		let outbound_last_hop_user_channel_id = UserChannelId(63);
+
+		payment_store
+			.insert(crate::payment::prepared_circular_payment_details(
+				"mismatch-test-invoice".to_string(),
+				payment_hash,
+				payment_preimage,
+				payment_secret,
+				20_000_000,
+				crate::payment::CircularPaymentContext {
+					operation_id,
+					outbound_payment_id,
+					first_hop_user_channel_id,
+					last_hop_user_channel_id: inbound_last_hop_user_channel_id,
+					max_routing_fee_msat: 50_000,
+				},
+			))
+			.unwrap();
+		payment_store
+			.insert(PaymentDetails::new(
+				outbound_payment_id,
+				PaymentKind::Bolt11 {
+					hash: payment_hash,
+					preimage: None,
+					secret: Some(payment_secret),
+					bolt11_invoice: Some("mismatch-test-invoice".to_string()),
+					required_receiving_channel_id: Some(outbound_last_hop_user_channel_id),
+					required_sending_channel_id: Some(first_hop_user_channel_id),
+					circular_operation_id: Some(operation_id),
+					circular_outbound_payment_id: Some(outbound_payment_id),
+					circular_max_routing_fee_msat: Some(50_000),
+				},
+				Some(20_000_000),
+				None,
+				PaymentDirection::Outbound,
+				PaymentStatus::Pending,
+			))
+			.unwrap();
+
+		assert_eq!(
+			fail_circular_payment_records(&payment_store, outbound_payment_id, Some(payment_hash),),
+			Err(Error::InvalidPaymentId)
+		);
+		assert_eq!(payment_store.get(&inbound_payment_id).unwrap().status, PaymentStatus::Pending);
+		assert_eq!(payment_store.get(&outbound_payment_id).unwrap().status, PaymentStatus::Pending);
 	}
 
 	#[test]
