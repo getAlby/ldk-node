@@ -50,6 +50,12 @@ pub struct PaymentDetails {
 	pub latest_update_timestamp: u64,
 	/// Alby: Payment creation timestamp, as seconds since Unix epoch.
 	pub created_at: u64,
+	/// The local fail-closed reason for a rejected prepared circular payment, when available.
+	pub circular_failure_reason: Option<CircularPaymentFailureReason>,
+	/// Identified local channels through which the rejected payment parts arrived.
+	pub circular_observed_receiving_channel_ids: Vec<crate::UserChannelId>,
+	/// The number of rejected payment parts for which LDK could not identify a local channel.
+	pub circular_unidentified_receiving_channel_count: u32,
 }
 
 impl PaymentDetails {
@@ -71,6 +77,9 @@ impl PaymentDetails {
 			status,
 			latest_update_timestamp,
 			created_at,
+			circular_failure_reason: None,
+			circular_observed_receiving_channel_ids: Vec::new(),
+			circular_unidentified_receiving_channel_count: 0,
 		}
 	}
 }
@@ -95,6 +104,9 @@ impl Writeable for PaymentDetails {
 			//(131074, Some(self.last_update), option), // old alby field
 			//(131076, self.fee_msat, option), // old alby field
 			(131078, Some(self.created_at), option),
+			(131081, self.circular_failure_reason, option),
+			(131083, self.circular_observed_receiving_channel_ids, optional_vec),
+			(131085, Some(self.circular_unidentified_receiving_channel_count), option),
 		});
 		Ok(())
 	}
@@ -120,6 +132,9 @@ impl Readable for PaymentDetails {
 			(131074, last_update_unused, option), // old alby field, must still be read
 			(131076, fee_msat_unused, option), // old alby field, must still be read
 			(131078, created_at, option),
+			(131081, circular_failure_reason, option),
+			(131083, circular_observed_receiving_channel_ids, optional_vec),
+			(131085, circular_unidentified_receiving_channel_count, option),
 		});
 
 		let id: PaymentId = id.0.ok_or(DecodeError::InvalidValue)?;
@@ -188,6 +203,11 @@ impl Readable for PaymentDetails {
 			status,
 			latest_update_timestamp,
 			created_at,
+			circular_failure_reason,
+			circular_observed_receiving_channel_ids: circular_observed_receiving_channel_ids
+				.unwrap_or_default(),
+			circular_unidentified_receiving_channel_count:
+				circular_unidentified_receiving_channel_count.unwrap_or(0),
 		})
 	}
 }
@@ -317,6 +337,18 @@ impl StorableObject for PaymentDetails {
 			update_if_necessary!(self.status, status);
 		}
 
+		if let Some(reason) = update.circular_failure_reason {
+			update_if_necessary!(self.circular_failure_reason, reason);
+		}
+
+		if let Some(channel_ids) = &update.circular_observed_receiving_channel_ids {
+			update_if_necessary!(self.circular_observed_receiving_channel_ids, channel_ids.clone());
+		}
+
+		if let Some(count) = update.circular_unidentified_receiving_channel_count {
+			update_if_necessary!(self.circular_unidentified_receiving_channel_count, count);
+		}
+
 		if let Some(confirmation_status) = update.confirmation_status {
 			match self.kind {
 				PaymentKind::Onchain { ref mut status, .. } => {
@@ -370,6 +402,32 @@ impl_writeable_tlv_based_enum!(PaymentStatus,
 	(0, Pending) => {},
 	(2, Succeeded) => {},
 	(4, Failed) => {}
+);
+
+/// The local safety check that rejected a prepared circular payment before settlement.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CircularPaymentFailureReason {
+	/// The persisted payment no longer had pending status when the HTLC became claimable.
+	PaymentNotPending,
+	/// The persisted operation, channel, or payment identifiers were incomplete or inconsistent.
+	CircularMetadataMismatch,
+	/// The received amount did not exactly equal the prepared amount.
+	AmountMismatch,
+	/// The prepared payment record did not contain a preimage that could be claimed safely.
+	MissingPreimage,
+	/// One or more payment parts had no identifiable local receiving channel.
+	MissingReceivingChannelIdentity,
+	/// One or more payment parts arrived through a different local channel.
+	ReceivingChannelMismatch,
+}
+
+impl_writeable_tlv_based_enum!(CircularPaymentFailureReason,
+	(0, PaymentNotPending) => {},
+	(2, CircularMetadataMismatch) => {},
+	(4, AmountMismatch) => {},
+	(6, MissingPreimage) => {},
+	(8, MissingReceivingChannelIdentity) => {},
+	(10, ReceivingChannelMismatch) => {}
 );
 
 /// Represents the kind of a payment.
@@ -611,6 +669,9 @@ pub(crate) struct PaymentDetailsUpdate {
 	pub status: Option<PaymentStatus>,
 	//pub fee_msat: Option<Option<u64>>, // old Alby field
 	pub confirmation_status: Option<ConfirmationStatus>,
+	pub circular_failure_reason: Option<Option<CircularPaymentFailureReason>>,
+	pub circular_observed_receiving_channel_ids: Option<Vec<crate::UserChannelId>>,
+	pub circular_unidentified_receiving_channel_count: Option<u32>,
 }
 
 impl PaymentDetailsUpdate {
@@ -626,6 +687,9 @@ impl PaymentDetailsUpdate {
 			direction: None,
 			status: None,
 			confirmation_status: None,
+			circular_failure_reason: None,
+			circular_observed_receiving_channel_ids: None,
+			circular_unidentified_receiving_channel_count: None,
 		}
 	}
 }
@@ -664,6 +728,13 @@ impl From<&PaymentDetails> for PaymentDetailsUpdate {
 			direction: Some(value.direction),
 			status: Some(value.status),
 			confirmation_status,
+			circular_failure_reason: Some(value.circular_failure_reason),
+			circular_observed_receiving_channel_ids: Some(
+				value.circular_observed_receiving_channel_ids.clone(),
+			),
+			circular_unidentified_receiving_channel_count: Some(
+				value.circular_unidentified_receiving_channel_count,
+			),
 		}
 	}
 }
@@ -852,7 +923,7 @@ mod tests {
 
 	#[test]
 	fn channel_constrained_bolt11_payment_roundtrips() {
-		let payment = PaymentDetails::new(
+		let mut payment = PaymentDetails::new(
 			PaymentId([1u8; 32]),
 			PaymentKind::Bolt11 {
 				hash: PaymentHash([2u8; 32]),
@@ -870,6 +941,11 @@ mod tests {
 			PaymentDirection::Inbound,
 			PaymentStatus::Pending,
 		);
+		payment.circular_failure_reason =
+			Some(CircularPaymentFailureReason::ReceivingChannelMismatch);
+		payment.circular_observed_receiving_channel_ids =
+			vec![crate::UserChannelId(40), crate::UserChannelId(43)];
+		payment.circular_unidentified_receiving_channel_count = 1;
 
 		let encoded = payment.encode();
 		let decoded = PaymentDetails::read(&mut Cursor::new(encoded)).unwrap();

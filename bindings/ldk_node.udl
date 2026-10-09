@@ -518,6 +518,15 @@ enum PaymentStatus {
 	"Failed",
 };
 
+enum CircularPaymentFailureReason {
+	"PaymentNotPending",
+	"CircularMetadataMismatch",
+	"AmountMismatch",
+	"MissingPreimage",
+	"MissingReceivingChannelIdentity",
+	"ReceivingChannelMismatch",
+};
+
 dictionary LSPFeeLimits {
 	u64? max_total_opening_fee_msat;
 	u64? max_proportional_opening_fee_ppm_msat;
@@ -538,6 +547,9 @@ dictionary PaymentDetails {
 	PaymentStatus status;
 	u64 created_at;
 	u64 latest_update_timestamp;
+	CircularPaymentFailureReason? circular_failure_reason;
+	sequence<UserChannelId> circular_observed_receiving_channel_ids;
+	u32 circular_unidentified_receiving_channel_count;
 };
 
 dictionary RouteParametersConfig {
