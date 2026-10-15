@@ -14,24 +14,26 @@ use std::sync::Arc;
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::hashes::sha256::Hash as Sha256Hash;
 use bitcoin::hashes::Hash;
-use bitcoin::{Address, Amount, ScriptBuf};
+use bitcoin::{Address, Amount, OutPoint, ScriptBuf};
 use common::logging::{init_log_logger, validate_log_entry, MultiNodeLogger, TestLogWriter};
 use common::{
 	bump_fee_and_broadcast, distribute_funds_unconfirmed, do_channel_full_cycle,
 	expect_channel_pending_event, expect_channel_ready_event, expect_event,
 	expect_payment_claimable_event, expect_payment_received_event, expect_payment_successful_event,
-	expect_splice_pending_event, generate_blocks_and_wait, open_channel, open_channel_push_amt,
-	premine_and_distribute_funds, premine_blocks, prepare_rbf, random_config,
-	random_listening_addresses, setup_bitcoind_and_electrsd, setup_builder, setup_node,
-	setup_node_for_async_payments, setup_two_nodes, wait_for_tx, TestChainSource, TestSyncStore,
+	expect_splice_pending_event, exponential_backoff_poll, generate_blocks_and_wait, open_channel,
+	open_channel_push_amt, premine_and_distribute_funds, premine_blocks, prepare_rbf,
+	random_config, random_listening_addresses, setup_bitcoind_and_electrsd, setup_builder,
+	setup_node, setup_node_for_async_payments, setup_two_nodes, wait_for_tx, TestChainSource,
+	TestSyncStore,
 };
+use electrum_client::ElectrumApi;
 use ldk_node::config::{AsyncPaymentsRole, EsploraSyncConfig};
 use ldk_node::liquidity::LSPS2ServiceConfig;
 use ldk_node::payment::{
 	ConfirmationStatus, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus,
 	QrPaymentResult,
 };
-use ldk_node::{Builder, DynStore, Event, NodeError};
+use ldk_node::{Builder, DynStore, Event, LightningBalance, NodeError};
 use lightning::ln::channelmanager::PaymentId;
 use lightning::routing::gossip::{NodeAlias, NodeId};
 use lightning::routing::router::RouteParametersConfig;
@@ -2300,4 +2302,169 @@ async fn lsps2_lsp_trusts_client_but_client_does_not_claim() {
 			.confirmations,
 		Some(6)
 	);
+}
+
+/// Returns whether the given output was spent by a transaction in the mempool or a block.
+fn is_outpoint_spent<E: ElectrumApi>(electrs: &E, outpoint: OutPoint) -> bool {
+	let tx = electrs.transaction_get(&outpoint.txid).unwrap();
+	let script = tx.output.get(outpoint.vout as usize).unwrap().script_pubkey.clone();
+	// The history also contains the transaction creating the output.
+	electrs.script_get_history(&script).unwrap().iter().any(|entry| entry.tx_hash != outpoint.txid)
+}
+
+/// Alby: a node recovering from a static channel backup must never broadcast our commitment
+/// transaction from the restored (outdated) channel monitors, e.g. because the backup contains
+/// an HTLC that has expired in the meantime. That commitment is revoked, so the counterparty
+/// would claim the whole channel balance with a penalty transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn restored_channel_monitors_never_broadcast_revoked_commitment() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+
+	let seed_bytes = vec![42u8; 64];
+	let node_a = setup_node(&chain_source, random_config(true), Some(seed_bytes.clone()));
+	let node_b = setup_node(&chain_source, random_config(true), None);
+
+	let addr_a = node_a.onchain_payment().new_address().unwrap();
+	let addr_b = node_b.onchain_payment().new_address().unwrap();
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![addr_a, addr_b],
+		Amount::from_sat(2_100_000),
+	)
+	.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	let funding_amount_sat = 1_000_000;
+	let funding_txo = open_channel(&node_a, &node_b, funding_amount_sat, false, &electrsd).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_event!(node_b, node_a.node_id());
+
+	// A pays a hold invoice of B, so the outbound HTLC stays pending.
+	let amount_msat = 100_000_000;
+	let preimage = PaymentPreimage([42u8; 32]);
+	let payment_hash = PaymentHash(Sha256Hash::hash(&preimage.0).to_byte_array());
+	let invoice_description =
+		Bolt11InvoiceDescription::Direct(Description::new(String::from("hold")).unwrap());
+	let invoice = node_b
+		.bolt11_payment()
+		.receive_for_hash_with_min_cltv_expiry_delta(
+			amount_msat,
+			&invoice_description.into(),
+			3600,
+			payment_hash,
+			40,
+		)
+		.unwrap();
+	let payment_id = node_a.bolt11_payment().send(&invoice, None).unwrap();
+	let claimable_amount_msat =
+		expect_payment_claimable_event!(node_b, payment_id, payment_hash, amount_msat);
+
+	let htlc_expiry_height = node_a
+		.list_balances()
+		.lightning_balances
+		.iter()
+		.find_map(|balance| match balance {
+			LightningBalance::MaybeTimeoutClaimableHTLC { claimable_height, .. } => {
+				Some(*claimable_height)
+			},
+			_ => None,
+		})
+		.expect("the outbound HTLC should be pending");
+
+	// The stored channel monitor is only fully rewritten every few blocks (or every 100
+	// updates), so sync block by block to make sure the stored monitor contains the HTLC.
+	for _ in 0..6 {
+		generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+		node_a.sync_wallets().unwrap();
+		node_b.sync_wallets().unwrap();
+	}
+	let backup = node_a.get_encoded_channel_monitors().unwrap();
+	assert_eq!(backup.len(), 1);
+
+	// B settles the payment, which revokes A's commitment transaction contained in the backup.
+	node_b.bolt11_payment().claim_for_hash(payment_hash, claimable_amount_msat, preimage).unwrap();
+	expect_payment_received_event!(node_b, claimable_amount_msat);
+	expect_payment_successful_event!(node_a, Some(payment_id), None);
+	exponential_backoff_poll(|| {
+		let htlc_pending =
+			node_a.list_balances().lightning_balances.iter().any(|balance| {
+				matches!(balance, LightningBalance::MaybeTimeoutClaimableHTLC { .. })
+			});
+		(!htlc_pending).then_some(())
+	})
+	.await;
+	tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+	// A's disk is lost. By the time it recovers, the HTLC in the backup has expired.
+	node_a.stop().unwrap();
+	drop(node_a);
+	let cur_height = bitcoind.client.get_blockchain_info().unwrap().blocks as u32;
+	let blocks_to_expiry = (htlc_expiry_height + 10).saturating_sub(cur_height);
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, blocks_to_expiry as usize).await;
+	node_b.sync_wallets().unwrap();
+
+	// Recover A from the backup like hub-recovery does: same seed, fresh storage, restored
+	// channel monitors.
+	let restored_config = random_config(true);
+	setup_builder!(builder, restored_config.node_config);
+	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
+	builder.set_chain_source_esplora(
+		esplora_url,
+		Some(EsploraSyncConfig { background_sync_config: None }),
+	);
+	#[cfg(feature = "uniffi")]
+	builder.set_entropy_seed_bytes(seed_bytes).unwrap();
+	#[cfg(not(feature = "uniffi"))]
+	builder.set_entropy_seed_bytes(seed_bytes.try_into().unwrap());
+	builder.restore_encoded_channel_monitors(backup);
+	let kv_store =
+		Arc::new(TestSyncStore::new(restored_config.node_config.storage_dir_path.clone().into()));
+	let restored_node = builder.build_with_store(kv_store).unwrap();
+	restored_node.start().unwrap();
+
+	// Connecting new blocks makes the restored monitor want to go on-chain for the expired HTLC.
+	restored_node.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+	restored_node.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+	assert!(
+		!is_outpoint_spent(&electrsd.client, funding_txo),
+		"the restored node broadcast its revoked commitment transaction"
+	);
+
+	// The channel is recovered by B force-closing it once we connect.
+	let onchain_balance_before_sat = restored_node.list_balances().spendable_onchain_balance_sats;
+	restored_node
+		.connect(
+			node_b.node_id(),
+			node_b.listening_addresses().unwrap().first().unwrap().clone(),
+			false,
+		)
+		.unwrap();
+
+	// A's channel balance minus the payment and on-chain fees.
+	let min_recovered_sat = funding_amount_sat - amount_msat / 1000 - 50_000;
+	let mut recovered = false;
+	for _ in 0..30 {
+		generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+		restored_node.sync_wallets().unwrap();
+		node_b.sync_wallets().unwrap();
+		let onchain_balance_sat = restored_node.list_balances().spendable_onchain_balance_sats;
+		if onchain_balance_sat >= onchain_balance_before_sat + min_recovered_sat {
+			recovered = true;
+			break;
+		}
+	}
+	assert!(is_outpoint_spent(&electrsd.client, funding_txo));
+	assert!(recovered, "the restored node did not recover its channel balance");
+
+	restored_node.stop().unwrap();
+	node_b.stop().unwrap();
 }

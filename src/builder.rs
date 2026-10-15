@@ -985,6 +985,7 @@ impl NodeBuilder {
 			logger,
 			Arc::new(vss_store),
 			self.reset_state,
+			false,
 		)
 	}
 
@@ -1037,6 +1038,7 @@ impl NodeBuilder {
 			logger,
 			kv_store,
 			self.reset_state,
+			self.monitors_to_restore.is_some(),
 		)
 	}
 }
@@ -1416,6 +1418,7 @@ fn build_with_store_internal(
 	pathfinding_scores_sync_config: Option<&PathfindingScoresSyncConfig>,
 	async_payments_role: Option<AsyncPaymentsRole>, seed_bytes: [u8; 64], runtime: Arc<Runtime>,
 	logger: Arc<Logger>, kv_store: Arc<DynStore>, reset_state: Option<ResetState>,
+	restored_channel_monitors: bool,
 ) -> Result<Node, BuildError> {
 	optionally_install_rustls_cryptoprovider();
 
@@ -1670,6 +1673,17 @@ fn build_with_store_internal(
 			}
 		},
 	};
+
+	// Alby: the monitors restored from a static channel backup are outdated, so we must never
+	// broadcast our commitment transaction built from them. The channels are recovered by the
+	// counterparty force-closing them.
+	if restored_channel_monitors {
+		tx_broadcaster.block_funding_outpoint_spends(
+			channel_monitors.iter().map(|(_, channel_monitor)| {
+				channel_monitor.get_funding_txo().into_bitcoin_outpoint()
+			}),
+		);
+	}
 
 	// Initialize the ChainMonitor
 	let chain_monitor: Arc<ChainMonitor> = Arc::new(chainmonitor::ChainMonitor::new(
