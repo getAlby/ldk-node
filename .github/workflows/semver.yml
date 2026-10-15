@@ -1,5 +1,7 @@
 name: SemVer checks
-on: [push, pull_request]
+# Alby: disabled as this fork intentionally extends the upstream API, so semver checks
+# against the upstream crates.io release always fail. Can still be run manually.
+on: workflow_dispatch
 
 jobs:
   semver-checks:

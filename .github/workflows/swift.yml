@@ -1,6 +1,7 @@
 name: CI Checks - Swift Tests
 
-on: [push, pull_request]
+# Alby: disabled as we only compile for Alby Hub, not mobile. Can still be run manually.
+on: workflow_dispatch
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
