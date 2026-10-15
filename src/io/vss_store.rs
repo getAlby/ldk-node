@@ -930,7 +930,7 @@ mod tests {
 	use vss_client::headers::FixedHeaders;
 
 	use super::*;
-	use crate::io::test_utils::do_read_write_remove_list_persist;
+	use crate::io::test_utils::{do_read_write_remove_list_persist, InMemoryStore};
 
 	#[test]
 	fn vss_read_write_remove_list_persist() {
@@ -940,8 +940,15 @@ mod tests {
 		let mut vss_seed = [0u8; 32];
 		rng.fill_bytes(&mut vss_seed);
 		let header_provider = Arc::new(FixedHeaders::new(HashMap::new()));
-		let vss_store =
-			VssStore::new(vss_base_url, rand_store_id, vss_seed, header_provider).unwrap();
+		let secondary_kv_store: Arc<crate::types::DynStore> = Arc::new(InMemoryStore::new());
+		let vss_store = VssStore::new(
+			vss_base_url,
+			rand_store_id,
+			vss_seed,
+			header_provider,
+			secondary_kv_store,
+		)
+		.unwrap();
 		do_read_write_remove_list_persist(&vss_store);
 	}
 
@@ -953,8 +960,15 @@ mod tests {
 		let mut vss_seed = [0u8; 32];
 		rng.fill_bytes(&mut vss_seed);
 		let header_provider = Arc::new(FixedHeaders::new(HashMap::new()));
-		let vss_store =
-			VssStore::new(vss_base_url, rand_store_id, vss_seed, header_provider).unwrap();
+		let secondary_kv_store: Arc<crate::types::DynStore> = Arc::new(InMemoryStore::new());
+		let vss_store = VssStore::new(
+			vss_base_url,
+			rand_store_id,
+			vss_seed,
+			header_provider,
+			secondary_kv_store,
+		)
+		.unwrap();
 
 		do_read_write_remove_list_persist(&vss_store);
 		drop(vss_store)
