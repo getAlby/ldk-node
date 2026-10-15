@@ -1136,9 +1136,10 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 		node_a.list_payments_with_filter(|p| matches!(p.kind, PaymentKind::Bolt11 { .. })).len(),
 		5
 	);
+	// Alby: +2 for the min_cltv_expiry_delta invoices created above
 	assert_eq!(
 		node_b.list_payments_with_filter(|p| matches!(p.kind, PaymentKind::Bolt11 { .. })).len(),
-		6
+		8
 	);
 	assert_eq!(
 		node_a
