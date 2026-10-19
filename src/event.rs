@@ -315,10 +315,11 @@ fn fail_circular_or_outbound_payment_records(
 }
 
 fn channel_constrained_claim_decision(
-	kind: &PaymentKind, status: PaymentStatus, expected_amount_msat: Option<u64>,
-	actual_amount_msat: u64, receiving_channel_ids: &[(ChannelId, Option<u128>)],
+	kind: &PaymentKind, payment_hash: &PaymentHash, status: PaymentStatus,
+	expected_amount_msat: Option<u64>, actual_amount_msat: u64,
+	receiving_channel_ids: &[(ChannelId, Option<u128>)],
 ) -> ChannelConstrainedClaimDecision {
-	let (preimage, required_channel_id, circular_metadata_matches) = match kind {
+	let (stored_hash, preimage, required_channel_id, circular_metadata_matches) = match kind {
 		PaymentKind::Bolt11 {
 			hash,
 			preimage,
@@ -347,7 +348,7 @@ fn channel_constrained_claim_decision(
 				},
 				_ => false,
 			};
-			(preimage, required_channel_id, metadata_matches)
+			(hash, preimage, required_channel_id, metadata_matches)
 		},
 		_ => return ChannelConstrainedClaimDecision::NotConstrained,
 	};
@@ -370,6 +371,18 @@ fn channel_constrained_claim_decision(
 			CircularPaymentFailureReason::MissingPreimage,
 		);
 	};
+	if stored_hash != payment_hash {
+		return ChannelConstrainedClaimDecision::Fail(
+			CircularPaymentFailureReason::CircularMetadataMismatch,
+		);
+	}
+	let preimage_hash =
+		PaymentHash(bitcoin::hashes::sha256::Hash::hash(&preimage.0).to_byte_array());
+	if preimage_hash != *payment_hash {
+		return ChannelConstrainedClaimDecision::Fail(
+			CircularPaymentFailureReason::MissingPreimage,
+		);
+	}
 	if receiving_channel_ids.is_empty()
 		|| receiving_channel_ids.iter().any(|(_, user_channel_id)| user_channel_id.is_none())
 	{
@@ -1149,6 +1162,7 @@ where
 					// knows the preimage.
 					let claim_decision = channel_constrained_claim_decision(
 						&info.kind,
+						&payment_hash,
 						info.status,
 						info.amount_msat,
 						amount_msat,
@@ -2495,8 +2509,10 @@ mod tests {
 	#[test]
 	fn channel_constrained_claim_requires_amount_preimage_and_every_exact_mpp_part() {
 		let preimage = PaymentPreimage([3u8; 32]);
+		let payment_hash =
+			PaymentHash(bitcoin::hashes::sha256::Hash::hash(&preimage.0).to_byte_array());
 		let constrained = PaymentKind::Bolt11 {
-			hash: PaymentHash([2u8; 32]),
+			hash: payment_hash,
 			preimage: Some(preimage),
 			secret: None,
 			bolt11_invoice: None,
@@ -2510,6 +2526,7 @@ mod tests {
 		assert_eq!(
 			channel_constrained_claim_decision(
 				&constrained,
+				&payment_hash,
 				PaymentStatus::Pending,
 				Some(20_000_000),
 				20_000_000,
@@ -2523,6 +2540,7 @@ mod tests {
 		assert_eq!(
 			channel_constrained_claim_decision(
 				&constrained,
+				&payment_hash,
 				PaymentStatus::Pending,
 				Some(20_000_000),
 				20_000_000,
@@ -2536,6 +2554,7 @@ mod tests {
 			assert_eq!(
 				channel_constrained_claim_decision(
 					&constrained,
+					&payment_hash,
 					PaymentStatus::Pending,
 					Some(20_000_000),
 					20_000_000,
@@ -2549,6 +2568,7 @@ mod tests {
 		assert_eq!(
 			channel_constrained_claim_decision(
 				&constrained,
+				&payment_hash,
 				PaymentStatus::Pending,
 				Some(20_000_000),
 				19_999_999,
@@ -2559,6 +2579,7 @@ mod tests {
 		assert_eq!(
 			channel_constrained_claim_decision(
 				&constrained,
+				&payment_hash,
 				PaymentStatus::Pending,
 				Some(20_000_000),
 				20_000_001,
@@ -2569,6 +2590,7 @@ mod tests {
 		assert_eq!(
 			channel_constrained_claim_decision(
 				&constrained,
+				&payment_hash,
 				PaymentStatus::Pending,
 				None,
 				20_000_000,
@@ -2579,6 +2601,7 @@ mod tests {
 		assert_eq!(
 			channel_constrained_claim_decision(
 				&constrained,
+				&payment_hash,
 				PaymentStatus::Failed,
 				Some(20_000_000),
 				20_000_000,
@@ -2594,12 +2617,42 @@ mod tests {
 		assert_eq!(
 			channel_constrained_claim_decision(
 				&missing_preimage,
+				&payment_hash,
 				PaymentStatus::Pending,
 				Some(20_000_000),
 				20_000_000,
 				&exact_parts,
 			),
 			ChannelConstrainedClaimDecision::Fail(CircularPaymentFailureReason::MissingPreimage)
+		);
+
+		let mut invalid_preimage = constrained.clone();
+		if let PaymentKind::Bolt11 { preimage, .. } = &mut invalid_preimage {
+			*preimage = Some(PaymentPreimage([9u8; 32]));
+		}
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&invalid_preimage,
+				&payment_hash,
+				PaymentStatus::Pending,
+				Some(20_000_000),
+				20_000_000,
+				&exact_parts,
+			),
+			ChannelConstrainedClaimDecision::Fail(CircularPaymentFailureReason::MissingPreimage)
+		);
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&constrained,
+				&PaymentHash([8u8; 32]),
+				PaymentStatus::Pending,
+				Some(20_000_000),
+				20_000_000,
+				&exact_parts,
+			),
+			ChannelConstrainedClaimDecision::Fail(
+				CircularPaymentFailureReason::CircularMetadataMismatch,
+			)
 		);
 
 		let mut missing_operation = constrained.clone();
@@ -2609,6 +2662,7 @@ mod tests {
 		assert_eq!(
 			channel_constrained_claim_decision(
 				&missing_operation,
+				&payment_hash,
 				PaymentStatus::Pending,
 				Some(20_000_000),
 				20_000_000,
@@ -2626,6 +2680,7 @@ mod tests {
 		assert_eq!(
 			channel_constrained_claim_decision(
 				&unconstrained,
+				&payment_hash,
 				PaymentStatus::Pending,
 				Some(20_000_000),
 				20_000_000,
@@ -3652,6 +3707,7 @@ mod tests {
 		assert_eq!(
 			channel_constrained_claim_decision(
 				&wrong_kind,
+				&wrong_hash,
 				PaymentStatus::Pending,
 				Some(amount_msat),
 				amount_msat,
@@ -3699,6 +3755,7 @@ mod tests {
 		assert_eq!(
 			channel_constrained_claim_decision(
 				&exact_kind,
+				&exact_hash,
 				PaymentStatus::Pending,
 				Some(amount_msat),
 				amount_msat,
@@ -3784,6 +3841,7 @@ mod tests {
 		assert_eq!(
 			channel_constrained_claim_decision(
 				&kind,
+				&payment_hash,
 				PaymentStatus::Pending,
 				Some(amount_msat),
 				amount_msat,
@@ -4058,6 +4116,7 @@ mod tests {
 		assert_eq!(
 			channel_constrained_claim_decision(
 				&prepared.kind,
+				&payment_hash,
 				prepared.status,
 				prepared.amount_msat,
 				amount_msat,
@@ -4383,6 +4442,7 @@ mod tests {
 		assert_eq!(
 			channel_constrained_claim_decision(
 				&prepared.kind,
+				&payment_hash,
 				prepared.status,
 				prepared.amount_msat,
 				amount_msat,
