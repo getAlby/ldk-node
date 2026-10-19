@@ -566,6 +566,67 @@ impl PaymentKind {
 	}
 }
 
+fn no_legacy_payment_kind_value<T>(_payment_kind: &PaymentKind) -> Option<T> {
+	None
+}
+
+fn bolt11_required_receiving_channel_id_for_write(
+	payment_kind: &PaymentKind,
+) -> Option<&crate::UserChannelId> {
+	match payment_kind {
+		PaymentKind::Bolt11 { required_receiving_channel_id, .. } => {
+			required_receiving_channel_id.as_ref()
+		},
+		_ => None,
+	}
+}
+
+fn bolt11_required_sending_channel_id_for_write(
+	payment_kind: &PaymentKind,
+) -> Option<&crate::UserChannelId> {
+	match payment_kind {
+		PaymentKind::Bolt11 { required_sending_channel_id, .. } => {
+			required_sending_channel_id.as_ref()
+		},
+		_ => None,
+	}
+}
+
+fn bolt11_circular_operation_id_for_write(payment_kind: &PaymentKind) -> Option<&PaymentId> {
+	match payment_kind {
+		PaymentKind::Bolt11 { circular_operation_id, .. } => circular_operation_id.as_ref(),
+		_ => None,
+	}
+}
+
+fn bolt11_circular_outbound_payment_id_for_write(payment_kind: &PaymentKind) -> Option<&PaymentId> {
+	match payment_kind {
+		PaymentKind::Bolt11 { circular_outbound_payment_id, .. } => {
+			circular_outbound_payment_id.as_ref()
+		},
+		_ => None,
+	}
+}
+
+fn bolt11_circular_max_routing_fee_msat_for_write(payment_kind: &PaymentKind) -> Option<&u64> {
+	match payment_kind {
+		PaymentKind::Bolt11 { circular_max_routing_fee_msat, .. } => {
+			circular_max_routing_fee_msat.as_ref()
+		},
+		_ => None,
+	}
+}
+
+fn merge_rc_payment_kind_field<T: PartialEq>(
+	current: Option<T>, legacy: Option<T>,
+) -> Result<Option<T>, DecodeError> {
+	match (current, legacy) {
+		(Some(current), Some(legacy)) if current != legacy => Err(DecodeError::InvalidValue),
+		(Some(current), _) => Ok(Some(current)),
+		(None, legacy) => Ok(legacy),
+	}
+}
+
 impl_writeable_tlv_based_enum!(PaymentKind,
 	(0, Onchain) => {
 		(0, txid, required),
@@ -576,11 +637,48 @@ impl_writeable_tlv_based_enum!(PaymentKind,
 		(2, preimage, option),
 		(4, secret, option),
 		(131072, bolt11_invoice, option),
-		(131074, required_receiving_channel_id, option),
-		(131076, required_sending_channel_id, option),
-		(131078, circular_operation_id, option),
-		(131080, circular_outbound_payment_id, option),
-		(131082, circular_max_routing_fee_msat, option),
+		// RC builds briefly wrote these optional fields with even types. Accept those records for
+		// wallet continuity, but only write the skippable odd types going forward.
+		(131074, legacy_required_receiving_channel_id, (legacy, crate::UserChannelId,
+			no_legacy_payment_kind_value::<crate::UserChannelId>)),
+		(131075, current_required_receiving_channel_id, (legacy, crate::UserChannelId,
+			bolt11_required_receiving_channel_id_for_write)),
+		(131076, legacy_required_sending_channel_id, (legacy, crate::UserChannelId,
+			no_legacy_payment_kind_value::<crate::UserChannelId>)),
+		(131077, current_required_sending_channel_id, (legacy, crate::UserChannelId,
+			bolt11_required_sending_channel_id_for_write)),
+		(131078, legacy_circular_operation_id, (legacy, PaymentId,
+			no_legacy_payment_kind_value::<PaymentId>)),
+		(131079, current_circular_operation_id, (legacy, PaymentId,
+			bolt11_circular_operation_id_for_write)),
+		(131080, legacy_circular_outbound_payment_id, (legacy, PaymentId,
+			no_legacy_payment_kind_value::<PaymentId>)),
+		(131081, current_circular_outbound_payment_id, (legacy, PaymentId,
+			bolt11_circular_outbound_payment_id_for_write)),
+		(131082, legacy_circular_max_routing_fee_msat, (legacy, u64,
+			no_legacy_payment_kind_value::<u64>)),
+		(131083, current_circular_max_routing_fee_msat, (legacy, u64,
+			bolt11_circular_max_routing_fee_msat_for_write)),
+		(_unused, required_receiving_channel_id, (static_value,
+			merge_rc_payment_kind_field(
+				current_required_receiving_channel_id, legacy_required_receiving_channel_id
+			)?)),
+		(_unused, required_sending_channel_id, (static_value,
+			merge_rc_payment_kind_field(
+				current_required_sending_channel_id, legacy_required_sending_channel_id
+			)?)),
+		(_unused, circular_operation_id, (static_value,
+			merge_rc_payment_kind_field(
+				current_circular_operation_id, legacy_circular_operation_id
+			)?)),
+		(_unused, circular_outbound_payment_id, (static_value,
+			merge_rc_payment_kind_field(
+				current_circular_outbound_payment_id, legacy_circular_outbound_payment_id
+			)?)),
+		(_unused, circular_max_routing_fee_msat, (static_value,
+			merge_rc_payment_kind_field(
+				current_circular_max_routing_fee_msat, legacy_circular_max_routing_fee_msat
+			)?)),
 	},
 	(4, Bolt11Jit) => {
 		(0, hash, required),
@@ -751,6 +849,54 @@ mod tests {
 	use lightning::util::ser::Readable;
 
 	use super::*;
+
+	#[derive(Debug, PartialEq, Eq)]
+	enum PaymentKindBeforeCircular {
+		Bolt11 {
+			hash: PaymentHash,
+			preimage: Option<PaymentPreimage>,
+			secret: Option<PaymentSecret>,
+			bolt11_invoice: Option<String>,
+		},
+	}
+
+	impl_writeable_tlv_based_enum!(PaymentKindBeforeCircular,
+		(2, Bolt11) => {
+			(0, hash, required),
+			(2, preimage, option),
+			(4, secret, option),
+			(131072, bolt11_invoice, option),
+		},
+	);
+
+	#[derive(Debug, PartialEq, Eq)]
+	enum PaymentKindRc6 {
+		Bolt11 {
+			hash: PaymentHash,
+			preimage: Option<PaymentPreimage>,
+			secret: Option<PaymentSecret>,
+			bolt11_invoice: Option<String>,
+			required_receiving_channel_id: Option<crate::UserChannelId>,
+			required_sending_channel_id: Option<crate::UserChannelId>,
+			circular_operation_id: Option<PaymentId>,
+			circular_outbound_payment_id: Option<PaymentId>,
+			circular_max_routing_fee_msat: Option<u64>,
+		},
+	}
+
+	impl_writeable_tlv_based_enum!(PaymentKindRc6,
+		(2, Bolt11) => {
+			(0, hash, required),
+			(2, preimage, option),
+			(4, secret, option),
+			(131072, bolt11_invoice, option),
+			(131074, required_receiving_channel_id, option),
+			(131076, required_sending_channel_id, option),
+			(131078, circular_operation_id, option),
+			(131080, circular_outbound_payment_id, option),
+			(131082, circular_max_routing_fee_msat, option),
+		},
+	);
 
 	/// We refactored `PaymentDetails` to hold a payment id and moved some required fields into
 	/// `PaymentKind`. Here, we keep the old layout available in order test de/ser compatibility.
@@ -950,5 +1096,30 @@ mod tests {
 		let encoded = payment.encode();
 		let decoded = PaymentDetails::read(&mut Cursor::new(encoded)).unwrap();
 		assert_eq!(decoded, payment);
+
+		let legacy_kind =
+			PaymentKindBeforeCircular::read(&mut Cursor::new(payment.kind.encode())).unwrap();
+		assert_eq!(
+			legacy_kind,
+			PaymentKindBeforeCircular::Bolt11 {
+				hash: PaymentHash([2u8; 32]),
+				preimage: Some(PaymentPreimage([3u8; 32])),
+				secret: Some(PaymentSecret([4u8; 32])),
+				bolt11_invoice: Some("prepared-circular-invoice".to_string()),
+			}
+		);
+
+		let rc6_kind = PaymentKindRc6::Bolt11 {
+			hash: PaymentHash([2u8; 32]),
+			preimage: Some(PaymentPreimage([3u8; 32])),
+			secret: Some(PaymentSecret([4u8; 32])),
+			bolt11_invoice: Some("prepared-circular-invoice".to_string()),
+			required_receiving_channel_id: Some(crate::UserChannelId(42)),
+			required_sending_channel_id: Some(crate::UserChannelId(41)),
+			circular_operation_id: Some(PaymentId([5u8; 32])),
+			circular_outbound_payment_id: Some(PaymentId([6u8; 32])),
+			circular_max_routing_fee_msat: Some(1_000_000),
+		};
+		assert_eq!(PaymentKind::read(&mut Cursor::new(rc6_kind.encode())).unwrap(), payment.kind);
 	}
 }

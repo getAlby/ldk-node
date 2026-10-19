@@ -16,7 +16,7 @@ use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use lightning::ln::channelmanager::{
 	Bolt11InvoiceParameters, Bolt11PaymentError, PaymentId, RecentPaymentDetails,
-	RecipientOnionFields, Retry, RetryableSendFailure,
+	RecipientOnionFields, Retry, RetryableSendFailure, MIN_FINAL_CLTV_EXPIRY_DELTA,
 };
 use lightning::routing::router::{
 	PaymentParameters, Route, RouteHint, RouteHintHop, RouteParameters, RouteParametersConfig,
@@ -25,10 +25,11 @@ use lightning::routing::router::{
 use lightning::util::ser::{Readable, Writeable};
 use lightning_invoice::{
 	Bolt11Invoice as LdkBolt11Invoice, Bolt11InvoiceDescription as LdkBolt11InvoiceDescription,
-	DEFAULT_MIN_FINAL_CLTV_EXPIRY_DELTA,
 };
 use lightning_types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning_types::routing::RoutingFees;
+use rand::rngs::OsRng;
+use rand::TryRngCore;
 
 use crate::config::{Config, LDK_PAYMENT_RETRY_TIMEOUT};
 use crate::connection::ConnectionManager;
@@ -195,6 +196,34 @@ fn circular_path_uses_exact_channels(
 	first_matches && last_matches
 }
 
+fn fresh_synthetic_payee() -> Result<bitcoin::secp256k1::PublicKey, Error> {
+	let secp_ctx = bitcoin::secp256k1::Secp256k1::new();
+	loop {
+		let mut secret_bytes = [0u8; 32];
+		OsRng.try_fill_bytes(&mut secret_bytes).map_err(|_| Error::PaymentSendingFailed)?;
+		if let Ok(secret_key) = bitcoin::secp256k1::SecretKey::from_slice(&secret_bytes) {
+			return Ok(bitcoin::secp256k1::PublicKey::from_secret_key(&secp_ctx, &secret_key));
+		}
+	}
+}
+
+fn apply_configured_routing_fee_cap(
+	route_params: &mut RouteParameters, route_parameters: &RouteParametersConfig,
+) {
+	if let Some(max_total_routing_fee_msat) = route_parameters.max_total_routing_fee_msat {
+		route_params.max_total_routing_fee_msat = Some(max_total_routing_fee_msat);
+	}
+}
+
+fn recent_payment_has_id(payment: &RecentPaymentDetails, expected_payment_id: PaymentId) -> bool {
+	match payment {
+		RecentPaymentDetails::AwaitingInvoice { payment_id }
+		| RecentPaymentDetails::Pending { payment_id, .. }
+		| RecentPaymentDetails::Fulfilled { payment_id, .. }
+		| RecentPaymentDetails::Abandoned { payment_id, .. } => *payment_id == expected_payment_id,
+	}
+}
+
 /// Convert the synthetic pathfinding destination into the real local recipient while preserving
 /// the exact reviewed first- and last-hop channels. Clearing `route_params` is intentional:
 /// `send_payment_with_route` reconstructs fixed-route parameters from the real final hop and uses
@@ -260,6 +289,15 @@ fn decode_and_validate_circular_quote_route(quote: &CircularRouteQuote) -> Resul
 	}
 
 	Ok(route)
+}
+
+fn circular_route_meets_min_final_cltv(route: &Route, min_final_cltv_expiry_delta: u64) -> bool {
+	!route.paths.is_empty()
+		&& route.paths.iter().all(|path| {
+			path.hops.last().map_or(false, |hop| {
+				u64::from(hop.cltv_expiry_delta) >= min_final_cltv_expiry_delta
+			})
+		})
 }
 
 #[derive(Clone)]
@@ -430,7 +468,7 @@ pub(crate) fn build_prepared_circular_execution(
 	}
 
 	let route = decode_and_validate_circular_quote_route(quote)?;
-	if route.paths.is_empty()
+	if !circular_route_meets_min_final_cltv(&route, invoice.min_final_cltv_expiry_delta())
 		|| route.paths.iter().any(|path| {
 			path.hops.len() < 2
 				|| path.hops.first().map_or(true, |hop| {
@@ -751,13 +789,13 @@ impl Bolt11Payment {
 			Error::InvalidChannelId
 		})?;
 
-		// This is secp256k1's generator public key (private key 1). It is intentionally unusable as
-		// a real destination here. Exact final-hop validation below ensures pathfinding can only use
-		// it behind the selected local inbound channel.
-		let synthetic_payee = bitcoin::secp256k1::PublicKey::from_str(
-			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-		)
-		.expect("hard-coded synthetic payee public key is valid");
+		// Use a fresh identity for this pathfinding-only destination so it cannot collide with or
+		// become a stable fingerprint for a real graph node. The private key is immediately dropped,
+		// and exact final-hop validation below still confines it behind the selected inbound channel.
+		let synthetic_payee = fresh_synthetic_payee().map_err(|e| {
+			log_error!(self.logger, "Failed to generate a fresh circular-route destination.");
+			e
+		})?;
 		if synthetic_payee == self.channel_manager.get_our_node_id() {
 			log_error!(self.logger, "Synthetic circular-route payee collides with local node ID.");
 			return Err(Error::InvalidNodeId);
@@ -778,7 +816,7 @@ impl Bolt11Payment {
 			route_parameters.or(self.config.route_parameters).unwrap_or_default();
 		let mut payment_params = PaymentParameters::from_node_id(
 			synthetic_payee,
-			DEFAULT_MIN_FINAL_CLTV_EXPIRY_DELTA as u32,
+			u32::from(MIN_FINAL_CLTV_EXPIRY_DELTA),
 		)
 		.with_route_hints(vec![route_hint])
 		.expect("clear payment parameters accept clear route hints");
@@ -788,7 +826,7 @@ impl Bolt11Payment {
 			route_parameters.max_channel_saturation_power_of_half;
 		let mut route_params =
 			RouteParameters::from_payment_params_and_value(payment_params, amount_msat);
-		route_params.max_total_routing_fee_msat = route_parameters.max_total_routing_fee_msat;
+		apply_configured_routing_fee_cap(&mut route_params, &route_parameters);
 
 		let mut quote_material = Vec::with_capacity(16 + 16 + 8);
 		quote_material.extend_from_slice(&first_hop.user_channel_id.to_be_bytes());
@@ -1078,6 +1116,18 @@ impl Bolt11Payment {
 				return Err(Error::DuplicatePayment);
 			}
 		}
+		if self
+			.channel_manager
+			.list_recent_payments()
+			.iter()
+			.any(|payment| recent_payment_has_id(payment, payment_id))
+		{
+			log_error!(
+				self.logger,
+				"Payment error: ChannelManager is already tracking this payment ID."
+			);
+			return Err(Error::DuplicatePayment);
+		}
 
 		let usable_channels = self.channel_manager.list_usable_channels();
 		let selected_channel = usable_channels
@@ -1097,7 +1147,7 @@ impl Bolt11Payment {
 		let payment_params = PaymentParameters::from_bolt11_invoice(invoice);
 		let mut route_params =
 			RouteParameters::from_payment_params_and_value(payment_params, amount_msat);
-		route_params.max_total_routing_fee_msat = route_parameters.max_total_routing_fee_msat;
+		apply_configured_routing_fee_cap(&mut route_params, &route_parameters);
 		route_params.payment_params.max_total_cltv_expiry_delta =
 			route_parameters.max_total_cltv_expiry_delta;
 		route_params.payment_params.max_path_count = route_parameters.max_path_count;
@@ -1175,15 +1225,11 @@ impl Bolt11Payment {
 			recipient_onion,
 			payment_id,
 		) {
-			// DuplicatePayment can mean ChannelManager recovered an already in-flight attempt after
-			// restart. Preserve Pending in that case so recovery evidence is not overwritten.
-			if e != RetryableSendFailure::DuplicatePayment {
-				let update = PaymentDetailsUpdate {
-					status: Some(PaymentStatus::Failed),
-					..PaymentDetailsUpdate::new(payment_id)
-				};
-				self.payment_store.update(&update)?;
-			}
+			let update = PaymentDetailsUpdate {
+				status: Some(PaymentStatus::Failed),
+				..PaymentDetailsUpdate::new(payment_id)
+			};
+			self.payment_store.update(&update)?;
 			return Err({
 				log_error!(
 					self.logger,
@@ -2159,6 +2205,82 @@ mod tests {
 		assert!(circular_path_uses_exact_channels(&path, first_node, 41, synthetic_payee, 99));
 		assert!(!circular_path_uses_exact_channels(&path, first_node, 42, synthetic_payee, 99));
 		assert!(!circular_path_uses_exact_channels(&path, first_node, 41, synthetic_payee, 100));
+	}
+
+	#[test]
+	fn circular_route_uses_a_fresh_synthetic_payee() {
+		let first = fresh_synthetic_payee().unwrap();
+		let second = fresh_synthetic_payee().unwrap();
+		assert_ne!(first, second);
+	}
+
+	#[test]
+	fn absent_configured_fee_cap_preserves_ldk_default() {
+		let payment_params = PaymentParameters::from_node_id(
+			fresh_synthetic_payee().unwrap(),
+			u32::from(MIN_FINAL_CLTV_EXPIRY_DELTA),
+		);
+		let mut route_params =
+			RouteParameters::from_payment_params_and_value(payment_params, 1_000_000);
+		let ldk_default = route_params.max_total_routing_fee_msat;
+
+		apply_configured_routing_fee_cap(&mut route_params, &RouteParametersConfig::default());
+		assert_eq!(route_params.max_total_routing_fee_msat, ldk_default);
+
+		let configured = RouteParametersConfig {
+			max_total_routing_fee_msat: Some(777),
+			..RouteParametersConfig::default()
+		};
+		apply_configured_routing_fee_cap(&mut route_params, &configured);
+		assert_eq!(route_params.max_total_routing_fee_msat, Some(777));
+	}
+
+	#[test]
+	fn every_recent_payment_state_reserves_its_payment_id() {
+		let expected = PaymentId([1u8; 32]);
+		let other = PaymentId([2u8; 32]);
+		let payment_hash = PaymentHash([3u8; 32]);
+		let payments = [
+			RecentPaymentDetails::AwaitingInvoice { payment_id: expected },
+			RecentPaymentDetails::Pending { payment_id: expected, payment_hash, total_msat: 1_000 },
+			RecentPaymentDetails::Fulfilled {
+				payment_id: expected,
+				payment_hash: Some(payment_hash),
+			},
+			RecentPaymentDetails::Abandoned { payment_id: expected, payment_hash },
+		];
+		for payment in payments {
+			assert!(recent_payment_has_id(&payment, expected));
+			assert!(!recent_payment_has_id(&payment, other));
+		}
+	}
+
+	#[test]
+	fn circular_route_requires_invoice_min_final_cltv() {
+		let first_node = bitcoin::secp256k1::PublicKey::from_str(
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+		)
+		.unwrap();
+		let local_node = bitcoin::secp256k1::PublicKey::from_str(
+			"02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+		)
+		.unwrap();
+		let mut route = Route {
+			paths: vec![Path {
+				hops: vec![route_hop(first_node, 41), route_hop(local_node, 99)],
+				blinded_tail: None,
+			}],
+			route_params: None,
+		};
+		let min_final_cltv_expiry_delta = u64::from(MIN_FINAL_CLTV_EXPIRY_DELTA);
+
+		assert!(!circular_route_meets_min_final_cltv(&route, min_final_cltv_expiry_delta));
+		route.paths[0].hops[1].cltv_expiry_delta = u32::from(MIN_FINAL_CLTV_EXPIRY_DELTA);
+		assert!(circular_route_meets_min_final_cltv(&route, min_final_cltv_expiry_delta));
+		assert!(!circular_route_meets_min_final_cltv(
+			&Route { paths: Vec::new(), route_params: None },
+			min_final_cltv_expiry_delta
+		));
 	}
 
 	#[test]

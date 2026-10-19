@@ -20,6 +20,7 @@ use lightning::events::{
 	ClosureReason, Event as LdkEvent, PaymentFailureReason, PaymentPurpose, ReplayEvent,
 };
 use lightning::ln::channelmanager::{FailureCode, PaymentId};
+use lightning::ln::msgs::DecodeError;
 use lightning::ln::types::ChannelId;
 use lightning::routing::gossip::NodeId;
 use lightning::util::config::{
@@ -27,7 +28,7 @@ use lightning::util::config::{
 };
 use lightning::util::errors::APIError;
 use lightning::util::persist::KVStore;
-use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
+use lightning::util::ser::{ReadTrackingReader, Readable, ReadableArgs, Writeable, Writer};
 use lightning::{impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
 use lightning_liquidity::lsps2::utils::compute_opening_fee;
 use lightning_types::payment::{PaymentHash, PaymentPreimage};
@@ -128,7 +129,9 @@ fn handle_channel_constrained_claim<A: ChannelConstrainedClaimActions>(
 		_ => None,
 	};
 	let outcome = apply_channel_constrained_claim_decision(actions, payment_hash, decision);
-	if outcome == ChannelConstrainedClaimOutcome::Failed {
+	let payment_was_already_terminal =
+		failure_reason == Some(CircularPaymentFailureReason::PaymentNotPending);
+	if outcome == ChannelConstrainedClaimOutcome::Failed && !payment_was_already_terminal {
 		let observed_receiving_channel_ids = receiving_channel_ids
 			.iter()
 			.filter_map(|(_, user_channel_id)| user_channel_id.map(UserChannelId))
@@ -287,6 +290,28 @@ fn fail_circular_payment_records(
 	payment_store.update(&outbound_update)?;
 	payment_store.update(&inbound_update)?;
 	Ok(true)
+}
+
+fn fail_circular_or_outbound_payment_records(
+	payment_store: &PaymentStore, outbound_payment_id: PaymentId,
+	event_payment_hash: Option<PaymentHash>,
+) -> Result<Option<Error>, Error> {
+	let circular_mismatch =
+		match fail_circular_payment_records(payment_store, outbound_payment_id, event_payment_hash)
+		{
+			Ok(true) => return Ok(None),
+			Ok(false) => None,
+			Err(Error::PersistenceFailed) => return Err(Error::PersistenceFailed),
+			Err(e) => Some(e),
+		};
+
+	let update = PaymentDetailsUpdate {
+		hash: Some(event_payment_hash),
+		status: Some(PaymentStatus::Failed),
+		..PaymentDetailsUpdate::new(outbound_payment_id)
+	};
+	payment_store.update(&update)?;
+	Ok(circular_mismatch)
 }
 
 fn channel_constrained_claim_decision(
@@ -573,6 +598,53 @@ pub enum Event {
 	},
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReceivingChannelsTlv(Vec<ReceivingChannel>);
+
+impl Writeable for ReceivingChannelsTlv {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), lightning::io::Error> {
+		for channel in &self.0 {
+			channel.write(writer)?;
+		}
+		Ok(())
+	}
+}
+
+impl Readable for ReceivingChannelsTlv {
+	fn read<R: lightning::io::Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		let mut channels = Vec::new();
+		loop {
+			let mut tracking_reader = ReadTrackingReader::new(reader);
+			match ReceivingChannel::read(&mut tracking_reader) {
+				Ok(channel) => channels.push(channel),
+				Err(DecodeError::ShortRead) if !tracking_reader.have_read => break,
+				Err(e) => return Err(e),
+			}
+		}
+		Ok(Self(channels))
+	}
+}
+
+fn payment_claimable_receiving_channels_for_write(event: &Event) -> Option<ReceivingChannelsTlv> {
+	match event {
+		Event::PaymentClaimable { receiving_channels, .. } if !receiving_channels.is_empty() => {
+			Some(ReceivingChannelsTlv(receiving_channels.clone()))
+		},
+		_ => None,
+	}
+}
+
+fn merge_payment_claimable_receiving_channels(
+	current: Option<ReceivingChannelsTlv>, legacy: Option<ReceivingChannelsTlv>,
+) -> Result<Vec<ReceivingChannel>, DecodeError> {
+	match (current, legacy) {
+		(Some(current), Some(legacy)) if current != legacy => Err(DecodeError::InvalidValue),
+		(Some(current), _) => Ok(current.0),
+		(None, Some(legacy)) => Ok(legacy.0),
+		(None, None) => Ok(Vec::new()),
+	}
+}
+
 impl_writeable_tlv_based_enum!(Event,
 	(0, PaymentSuccessful) => {
 		(0, payment_hash, required),
@@ -616,7 +688,16 @@ impl_writeable_tlv_based_enum!(Event,
 		(4, claimable_amount_msat, required),
 		(6, claim_deadline, option),
 		(7, custom_records, optional_vec),
-		(8, receiving_channels, optional_vec),
+		// RC builds briefly wrote this optional field as required even type 8. Read it for
+		// wallet continuity, but only write the skippable odd type 9 going forward.
+		(8, legacy_receiving_channels, (legacy, ReceivingChannelsTlv,
+			|_event: &Event| -> Option<ReceivingChannelsTlv> { None })),
+		(9, current_receiving_channels, (legacy, ReceivingChannelsTlv,
+			payment_claimable_receiving_channels_for_write)),
+		(_unused, receiving_channels, (static_value,
+			merge_payment_claimable_receiving_channels(
+				current_receiving_channels, legacy_receiving_channels
+			)?)),
 	},
 	(7, PaymentForwarded) => {
 		(0, prev_channel_id, required),
@@ -1455,26 +1536,30 @@ where
 					reason
 				);
 
-				match fail_circular_payment_records(&self.payment_store, payment_id, payment_hash) {
-					Ok(true) => {},
-					Ok(false) => {
-						let update = PaymentDetailsUpdate {
-							hash: Some(payment_hash),
-							status: Some(PaymentStatus::Failed),
-							..PaymentDetailsUpdate::new(payment_id)
-						};
-						if let Err(e) = self.payment_store.update(&update) {
-							log_error!(self.logger, "Failed to access payment store: {}", e);
-							return Err(ReplayEvent());
-						}
+				match fail_circular_or_outbound_payment_records(
+					&self.payment_store,
+					payment_id,
+					payment_hash,
+				) {
+					Ok(None) => {},
+					Ok(Some(e)) => {
+						log_error!(
+							self.logger,
+							"Circular payment records for {} are inconsistent ({}); failed only the outbound record.",
+							payment_id,
+							e
+						);
+					},
+					Err(Error::PersistenceFailed) => {
+						log_error!(self.logger, "Failed to persist payment failure records.");
+						return Err(ReplayEvent());
 					},
 					Err(e) => {
 						log_error!(
 							self.logger,
-							"Failed to persist both circular payment failure records: {}",
+							"Failed to update payment failure records due to a non-persistence error: {}",
 							e
 						);
-						return Err(ReplayEvent());
 					},
 				}
 
@@ -2229,6 +2314,7 @@ mod tests {
 	use std::time::Duration;
 
 	use bitcoin::hashes::Hash as _;
+	use bitcoin::io::Cursor;
 	use lightning::ln::channelmanager::{
 		Bolt11InvoiceParameters, RecentPaymentDetails, RecipientOnionFields,
 	};
@@ -2265,6 +2351,50 @@ mod tests {
 			self.failed.lock().unwrap().push(*payment_hash);
 		}
 	}
+
+	#[derive(Debug, PartialEq, Eq)]
+	enum EventBeforeReceivingChannels {
+		PaymentClaimable {
+			payment_id: PaymentId,
+			payment_hash: PaymentHash,
+			claimable_amount_msat: u64,
+			claim_deadline: Option<u32>,
+			custom_records: Vec<CustomTlvRecord>,
+		},
+	}
+
+	impl_writeable_tlv_based_enum!(EventBeforeReceivingChannels,
+		(6, PaymentClaimable) => {
+			(0, payment_hash, required),
+			(2, payment_id, required),
+			(4, claimable_amount_msat, required),
+			(6, claim_deadline, option),
+			(7, custom_records, optional_vec),
+		},
+	);
+
+	#[derive(Debug, PartialEq, Eq)]
+	enum EventRc6ReceivingChannels {
+		PaymentClaimable {
+			payment_id: PaymentId,
+			payment_hash: PaymentHash,
+			claimable_amount_msat: u64,
+			claim_deadline: Option<u32>,
+			custom_records: Vec<CustomTlvRecord>,
+			receiving_channels: Vec<ReceivingChannel>,
+		},
+	}
+
+	impl_writeable_tlv_based_enum!(EventRc6ReceivingChannels,
+		(6, PaymentClaimable) => {
+			(0, payment_hash, required),
+			(2, payment_id, required),
+			(4, claimable_amount_msat, required),
+			(6, claim_deadline, option),
+			(7, custom_records, optional_vec),
+			(8, receiving_channels, optional_vec),
+		},
+	);
 
 	#[tokio::test]
 	async fn event_queue_persistence() {
@@ -2332,7 +2462,34 @@ mod tests {
 		.unwrap();
 		let deser_event_queue =
 			EventQueue::read(&mut &persisted_bytes[..], (Arc::clone(&store), logger)).unwrap();
-		assert_eq!(deser_event_queue.next_event(), Some(expected_event));
+		assert_eq!(deser_event_queue.next_event(), Some(expected_event.clone()));
+
+		let encoded_event = expected_event.encode();
+		let legacy_event =
+			EventBeforeReceivingChannels::read(&mut Cursor::new(encoded_event)).unwrap();
+		assert_eq!(
+			legacy_event,
+			EventBeforeReceivingChannels::PaymentClaimable {
+				payment_id: PaymentId([1u8; 32]),
+				payment_hash: PaymentHash([2u8; 32]),
+				claimable_amount_msat: 500_000,
+				claim_deadline: Some(840_000),
+				custom_records: Vec::new(),
+			}
+		);
+
+		let rc6_event = EventRc6ReceivingChannels::PaymentClaimable {
+			payment_id: PaymentId([1u8; 32]),
+			payment_hash: PaymentHash([2u8; 32]),
+			claimable_amount_msat: 500_000,
+			claim_deadline: Some(840_000),
+			custom_records: Vec::new(),
+			receiving_channels: vec![ReceivingChannel {
+				channel_id: ChannelId([3u8; 32]),
+				user_channel_id: Some(UserChannelId(4)),
+			}],
+		};
+		assert_eq!(Event::read(&mut Cursor::new(rc6_event.encode())).unwrap(), expected_event);
 	}
 
 	#[test]
@@ -2572,6 +2729,59 @@ mod tests {
 	}
 
 	#[test]
+	fn rejected_duplicate_claim_preserves_terminal_payment_state() {
+		let kv_store: Arc<DynStore> = Arc::new(InMemoryStore::new());
+		let logger = Arc::new(Logger::new_log_facade());
+		let payment_store = PaymentStore::new(
+			Vec::new(),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			Arc::clone(&kv_store),
+			Arc::clone(&logger),
+		);
+		let payment_hash = PaymentHash([7u8; 32]);
+		let payment_id = PaymentId(payment_hash.0);
+		payment_store
+			.insert(PaymentDetails::new(
+				payment_id,
+				test_circular_payment_kind(
+					payment_hash,
+					PaymentPreimage([8u8; 32]),
+					UserChannelId(42),
+				),
+				Some(20_000_000),
+				None,
+				PaymentDirection::Inbound,
+				PaymentStatus::Succeeded,
+			))
+			.unwrap();
+
+		let actions = TestChannelConstrainedClaimActions::default();
+		assert_eq!(
+			handle_channel_constrained_claim(
+				&actions,
+				&payment_store,
+				payment_id,
+				&payment_hash,
+				ChannelConstrainedClaimDecision::Fail(
+					CircularPaymentFailureReason::PaymentNotPending,
+				),
+				&[(ChannelId([9u8; 32]), Some(42))],
+			)
+			.unwrap(),
+			ChannelConstrainedClaimOutcome::Failed
+		);
+		assert_eq!(*actions.failed.lock().unwrap(), vec![payment_hash]);
+
+		let reloaded = crate::io::utils::read_payments(kv_store, logger).unwrap();
+		assert_eq!(reloaded.len(), 1);
+		assert_eq!(reloaded[0].status, PaymentStatus::Succeeded);
+		assert_eq!(reloaded[0].circular_failure_reason, None);
+		assert!(reloaded[0].circular_observed_receiving_channel_ids.is_empty());
+		assert_eq!(reloaded[0].circular_unidentified_receiving_channel_count, 0);
+	}
+
+	#[test]
 	fn circular_terminal_updates_are_distinct_and_idempotent_after_reload() {
 		let kv_store: Arc<DynStore> = Arc::new(InMemoryStore::new());
 		let logger = Arc::new(Logger::new_log_facade());
@@ -2771,7 +2981,7 @@ mod tests {
 	}
 
 	#[test]
-	fn circular_failure_rejects_mismatched_inbound_binding_without_updates() {
+	fn circular_failure_mismatch_fails_only_outbound_without_replay() {
 		let kv_store: Arc<DynStore> = Arc::new(InMemoryStore::new());
 		let logger = Arc::new(Logger::new_log_facade());
 		let payment_store = PaymentStore::new(
@@ -2830,11 +3040,15 @@ mod tests {
 			.unwrap();
 
 		assert_eq!(
-			fail_circular_payment_records(&payment_store, outbound_payment_id, Some(payment_hash),),
-			Err(Error::InvalidPaymentId)
+			fail_circular_or_outbound_payment_records(
+				&payment_store,
+				outbound_payment_id,
+				Some(payment_hash),
+			),
+			Ok(Some(Error::InvalidPaymentId))
 		);
 		assert_eq!(payment_store.get(&inbound_payment_id).unwrap().status, PaymentStatus::Pending);
-		assert_eq!(payment_store.get(&outbound_payment_id).unwrap().status, PaymentStatus::Pending);
+		assert_eq!(payment_store.get(&outbound_payment_id).unwrap().status, PaymentStatus::Failed);
 	}
 
 	#[test]
