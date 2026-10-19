@@ -224,6 +224,10 @@ fn recent_payment_has_id(payment: &RecentPaymentDetails, expected_payment_id: Pa
 	}
 }
 
+fn pinned_send_failure_should_mark_failed(failure: &RetryableSendFailure) -> bool {
+	*failure != RetryableSendFailure::DuplicatePayment
+}
+
 /// Convert the synthetic pathfinding destination into the real local recipient while preserving
 /// the exact reviewed first- and last-hop channels. Clearing `route_params` is intentional:
 /// `send_payment_with_route` reconstructs fixed-route parameters from the real final hop and uses
@@ -1225,11 +1229,23 @@ impl Bolt11Payment {
 			recipient_onion,
 			payment_id,
 		) {
-			let update = PaymentDetailsUpdate {
-				status: Some(PaymentStatus::Failed),
-				..PaymentDetailsUpdate::new(payment_id)
-			};
-			self.payment_store.update(&update)?;
+			// DuplicatePayment means ChannelManager still has a live payment with this ID. This can
+			// race the read-only preflight above, so preserve Pending and let the terminal event
+			// reconcile the shared record. Other failures did not commit an in-flight payment.
+			if pinned_send_failure_should_mark_failed(&e) {
+				let update = PaymentDetailsUpdate {
+					status: Some(PaymentStatus::Failed),
+					..PaymentDetailsUpdate::new(payment_id)
+				};
+				if let Err(update_err) = self.payment_store.update(&update) {
+					log_error!(
+						self.logger,
+						"Failed to mark pinned first-hop payment {} as failed: {}",
+						payment_id,
+						update_err
+					);
+				}
+			}
 			return Err({
 				log_error!(
 					self.logger,
@@ -2253,6 +2269,16 @@ mod tests {
 			assert!(recent_payment_has_id(&payment, expected));
 			assert!(!recent_payment_has_id(&payment, other));
 		}
+	}
+
+	#[test]
+	fn duplicate_pinned_send_preserves_pending_record() {
+		assert!(!pinned_send_failure_should_mark_failed(&RetryableSendFailure::DuplicatePayment));
+		assert!(pinned_send_failure_should_mark_failed(&RetryableSendFailure::PaymentExpired));
+		assert!(pinned_send_failure_should_mark_failed(&RetryableSendFailure::RouteNotFound));
+		assert!(pinned_send_failure_should_mark_failed(
+			&RetryableSendFailure::OnionPacketSizeExceeded
+		));
 	}
 
 	#[test]
