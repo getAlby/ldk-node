@@ -12,14 +12,15 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 use bitcoin::blockdata::locktime::absolute::LockTime;
+use bitcoin::hashes::Hash as _;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Amount, OutPoint};
 use lightning::events::bump_transaction::BumpTransactionEvent;
 use lightning::events::{
 	ClosureReason, Event as LdkEvent, PaymentFailureReason, PaymentPurpose, ReplayEvent,
 };
-use lightning::impl_writeable_tlv_based_enum;
 use lightning::ln::channelmanager::{FailureCode, PaymentId};
+use lightning::ln::msgs::DecodeError;
 use lightning::ln::types::ChannelId;
 use lightning::routing::gossip::NodeId;
 use lightning::util::config::{
@@ -27,7 +28,8 @@ use lightning::util::config::{
 };
 use lightning::util::errors::APIError;
 use lightning::util::persist::KVStore;
-use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
+use lightning::util::ser::{ReadTrackingReader, Readable, ReadableArgs, Writeable, Writer};
+use lightning::{impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
 use lightning_liquidity::lsps2::utils::compute_opening_fee;
 use lightning_types::payment::{PaymentHash, PaymentPreimage};
 use rand::{rng, Rng};
@@ -45,7 +47,8 @@ use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use crate::payment::asynchronous::static_invoice_store::StaticInvoiceStore;
 use crate::payment::store::{
-	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
+	CircularPaymentFailureReason, PaymentDetails, PaymentDetailsUpdate, PaymentDirection,
+	PaymentKind, PaymentStatus,
 };
 use crate::runtime::Runtime;
 use crate::types::{
@@ -55,6 +58,349 @@ use crate::{
 	hex_utils, BumpTransactionEventHandler, ChannelManager, Error, Graph, PeerInfo, PeerStore,
 	UserChannelId,
 };
+
+/// Identifies one local channel over which a claimable payment part arrived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivingChannel {
+	/// The protocol-level channel identifier.
+	pub channel_id: ChannelId,
+	/// The stable user channel identifier, when LDK can associate one with the HTLC.
+	pub user_channel_id: Option<UserChannelId>,
+}
+
+impl_writeable_tlv_based!(ReceivingChannel, {
+	(0, channel_id, required),
+	(2, user_channel_id, option),
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelConstrainedClaimDecision {
+	NotConstrained,
+	Claim(PaymentPreimage),
+	Fail(CircularPaymentFailureReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelConstrainedClaimOutcome {
+	NotConstrained,
+	Claimed,
+	Failed,
+}
+
+trait ChannelConstrainedClaimActions {
+	fn claim(&self, preimage: PaymentPreimage);
+	fn fail(&self, payment_hash: &PaymentHash);
+}
+
+impl ChannelConstrainedClaimActions for ChannelManager {
+	fn claim(&self, preimage: PaymentPreimage) {
+		self.claim_funds(preimage);
+	}
+
+	fn fail(&self, payment_hash: &PaymentHash) {
+		self.fail_htlc_backwards(payment_hash);
+	}
+}
+
+fn apply_channel_constrained_claim_decision<A: ChannelConstrainedClaimActions>(
+	actions: &A, payment_hash: &PaymentHash, decision: ChannelConstrainedClaimDecision,
+) -> ChannelConstrainedClaimOutcome {
+	match decision {
+		ChannelConstrainedClaimDecision::NotConstrained => {
+			ChannelConstrainedClaimOutcome::NotConstrained
+		},
+		ChannelConstrainedClaimDecision::Claim(preimage) => {
+			actions.claim(preimage);
+			ChannelConstrainedClaimOutcome::Claimed
+		},
+		ChannelConstrainedClaimDecision::Fail(_) => {
+			actions.fail(payment_hash);
+			ChannelConstrainedClaimOutcome::Failed
+		},
+	}
+}
+
+fn handle_channel_constrained_claim<A: ChannelConstrainedClaimActions>(
+	actions: &A, payment_store: &PaymentStore, payment_id: PaymentId, payment_hash: &PaymentHash,
+	decision: ChannelConstrainedClaimDecision, receiving_channel_ids: &[(ChannelId, Option<u128>)],
+) -> Result<ChannelConstrainedClaimOutcome, Error> {
+	let failure_reason = match decision {
+		ChannelConstrainedClaimDecision::Fail(reason) => Some(reason),
+		_ => None,
+	};
+	let outcome = apply_channel_constrained_claim_decision(actions, payment_hash, decision);
+	let payment_was_already_terminal =
+		failure_reason == Some(CircularPaymentFailureReason::PaymentNotPending);
+	if outcome == ChannelConstrainedClaimOutcome::Failed && !payment_was_already_terminal {
+		let observed_receiving_channel_ids = receiving_channel_ids
+			.iter()
+			.filter_map(|(_, user_channel_id)| user_channel_id.map(UserChannelId))
+			.collect();
+		let unidentified_count = receiving_channel_ids
+			.iter()
+			.filter(|(_, user_channel_id)| user_channel_id.is_none())
+			.count()
+			.try_into()
+			.unwrap_or(u32::MAX);
+		let update = PaymentDetailsUpdate {
+			status: Some(PaymentStatus::Failed),
+			circular_failure_reason: Some(failure_reason),
+			circular_observed_receiving_channel_ids: Some(observed_receiving_channel_ids),
+			circular_unidentified_receiving_channel_count: Some(unidentified_count),
+			..PaymentDetailsUpdate::new(payment_id)
+		};
+		payment_store.update(&update)?;
+	}
+	Ok(outcome)
+}
+
+fn payment_claimed_store_update(
+	payment_id: PaymentId, purpose: PaymentPurpose, amount_msat: u64,
+) -> PaymentDetailsUpdate {
+	match purpose {
+		PaymentPurpose::Bolt11InvoicePayment { payment_preimage, payment_secret, .. }
+		| PaymentPurpose::Bolt12OfferPayment { payment_preimage, payment_secret, .. }
+		| PaymentPurpose::Bolt12RefundPayment { payment_preimage, payment_secret, .. } => {
+			PaymentDetailsUpdate {
+				preimage: Some(payment_preimage),
+				secret: Some(Some(payment_secret)),
+				amount_msat: Some(Some(amount_msat)),
+				status: Some(PaymentStatus::Succeeded),
+				..PaymentDetailsUpdate::new(payment_id)
+			}
+		},
+		PaymentPurpose::SpontaneousPayment(preimage) => PaymentDetailsUpdate {
+			preimage: Some(Some(preimage)),
+			amount_msat: Some(Some(amount_msat)),
+			status: Some(PaymentStatus::Succeeded),
+			..PaymentDetailsUpdate::new(payment_id)
+		},
+	}
+}
+
+fn payment_sent_store_update(
+	payment_id: PaymentId, payment_hash: PaymentHash, payment_preimage: PaymentPreimage,
+	fee_paid_msat: Option<u64>,
+) -> PaymentDetailsUpdate {
+	PaymentDetailsUpdate {
+		hash: Some(Some(payment_hash)),
+		preimage: Some(Some(payment_preimage)),
+		fee_paid_msat: Some(fee_paid_msat),
+		status: Some(PaymentStatus::Succeeded),
+		..PaymentDetailsUpdate::new(payment_id)
+	}
+}
+
+fn fail_circular_payment_records(
+	payment_store: &PaymentStore, outbound_payment_id: PaymentId,
+	event_payment_hash: Option<PaymentHash>,
+) -> Result<bool, Error> {
+	let Some(outbound) = payment_store.get(&outbound_payment_id) else {
+		return Ok(false);
+	};
+	let (
+		payment_hash,
+		outbound_preimage,
+		payment_secret,
+		bolt11_invoice,
+		required_receiving_channel_id,
+		required_sending_channel_id,
+		operation_id,
+		max_routing_fee_msat,
+	) = match &outbound.kind {
+		PaymentKind::Bolt11 {
+			hash,
+			preimage,
+			secret: Some(secret),
+			bolt11_invoice: Some(invoice),
+			required_receiving_channel_id: Some(receiving_channel_id),
+			required_sending_channel_id: Some(sending_channel_id),
+			circular_operation_id: Some(operation_id),
+			circular_outbound_payment_id: Some(stored_outbound_payment_id),
+			circular_max_routing_fee_msat: Some(max_routing_fee_msat),
+		} if *stored_outbound_payment_id == outbound_payment_id => (
+			*hash,
+			*preimage,
+			*secret,
+			invoice,
+			*receiving_channel_id,
+			*sending_channel_id,
+			*operation_id,
+			*max_routing_fee_msat,
+		),
+		_ => return Ok(false),
+	};
+	if outbound.id != outbound_payment_id
+		|| outbound.direction != PaymentDirection::Outbound
+		|| outbound.amount_msat.is_none()
+		|| outbound.fee_paid_msat.is_some()
+		|| outbound.status == PaymentStatus::Succeeded
+		|| crate::payment::derive_circular_outbound_payment_id(operation_id) != outbound_payment_id
+		|| event_payment_hash.map_or(false, |hash| hash != payment_hash)
+	{
+		return Err(Error::InvalidPaymentId);
+	}
+
+	let inbound_payment_id = PaymentId(payment_hash.0);
+	let inbound = payment_store.get(&inbound_payment_id).ok_or(Error::InvalidPaymentId)?;
+	let inbound_preimage = match &inbound.kind {
+		PaymentKind::Bolt11 {
+			hash,
+			preimage: Some(preimage),
+			secret: Some(secret),
+			bolt11_invoice: Some(invoice),
+			required_receiving_channel_id: Some(receiving_channel_id),
+			required_sending_channel_id: Some(sending_channel_id),
+			circular_operation_id: Some(stored_operation_id),
+			circular_outbound_payment_id: Some(stored_outbound_payment_id),
+			circular_max_routing_fee_msat: Some(stored_max_routing_fee_msat),
+		} if *hash == payment_hash
+			&& *secret == payment_secret
+			&& invoice == bolt11_invoice
+			&& *receiving_channel_id == required_receiving_channel_id
+			&& *sending_channel_id == required_sending_channel_id
+			&& *stored_operation_id == operation_id
+			&& *stored_outbound_payment_id == outbound_payment_id
+			&& *stored_max_routing_fee_msat == max_routing_fee_msat =>
+		{
+			*preimage
+		},
+		_ => return Err(Error::InvalidPaymentId),
+	};
+	if inbound.id != inbound_payment_id
+		|| inbound.direction != PaymentDirection::Inbound
+		|| inbound.amount_msat != outbound.amount_msat
+		|| inbound.fee_paid_msat.is_some()
+		|| inbound.status == PaymentStatus::Succeeded
+		|| outbound_preimage.map_or(false, |preimage| preimage != inbound_preimage)
+		|| PaymentHash(bitcoin::hashes::sha256::Hash::hash(&inbound_preimage.0).to_byte_array())
+			!= payment_hash
+	{
+		return Err(Error::InvalidPaymentId);
+	}
+
+	let outbound_update = PaymentDetailsUpdate {
+		status: Some(PaymentStatus::Failed),
+		..PaymentDetailsUpdate::new(outbound_payment_id)
+	};
+	let inbound_update = PaymentDetailsUpdate {
+		status: Some(PaymentStatus::Failed),
+		..PaymentDetailsUpdate::new(inbound_payment_id)
+	};
+	payment_store.update(&outbound_update)?;
+	payment_store.update(&inbound_update)?;
+	Ok(true)
+}
+
+fn fail_circular_or_outbound_payment_records(
+	payment_store: &PaymentStore, outbound_payment_id: PaymentId,
+	event_payment_hash: Option<PaymentHash>,
+) -> Result<Option<Error>, Error> {
+	let circular_mismatch =
+		match fail_circular_payment_records(payment_store, outbound_payment_id, event_payment_hash)
+		{
+			Ok(true) => return Ok(None),
+			Ok(false) => None,
+			Err(Error::PersistenceFailed) => return Err(Error::PersistenceFailed),
+			Err(e) => Some(e),
+		};
+
+	let update = PaymentDetailsUpdate {
+		hash: Some(event_payment_hash),
+		status: Some(PaymentStatus::Failed),
+		..PaymentDetailsUpdate::new(outbound_payment_id)
+	};
+	payment_store.update(&update)?;
+	Ok(circular_mismatch)
+}
+
+fn channel_constrained_claim_decision(
+	kind: &PaymentKind, payment_hash: &PaymentHash, status: PaymentStatus,
+	expected_amount_msat: Option<u64>, actual_amount_msat: u64,
+	receiving_channel_ids: &[(ChannelId, Option<u128>)],
+) -> ChannelConstrainedClaimDecision {
+	let (stored_hash, preimage, required_channel_id, circular_metadata_matches) = match kind {
+		PaymentKind::Bolt11 {
+			hash,
+			preimage,
+			required_receiving_channel_id: Some(required_channel_id),
+			required_sending_channel_id,
+			circular_operation_id,
+			circular_outbound_payment_id,
+			circular_max_routing_fee_msat,
+			..
+		} => {
+			let metadata_matches = match (
+				required_sending_channel_id,
+				circular_operation_id,
+				circular_outbound_payment_id,
+				circular_max_routing_fee_msat,
+			) {
+				(
+					Some(required_sending_channel_id),
+					Some(operation_id),
+					Some(outbound_payment_id),
+					Some(_),
+				) => {
+					required_sending_channel_id != required_channel_id
+						&& operation_id != outbound_payment_id
+						&& outbound_payment_id.0 != hash.0
+				},
+				_ => false,
+			};
+			(hash, preimage, required_channel_id, metadata_matches)
+		},
+		_ => return ChannelConstrainedClaimDecision::NotConstrained,
+	};
+
+	if status != PaymentStatus::Pending {
+		return ChannelConstrainedClaimDecision::Fail(
+			CircularPaymentFailureReason::PaymentNotPending,
+		);
+	}
+	if !circular_metadata_matches {
+		return ChannelConstrainedClaimDecision::Fail(
+			CircularPaymentFailureReason::CircularMetadataMismatch,
+		);
+	}
+	if expected_amount_msat.map(|expected| actual_amount_msat != expected).unwrap_or(true) {
+		return ChannelConstrainedClaimDecision::Fail(CircularPaymentFailureReason::AmountMismatch);
+	}
+	let Some(preimage) = preimage else {
+		return ChannelConstrainedClaimDecision::Fail(
+			CircularPaymentFailureReason::MissingPreimage,
+		);
+	};
+	if stored_hash != payment_hash {
+		return ChannelConstrainedClaimDecision::Fail(
+			CircularPaymentFailureReason::CircularMetadataMismatch,
+		);
+	}
+	let preimage_hash =
+		PaymentHash(bitcoin::hashes::sha256::Hash::hash(&preimage.0).to_byte_array());
+	if preimage_hash != *payment_hash {
+		return ChannelConstrainedClaimDecision::Fail(
+			CircularPaymentFailureReason::MissingPreimage,
+		);
+	}
+	if receiving_channel_ids.is_empty()
+		|| receiving_channel_ids.iter().any(|(_, user_channel_id)| user_channel_id.is_none())
+	{
+		return ChannelConstrainedClaimDecision::Fail(
+			CircularPaymentFailureReason::MissingReceivingChannelIdentity,
+		);
+	}
+	if receiving_channel_ids
+		.iter()
+		.any(|(_, user_channel_id)| *user_channel_id != Some(required_channel_id.0))
+	{
+		return ChannelConstrainedClaimDecision::Fail(
+			CircularPaymentFailureReason::ReceivingChannelMismatch,
+		);
+	}
+
+	ChannelConstrainedClaimDecision::Claim(*preimage)
+}
 
 /// An event emitted by [`Node`], which should be handled by the user.
 ///
@@ -186,6 +532,11 @@ pub enum Event {
 		claim_deadline: Option<u32>,
 		/// Custom TLV records attached to the payment
 		custom_records: Vec<CustomTlvRecord>,
+		/// The local channels over which the claimable payment parts arrived.
+		///
+		/// All entries must match an application's required incoming channel before it claims a
+		/// channel-constrained payment.
+		receiving_channels: Vec<ReceivingChannel>,
 	},
 	/// A channel has been created and is pending confirmation on-chain.
 	ChannelPending {
@@ -260,6 +611,53 @@ pub enum Event {
 	},
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReceivingChannelsTlv(Vec<ReceivingChannel>);
+
+impl Writeable for ReceivingChannelsTlv {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), lightning::io::Error> {
+		for channel in &self.0 {
+			channel.write(writer)?;
+		}
+		Ok(())
+	}
+}
+
+impl Readable for ReceivingChannelsTlv {
+	fn read<R: lightning::io::Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		let mut channels = Vec::new();
+		loop {
+			let mut tracking_reader = ReadTrackingReader::new(reader);
+			match ReceivingChannel::read(&mut tracking_reader) {
+				Ok(channel) => channels.push(channel),
+				Err(DecodeError::ShortRead) if !tracking_reader.have_read => break,
+				Err(e) => return Err(e),
+			}
+		}
+		Ok(Self(channels))
+	}
+}
+
+fn payment_claimable_receiving_channels_for_write(event: &Event) -> Option<ReceivingChannelsTlv> {
+	match event {
+		Event::PaymentClaimable { receiving_channels, .. } if !receiving_channels.is_empty() => {
+			Some(ReceivingChannelsTlv(receiving_channels.clone()))
+		},
+		_ => None,
+	}
+}
+
+fn merge_payment_claimable_receiving_channels(
+	current: Option<ReceivingChannelsTlv>, legacy: Option<ReceivingChannelsTlv>,
+) -> Result<Vec<ReceivingChannel>, DecodeError> {
+	match (current, legacy) {
+		(Some(current), Some(legacy)) if current != legacy => Err(DecodeError::InvalidValue),
+		(Some(current), _) => Ok(current.0),
+		(None, Some(legacy)) => Ok(legacy.0),
+		(None, None) => Ok(Vec::new()),
+	}
+}
+
 impl_writeable_tlv_based_enum!(Event,
 	(0, PaymentSuccessful) => {
 		(0, payment_hash, required),
@@ -303,6 +701,16 @@ impl_writeable_tlv_based_enum!(Event,
 		(4, claimable_amount_msat, required),
 		(6, claim_deadline, option),
 		(7, custom_records, optional_vec),
+		// RC builds briefly wrote this optional field as required even type 8. Read it for
+		// wallet continuity, but only write the skippable odd type 9 going forward.
+		(8, legacy_receiving_channels, (legacy, ReceivingChannelsTlv,
+			|_event: &Event| -> Option<ReceivingChannelsTlv> { None })),
+		(9, current_receiving_channels, (legacy, ReceivingChannelsTlv,
+			payment_claimable_receiving_channels_for_write)),
+		(_unused, receiving_channels, (static_value,
+			merge_payment_claimable_receiving_channels(
+				current_receiving_channels, legacy_receiving_channels
+			)?)),
 	},
 	(7, PaymentForwarded) => {
 		(0, prev_channel_id, required),
@@ -643,6 +1051,7 @@ where
 				claim_deadline,
 				onion_fields,
 				counterparty_skimmed_fee_msat,
+				receiving_channel_ids,
 				..
 			} => {
 				let payment_id = PaymentId(payment_hash.0);
@@ -747,44 +1156,99 @@ where
 						}
 					}
 
-					// If this is known by the store but ChannelManager doesn't know the preimage,
-					// the payment has been registered via `_for_hash` variants and needs to be manually claimed via
-					// user interaction.
-					match info.kind {
-						PaymentKind::Bolt11 { preimage, .. }
-						| PaymentKind::Bolt11Jit { preimage, .. } => {
-							if purpose.preimage().is_none() {
-								debug_assert!(
-									preimage.is_none(),
-									"We would have registered the preimage if we knew"
-								);
-
-								let custom_records = onion_fields
-									.map(|cf| {
-										cf.custom_tlvs().into_iter().map(|tlv| tlv.into()).collect()
-									})
-									.unwrap_or_default();
-								let event = Event::PaymentClaimable {
-									payment_id,
-									payment_hash,
-									claimable_amount_msat: amount_msat,
-									claim_deadline,
-									custom_records,
-								};
-								match self.event_queue.add_event(event).await {
-									Ok(_) => return Ok(()),
-									Err(e) => {
-										log_error!(
-											self.logger,
-											"Failed to push to event queue: {}",
-											e
-										);
-										return Err(ReplayEvent());
-									},
-								};
-							}
+					// A prepared circular payment keeps its preimage in the payment store and may
+					// claim only after every MPP part is proven to have arrived through the exact
+					// required local channel. Apply the constraint even if ChannelManager unexpectedly
+					// knows the preimage.
+					let claim_decision = channel_constrained_claim_decision(
+						&info.kind,
+						&payment_hash,
+						info.status,
+						info.amount_msat,
+						amount_msat,
+						receiving_channel_ids.as_slice(),
+					);
+					let claim_outcome = match handle_channel_constrained_claim(
+						&*self.channel_manager,
+						&self.payment_store,
+						payment_id,
+						&payment_hash,
+						claim_decision,
+						receiving_channel_ids.as_slice(),
+					) {
+						Ok(outcome) => outcome,
+						Err(e) => {
+							log_error!(self.logger, "Failed to access payment store: {}", e);
+							return Err(ReplayEvent());
 						},
-						_ => {},
+					};
+					match claim_outcome {
+						ChannelConstrainedClaimOutcome::Claimed => {
+							log_info!(
+								self.logger,
+								"Claimed channel-constrained inbound payment through its required channel."
+							);
+							return Ok(());
+						},
+						ChannelConstrainedClaimOutcome::Failed => {
+							log_info!(
+								self.logger,
+								"Refused channel-constrained inbound payment because its amount, preimage state, or receiving channels did not match the persisted constraint."
+							);
+							return Ok(());
+						},
+						ChannelConstrainedClaimOutcome::NotConstrained => {},
+					}
+
+					// If this is known by the store but ChannelManager doesn't know the preimage,
+					// the payment has been registered via a `_for_hash` variant. Ordinary payments
+					// are surfaced for manual claiming.
+					let manually_claimable = match info.kind {
+						PaymentKind::Bolt11 { preimage, required_receiving_channel_id, .. }
+							if purpose.preimage().is_none() =>
+						{
+							debug_assert!(required_receiving_channel_id.is_none());
+							debug_assert!(
+								preimage.is_none(),
+								"Ordinary manual-claim payments must not persist a preimage"
+							);
+							true
+						},
+						PaymentKind::Bolt11Jit { preimage, .. } if purpose.preimage().is_none() => {
+							debug_assert!(
+								preimage.is_none(),
+								"We would have registered the preimage if we knew"
+							);
+							true
+						},
+						_ => false,
+					};
+
+					if manually_claimable {
+						let custom_records = onion_fields
+							.map(|cf| cf.custom_tlvs().into_iter().map(|tlv| tlv.into()).collect())
+							.unwrap_or_default();
+						let event = Event::PaymentClaimable {
+							payment_id,
+							payment_hash,
+							claimable_amount_msat: amount_msat,
+							claim_deadline,
+							custom_records,
+							receiving_channels: receiving_channel_ids
+								.iter()
+								.map(|(channel_id, user_channel_id)| ReceivingChannel {
+									channel_id: *channel_id,
+									user_channel_id: user_channel_id.map(UserChannelId),
+								})
+								.collect(),
+						};
+						match self.event_queue.add_event(event).await {
+							Ok(_) => return Ok(()),
+							Err(e) => {
+								log_error!(self.logger, "Failed to push to event queue: {}", e);
+								return Err(ReplayEvent());
+							},
+						};
 					}
 				} else if counterparty_skimmed_fee_msat > 0 {
 					// We only ever authorize an LSP to withhold a fee for JIT-channel payments we
@@ -964,45 +1428,7 @@ where
 					amount_msat,
 				);
 
-				let update = match purpose {
-					PaymentPurpose::Bolt11InvoicePayment {
-						payment_preimage,
-						payment_secret,
-						..
-					} => PaymentDetailsUpdate {
-						preimage: Some(payment_preimage),
-						secret: Some(Some(payment_secret)),
-						amount_msat: Some(Some(amount_msat)),
-						status: Some(PaymentStatus::Succeeded),
-						..PaymentDetailsUpdate::new(payment_id)
-					},
-					PaymentPurpose::Bolt12OfferPayment {
-						payment_preimage, payment_secret, ..
-					} => PaymentDetailsUpdate {
-						preimage: Some(payment_preimage),
-						secret: Some(Some(payment_secret)),
-						amount_msat: Some(Some(amount_msat)),
-						status: Some(PaymentStatus::Succeeded),
-						..PaymentDetailsUpdate::new(payment_id)
-					},
-					PaymentPurpose::Bolt12RefundPayment {
-						payment_preimage,
-						payment_secret,
-						..
-					} => PaymentDetailsUpdate {
-						preimage: Some(payment_preimage),
-						secret: Some(Some(payment_secret)),
-						amount_msat: Some(Some(amount_msat)),
-						status: Some(PaymentStatus::Succeeded),
-						..PaymentDetailsUpdate::new(payment_id)
-					},
-					PaymentPurpose::SpontaneousPayment(preimage) => PaymentDetailsUpdate {
-						preimage: Some(Some(preimage)),
-						amount_msat: Some(Some(amount_msat)),
-						status: Some(PaymentStatus::Succeeded),
-						..PaymentDetailsUpdate::new(payment_id)
-					},
-				};
+				let update = payment_claimed_store_update(payment_id, purpose, amount_msat);
 
 				match self.payment_store.update(&update) {
 					Ok(DataStoreUpdateResult::Updated) | Ok(DataStoreUpdateResult::Unchanged) => (
@@ -1057,14 +1483,12 @@ where
 					return Ok(());
 				};
 
-				let update = PaymentDetailsUpdate {
-					hash: Some(Some(payment_hash)),
-					preimage: Some(Some(payment_preimage)),
-					fee_paid_msat: Some(fee_paid_msat),
-					status: Some(PaymentStatus::Succeeded),
-					//fee_msat: Some(fee_paid_msat),
-					..PaymentDetailsUpdate::new(payment_id)
-				};
+				let update = payment_sent_store_update(
+					payment_id,
+					payment_hash,
+					payment_preimage,
+					fee_paid_msat,
+				);
 
 				match self.payment_store.update(&update) {
 					Ok(_) => {},
@@ -1126,18 +1550,32 @@ where
 					reason
 				);
 
-				let update = PaymentDetailsUpdate {
-					hash: Some(payment_hash),
-					status: Some(PaymentStatus::Failed),
-					..PaymentDetailsUpdate::new(payment_id)
-				};
-				match self.payment_store.update(&update) {
-					Ok(_) => {},
-					Err(e) => {
-						log_error!(self.logger, "Failed to access payment store: {}", e);
+				match fail_circular_or_outbound_payment_records(
+					&self.payment_store,
+					payment_id,
+					payment_hash,
+				) {
+					Ok(None) => {},
+					Ok(Some(e)) => {
+						log_error!(
+							self.logger,
+							"Circular payment records for {} are inconsistent ({}); failed only the outbound record.",
+							payment_id,
+							e
+						);
+					},
+					Err(Error::PersistenceFailed) => {
+						log_error!(self.logger, "Failed to persist payment failure records.");
 						return Err(ReplayEvent());
 					},
-				};
+					Err(e) => {
+						log_error!(
+							self.logger,
+							"Failed to update payment failure records due to a non-persistence error: {}",
+							e
+						);
+					},
+				}
 
 				let event =
 					Event::PaymentFailed { payment_id: Some(payment_id), payment_hash, reason };
@@ -1889,10 +2327,88 @@ mod tests {
 	use std::sync::atomic::{AtomicU16, Ordering};
 	use std::time::Duration;
 
+	use bitcoin::hashes::Hash as _;
+	use bitcoin::io::Cursor;
+	use lightning::ln::channelmanager::{
+		Bolt11InvoiceParameters, RecentPaymentDetails, RecipientOnionFields,
+	};
+	use lightning::ln::functional_test_utils::{
+		_reload_node, claim_payment_along_route, create_announced_chan_between_nodes,
+		create_announced_chan_between_nodes_with_value, create_chanmon_cfgs, create_network,
+		create_node_cfgs, create_node_chanmgrs, do_claim_payment_along_route,
+		fail_payment_along_route, pass_along_path, reconnect_nodes, remove_first_msg_event_to_node,
+		test_default_channel_config, ClaimAlongRouteArgs, ReconnectArgs, SendEvent,
+		TEST_FINAL_CLTV,
+	};
+	use lightning::ln::msgs::{BaseMessageHandler, ChannelMessageHandler, MessageSendEvent};
+	use lightning::reload_node;
 	use lightning::util::test_utils::TestLogger;
 
 	use super::*;
 	use crate::io::test_utils::InMemoryStore;
+	use crate::io::{
+		PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+	};
+
+	#[derive(Default)]
+	struct TestChannelConstrainedClaimActions {
+		claimed: Mutex<Vec<PaymentPreimage>>,
+		failed: Mutex<Vec<PaymentHash>>,
+	}
+
+	impl ChannelConstrainedClaimActions for TestChannelConstrainedClaimActions {
+		fn claim(&self, preimage: PaymentPreimage) {
+			self.claimed.lock().unwrap().push(preimage);
+		}
+
+		fn fail(&self, payment_hash: &PaymentHash) {
+			self.failed.lock().unwrap().push(*payment_hash);
+		}
+	}
+
+	#[derive(Debug, PartialEq, Eq)]
+	enum EventBeforeReceivingChannels {
+		PaymentClaimable {
+			payment_id: PaymentId,
+			payment_hash: PaymentHash,
+			claimable_amount_msat: u64,
+			claim_deadline: Option<u32>,
+			custom_records: Vec<CustomTlvRecord>,
+		},
+	}
+
+	impl_writeable_tlv_based_enum!(EventBeforeReceivingChannels,
+		(6, PaymentClaimable) => {
+			(0, payment_hash, required),
+			(2, payment_id, required),
+			(4, claimable_amount_msat, required),
+			(6, claim_deadline, option),
+			(7, custom_records, optional_vec),
+		},
+	);
+
+	#[derive(Debug, PartialEq, Eq)]
+	enum EventRc6ReceivingChannels {
+		PaymentClaimable {
+			payment_id: PaymentId,
+			payment_hash: PaymentHash,
+			claimable_amount_msat: u64,
+			claim_deadline: Option<u32>,
+			custom_records: Vec<CustomTlvRecord>,
+			receiving_channels: Vec<ReceivingChannel>,
+		},
+	}
+
+	impl_writeable_tlv_based_enum!(EventRc6ReceivingChannels,
+		(6, PaymentClaimable) => {
+			(0, payment_hash, required),
+			(2, payment_id, required),
+			(4, claimable_amount_msat, required),
+			(6, claim_deadline, option),
+			(7, custom_records, optional_vec),
+			(8, receiving_channels, optional_vec),
+		},
+	);
 
 	#[tokio::test]
 	async fn event_queue_persistence() {
@@ -1930,6 +2446,2203 @@ mod tests {
 
 		event_queue.event_handled().await.unwrap();
 		assert_eq!(event_queue.next_event(), None);
+	}
+
+	#[tokio::test]
+	async fn payment_claimable_receiving_channels_persist() {
+		let store: Arc<DynStore> = Arc::new(InMemoryStore::new());
+		let logger = Arc::new(TestLogger::new());
+		let event_queue = Arc::new(EventQueue::new(Arc::clone(&store), Arc::clone(&logger)));
+		let expected_event = Event::PaymentClaimable {
+			payment_id: PaymentId([1u8; 32]),
+			payment_hash: PaymentHash([2u8; 32]),
+			claimable_amount_msat: 500_000,
+			claim_deadline: Some(840_000),
+			custom_records: Vec::new(),
+			receiving_channels: vec![ReceivingChannel {
+				channel_id: ChannelId([3u8; 32]),
+				user_channel_id: Some(UserChannelId(4)),
+			}],
+		};
+
+		event_queue.add_event(expected_event.clone()).await.unwrap();
+		let persisted_bytes = KVStore::read(
+			&*store,
+			EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_KEY,
+		)
+		.await
+		.unwrap();
+		let deser_event_queue =
+			EventQueue::read(&mut &persisted_bytes[..], (Arc::clone(&store), logger)).unwrap();
+		assert_eq!(deser_event_queue.next_event(), Some(expected_event.clone()));
+
+		let encoded_event = expected_event.encode();
+		let legacy_event =
+			EventBeforeReceivingChannels::read(&mut Cursor::new(encoded_event)).unwrap();
+		assert_eq!(
+			legacy_event,
+			EventBeforeReceivingChannels::PaymentClaimable {
+				payment_id: PaymentId([1u8; 32]),
+				payment_hash: PaymentHash([2u8; 32]),
+				claimable_amount_msat: 500_000,
+				claim_deadline: Some(840_000),
+				custom_records: Vec::new(),
+			}
+		);
+
+		let rc6_event = EventRc6ReceivingChannels::PaymentClaimable {
+			payment_id: PaymentId([1u8; 32]),
+			payment_hash: PaymentHash([2u8; 32]),
+			claimable_amount_msat: 500_000,
+			claim_deadline: Some(840_000),
+			custom_records: Vec::new(),
+			receiving_channels: vec![ReceivingChannel {
+				channel_id: ChannelId([3u8; 32]),
+				user_channel_id: Some(UserChannelId(4)),
+			}],
+		};
+		assert_eq!(Event::read(&mut Cursor::new(rc6_event.encode())).unwrap(), expected_event);
+	}
+
+	#[test]
+	fn channel_constrained_claim_requires_amount_preimage_and_every_exact_mpp_part() {
+		let preimage = PaymentPreimage([3u8; 32]);
+		let payment_hash =
+			PaymentHash(bitcoin::hashes::sha256::Hash::hash(&preimage.0).to_byte_array());
+		let constrained = PaymentKind::Bolt11 {
+			hash: payment_hash,
+			preimage: Some(preimage),
+			secret: None,
+			bolt11_invoice: None,
+			required_receiving_channel_id: Some(UserChannelId(42)),
+			required_sending_channel_id: Some(UserChannelId(41)),
+			circular_operation_id: Some(PaymentId([4u8; 32])),
+			circular_outbound_payment_id: Some(PaymentId([5u8; 32])),
+			circular_max_routing_fee_msat: Some(1_000_000),
+		};
+		let exact_parts = vec![(ChannelId([1u8; 32]), Some(42)), (ChannelId([2u8; 32]), Some(42))];
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&constrained,
+				&payment_hash,
+				PaymentStatus::Pending,
+				Some(20_000_000),
+				20_000_000,
+				&exact_parts
+			),
+			ChannelConstrainedClaimDecision::Claim(preimage)
+		);
+
+		let mixed_parts = vec![(ChannelId([1u8; 32]), Some(42)), (ChannelId([2u8; 32]), Some(43))];
+		let unidentified_part = vec![(ChannelId([1u8; 32]), None)];
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&constrained,
+				&payment_hash,
+				PaymentStatus::Pending,
+				Some(20_000_000),
+				20_000_000,
+				&mixed_parts,
+			),
+			ChannelConstrainedClaimDecision::Fail(
+				CircularPaymentFailureReason::ReceivingChannelMismatch,
+			)
+		);
+		for unidentified_parts in [&unidentified_part[..], &[]] {
+			assert_eq!(
+				channel_constrained_claim_decision(
+					&constrained,
+					&payment_hash,
+					PaymentStatus::Pending,
+					Some(20_000_000),
+					20_000_000,
+					unidentified_parts,
+				),
+				ChannelConstrainedClaimDecision::Fail(
+					CircularPaymentFailureReason::MissingReceivingChannelIdentity,
+				)
+			);
+		}
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&constrained,
+				&payment_hash,
+				PaymentStatus::Pending,
+				Some(20_000_000),
+				19_999_999,
+				&exact_parts
+			),
+			ChannelConstrainedClaimDecision::Fail(CircularPaymentFailureReason::AmountMismatch)
+		);
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&constrained,
+				&payment_hash,
+				PaymentStatus::Pending,
+				Some(20_000_000),
+				20_000_001,
+				&exact_parts,
+			),
+			ChannelConstrainedClaimDecision::Fail(CircularPaymentFailureReason::AmountMismatch)
+		);
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&constrained,
+				&payment_hash,
+				PaymentStatus::Pending,
+				None,
+				20_000_000,
+				&exact_parts,
+			),
+			ChannelConstrainedClaimDecision::Fail(CircularPaymentFailureReason::AmountMismatch)
+		);
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&constrained,
+				&payment_hash,
+				PaymentStatus::Failed,
+				Some(20_000_000),
+				20_000_000,
+				&exact_parts,
+			),
+			ChannelConstrainedClaimDecision::Fail(CircularPaymentFailureReason::PaymentNotPending,)
+		);
+
+		let mut missing_preimage = constrained.clone();
+		if let PaymentKind::Bolt11 { preimage, .. } = &mut missing_preimage {
+			*preimage = None;
+		}
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&missing_preimage,
+				&payment_hash,
+				PaymentStatus::Pending,
+				Some(20_000_000),
+				20_000_000,
+				&exact_parts,
+			),
+			ChannelConstrainedClaimDecision::Fail(CircularPaymentFailureReason::MissingPreimage)
+		);
+
+		let mut invalid_preimage = constrained.clone();
+		if let PaymentKind::Bolt11 { preimage, .. } = &mut invalid_preimage {
+			*preimage = Some(PaymentPreimage([9u8; 32]));
+		}
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&invalid_preimage,
+				&payment_hash,
+				PaymentStatus::Pending,
+				Some(20_000_000),
+				20_000_000,
+				&exact_parts,
+			),
+			ChannelConstrainedClaimDecision::Fail(CircularPaymentFailureReason::MissingPreimage)
+		);
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&constrained,
+				&PaymentHash([8u8; 32]),
+				PaymentStatus::Pending,
+				Some(20_000_000),
+				20_000_000,
+				&exact_parts,
+			),
+			ChannelConstrainedClaimDecision::Fail(
+				CircularPaymentFailureReason::CircularMetadataMismatch,
+			)
+		);
+
+		let mut missing_operation = constrained.clone();
+		if let PaymentKind::Bolt11 { circular_operation_id, .. } = &mut missing_operation {
+			*circular_operation_id = None;
+		}
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&missing_operation,
+				&payment_hash,
+				PaymentStatus::Pending,
+				Some(20_000_000),
+				20_000_000,
+				&exact_parts,
+			),
+			ChannelConstrainedClaimDecision::Fail(
+				CircularPaymentFailureReason::CircularMetadataMismatch,
+			)
+		);
+
+		let mut unconstrained = constrained;
+		if let PaymentKind::Bolt11 { required_receiving_channel_id, .. } = &mut unconstrained {
+			*required_receiving_channel_id = None;
+		}
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&unconstrained,
+				&payment_hash,
+				PaymentStatus::Pending,
+				Some(20_000_000),
+				20_000_000,
+				&exact_parts,
+			),
+			ChannelConstrainedClaimDecision::NotConstrained
+		);
+	}
+
+	#[test]
+	fn channel_constrained_claim_dispatches_exactly_one_action() {
+		let actions = TestChannelConstrainedClaimActions::default();
+		let payment_hash = PaymentHash([2u8; 32]);
+		let preimage = PaymentPreimage([3u8; 32]);
+
+		assert_eq!(
+			apply_channel_constrained_claim_decision(
+				&actions,
+				&payment_hash,
+				ChannelConstrainedClaimDecision::Claim(preimage),
+			),
+			ChannelConstrainedClaimOutcome::Claimed
+		);
+		assert_eq!(*actions.claimed.lock().unwrap(), vec![preimage]);
+		assert!(actions.failed.lock().unwrap().is_empty());
+
+		assert_eq!(
+			apply_channel_constrained_claim_decision(
+				&actions,
+				&payment_hash,
+				ChannelConstrainedClaimDecision::Fail(
+					CircularPaymentFailureReason::ReceivingChannelMismatch,
+				),
+			),
+			ChannelConstrainedClaimOutcome::Failed
+		);
+		assert_eq!(*actions.claimed.lock().unwrap(), vec![preimage]);
+		assert_eq!(*actions.failed.lock().unwrap(), vec![payment_hash]);
+
+		assert_eq!(
+			apply_channel_constrained_claim_decision(
+				&actions,
+				&payment_hash,
+				ChannelConstrainedClaimDecision::NotConstrained,
+			),
+			ChannelConstrainedClaimOutcome::NotConstrained
+		);
+		assert_eq!(*actions.claimed.lock().unwrap(), vec![preimage]);
+		assert_eq!(*actions.failed.lock().unwrap(), vec![payment_hash]);
+	}
+
+	#[test]
+	fn rejected_constrained_claim_persists_failed_state_for_reload() {
+		let kv_store: Arc<DynStore> = Arc::new(InMemoryStore::new());
+		let logger = Arc::new(Logger::new_log_facade());
+		let payment_store = PaymentStore::new(
+			Vec::new(),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			Arc::clone(&kv_store),
+			Arc::clone(&logger),
+		);
+		let payment_hash = PaymentHash([2u8; 32]);
+		let payment_id = PaymentId(payment_hash.0);
+		let payment = PaymentDetails::new(
+			payment_id,
+			test_circular_payment_kind(payment_hash, PaymentPreimage([3u8; 32]), UserChannelId(42)),
+			Some(20_000_000),
+			None,
+			PaymentDirection::Inbound,
+			PaymentStatus::Pending,
+		);
+		payment_store.insert(payment).unwrap();
+
+		let actions = TestChannelConstrainedClaimActions::default();
+		assert_eq!(
+			handle_channel_constrained_claim(
+				&actions,
+				&payment_store,
+				payment_id,
+				&payment_hash,
+				ChannelConstrainedClaimDecision::Fail(
+					CircularPaymentFailureReason::ReceivingChannelMismatch,
+				),
+				&[(ChannelId([4u8; 32]), Some(41))],
+			)
+			.unwrap(),
+			ChannelConstrainedClaimOutcome::Failed
+		);
+		assert_eq!(*actions.failed.lock().unwrap(), vec![payment_hash]);
+
+		let reloaded = crate::io::utils::read_payments(kv_store, logger).unwrap();
+		assert_eq!(reloaded.len(), 1);
+		assert_eq!(reloaded[0].id, payment_id);
+		assert_eq!(reloaded[0].status, PaymentStatus::Failed);
+		assert_eq!(
+			reloaded[0].circular_failure_reason,
+			Some(CircularPaymentFailureReason::ReceivingChannelMismatch)
+		);
+		assert_eq!(reloaded[0].circular_observed_receiving_channel_ids, vec![UserChannelId(41)]);
+	}
+
+	#[test]
+	fn rejected_duplicate_claim_preserves_terminal_payment_state() {
+		let kv_store: Arc<DynStore> = Arc::new(InMemoryStore::new());
+		let logger = Arc::new(Logger::new_log_facade());
+		let payment_store = PaymentStore::new(
+			Vec::new(),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			Arc::clone(&kv_store),
+			Arc::clone(&logger),
+		);
+		let payment_hash = PaymentHash([7u8; 32]);
+		let payment_id = PaymentId(payment_hash.0);
+		payment_store
+			.insert(PaymentDetails::new(
+				payment_id,
+				test_circular_payment_kind(
+					payment_hash,
+					PaymentPreimage([8u8; 32]),
+					UserChannelId(42),
+				),
+				Some(20_000_000),
+				None,
+				PaymentDirection::Inbound,
+				PaymentStatus::Succeeded,
+			))
+			.unwrap();
+
+		let actions = TestChannelConstrainedClaimActions::default();
+		assert_eq!(
+			handle_channel_constrained_claim(
+				&actions,
+				&payment_store,
+				payment_id,
+				&payment_hash,
+				ChannelConstrainedClaimDecision::Fail(
+					CircularPaymentFailureReason::PaymentNotPending,
+				),
+				&[(ChannelId([9u8; 32]), Some(42))],
+			)
+			.unwrap(),
+			ChannelConstrainedClaimOutcome::Failed
+		);
+		assert_eq!(*actions.failed.lock().unwrap(), vec![payment_hash]);
+
+		let reloaded = crate::io::utils::read_payments(kv_store, logger).unwrap();
+		assert_eq!(reloaded.len(), 1);
+		assert_eq!(reloaded[0].status, PaymentStatus::Succeeded);
+		assert_eq!(reloaded[0].circular_failure_reason, None);
+		assert!(reloaded[0].circular_observed_receiving_channel_ids.is_empty());
+		assert_eq!(reloaded[0].circular_unidentified_receiving_channel_count, 0);
+	}
+
+	#[test]
+	fn circular_terminal_updates_are_distinct_and_idempotent_after_reload() {
+		let kv_store: Arc<DynStore> = Arc::new(InMemoryStore::new());
+		let logger = Arc::new(Logger::new_log_facade());
+		let payment_store = PaymentStore::new(
+			Vec::new(),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			Arc::clone(&kv_store),
+			Arc::clone(&logger),
+		);
+		let payment_hash = PaymentHash([2u8; 32]);
+		let inbound_payment_id = PaymentId(payment_hash.0);
+		let payment_preimage = PaymentPreimage([3u8; 32]);
+		let payment_secret = lightning_types::payment::PaymentSecret([4u8; 32]);
+		let operation_id = PaymentId([5u8; 32]);
+		let outbound_payment_id = crate::payment::derive_circular_outbound_payment_id(operation_id);
+		let first_hop_user_channel_id = UserChannelId(41);
+		let last_hop_user_channel_id = UserChannelId(42);
+		let amount_msat = 20_000_000;
+		let fee_paid_msat = 17_062;
+
+		payment_store
+			.insert(crate::payment::prepared_circular_payment_details(
+				"test-invoice".to_string(),
+				payment_hash,
+				payment_preimage,
+				payment_secret,
+				amount_msat,
+				crate::payment::CircularPaymentContext {
+					operation_id,
+					outbound_payment_id,
+					first_hop_user_channel_id,
+					last_hop_user_channel_id,
+					max_routing_fee_msat: 50_000,
+				},
+			))
+			.unwrap();
+		payment_store
+			.insert(PaymentDetails::new(
+				outbound_payment_id,
+				PaymentKind::Bolt11 {
+					hash: payment_hash,
+					preimage: None,
+					secret: Some(payment_secret),
+					bolt11_invoice: Some("test-invoice".to_string()),
+					required_receiving_channel_id: Some(last_hop_user_channel_id),
+					required_sending_channel_id: Some(first_hop_user_channel_id),
+					circular_operation_id: Some(operation_id),
+					circular_outbound_payment_id: Some(outbound_payment_id),
+					circular_max_routing_fee_msat: Some(50_000),
+				},
+				Some(amount_msat),
+				None,
+				PaymentDirection::Outbound,
+				PaymentStatus::Pending,
+			))
+			.unwrap();
+
+		let claimed_update = payment_claimed_store_update(
+			inbound_payment_id,
+			PaymentPurpose::Bolt11InvoicePayment {
+				payment_preimage: Some(payment_preimage),
+				payment_secret,
+			},
+			amount_msat,
+		);
+		let sent_update = payment_sent_store_update(
+			outbound_payment_id,
+			payment_hash,
+			payment_preimage,
+			Some(fee_paid_msat),
+		);
+		assert_eq!(payment_store.update(&claimed_update).unwrap(), DataStoreUpdateResult::Updated);
+		assert_eq!(payment_store.update(&sent_update).unwrap(), DataStoreUpdateResult::Updated);
+
+		let reloaded_payments =
+			crate::io::utils::read_payments(Arc::clone(&kv_store), Arc::clone(&logger)).unwrap();
+		assert_eq!(reloaded_payments.len(), 2);
+		let reloaded_store = PaymentStore::new(
+			reloaded_payments,
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			kv_store,
+			logger,
+		);
+		assert_eq!(
+			reloaded_store.update(&claimed_update).unwrap(),
+			DataStoreUpdateResult::Unchanged
+		);
+		assert_eq!(reloaded_store.update(&sent_update).unwrap(), DataStoreUpdateResult::Unchanged);
+
+		let inbound = reloaded_store.get(&inbound_payment_id).unwrap();
+		let outbound = reloaded_store.get(&outbound_payment_id).unwrap();
+		assert_ne!(inbound.id, outbound.id);
+		assert_eq!(inbound.direction, PaymentDirection::Inbound);
+		assert_eq!(outbound.direction, PaymentDirection::Outbound);
+		assert_eq!(inbound.status, PaymentStatus::Succeeded);
+		assert_eq!(outbound.status, PaymentStatus::Succeeded);
+		assert_eq!(inbound.amount_msat, Some(amount_msat));
+		assert_eq!(outbound.amount_msat, Some(amount_msat));
+		assert_eq!(inbound.fee_paid_msat, None);
+		assert_eq!(outbound.fee_paid_msat, Some(fee_paid_msat));
+		match (&inbound.kind, &outbound.kind) {
+			(
+				PaymentKind::Bolt11 { preimage: inbound_preimage, .. },
+				PaymentKind::Bolt11 { preimage: outbound_preimage, .. },
+			) => {
+				assert_eq!(*inbound_preimage, Some(payment_preimage));
+				assert_eq!(*outbound_preimage, Some(payment_preimage));
+			},
+			other => panic!("expected two BOLT 11 payment records, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn circular_failure_marks_both_exact_records_and_replays_idempotently() {
+		let kv_store: Arc<DynStore> = Arc::new(InMemoryStore::new());
+		let logger = Arc::new(Logger::new_log_facade());
+		let payment_store = PaymentStore::new(
+			Vec::new(),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			Arc::clone(&kv_store),
+			Arc::clone(&logger),
+		);
+		let payment_preimage = PaymentPreimage([13u8; 32]);
+		let payment_hash =
+			PaymentHash(bitcoin::hashes::sha256::Hash::hash(&payment_preimage.0).to_byte_array());
+		let inbound_payment_id = PaymentId(payment_hash.0);
+		let payment_secret = lightning_types::payment::PaymentSecret([14u8; 32]);
+		let operation_id = PaymentId([15u8; 32]);
+		let outbound_payment_id = crate::payment::derive_circular_outbound_payment_id(operation_id);
+		let first_hop_user_channel_id = UserChannelId(51);
+		let last_hop_user_channel_id = UserChannelId(52);
+		let amount_msat = 20_000_000;
+		let max_routing_fee_msat = 50_000;
+
+		payment_store
+			.insert(crate::payment::prepared_circular_payment_details(
+				"failure-test-invoice".to_string(),
+				payment_hash,
+				payment_preimage,
+				payment_secret,
+				amount_msat,
+				crate::payment::CircularPaymentContext {
+					operation_id,
+					outbound_payment_id,
+					first_hop_user_channel_id,
+					last_hop_user_channel_id,
+					max_routing_fee_msat,
+				},
+			))
+			.unwrap();
+		payment_store
+			.insert(PaymentDetails::new(
+				outbound_payment_id,
+				PaymentKind::Bolt11 {
+					hash: payment_hash,
+					preimage: None,
+					secret: Some(payment_secret),
+					bolt11_invoice: Some("failure-test-invoice".to_string()),
+					required_receiving_channel_id: Some(last_hop_user_channel_id),
+					required_sending_channel_id: Some(first_hop_user_channel_id),
+					circular_operation_id: Some(operation_id),
+					circular_outbound_payment_id: Some(outbound_payment_id),
+					circular_max_routing_fee_msat: Some(max_routing_fee_msat),
+				},
+				Some(amount_msat),
+				None,
+				PaymentDirection::Outbound,
+				PaymentStatus::Pending,
+			))
+			.unwrap();
+
+		assert_eq!(
+			fail_circular_payment_records(&payment_store, outbound_payment_id, Some(payment_hash),),
+			Ok(true)
+		);
+		assert_eq!(payment_store.get(&inbound_payment_id).unwrap().status, PaymentStatus::Failed);
+		assert_eq!(payment_store.get(&outbound_payment_id).unwrap().status, PaymentStatus::Failed);
+
+		let reloaded_payments =
+			crate::io::utils::read_payments(Arc::clone(&kv_store), Arc::clone(&logger)).unwrap();
+		let reloaded_store = PaymentStore::new(
+			reloaded_payments,
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			kv_store,
+			logger,
+		);
+		assert_eq!(
+			fail_circular_payment_records(&reloaded_store, outbound_payment_id, Some(payment_hash),),
+			Ok(true)
+		);
+		assert_eq!(reloaded_store.get(&inbound_payment_id).unwrap().status, PaymentStatus::Failed);
+		assert_eq!(reloaded_store.get(&outbound_payment_id).unwrap().status, PaymentStatus::Failed);
+	}
+
+	#[test]
+	fn circular_failure_mismatch_fails_only_outbound_without_replay() {
+		let kv_store: Arc<DynStore> = Arc::new(InMemoryStore::new());
+		let logger = Arc::new(Logger::new_log_facade());
+		let payment_store = PaymentStore::new(
+			Vec::new(),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			kv_store,
+			logger,
+		);
+		let payment_preimage = PaymentPreimage([16u8; 32]);
+		let payment_hash =
+			PaymentHash(bitcoin::hashes::sha256::Hash::hash(&payment_preimage.0).to_byte_array());
+		let inbound_payment_id = PaymentId(payment_hash.0);
+		let payment_secret = lightning_types::payment::PaymentSecret([17u8; 32]);
+		let operation_id = PaymentId([18u8; 32]);
+		let outbound_payment_id = crate::payment::derive_circular_outbound_payment_id(operation_id);
+		let first_hop_user_channel_id = UserChannelId(61);
+		let inbound_last_hop_user_channel_id = UserChannelId(62);
+		let outbound_last_hop_user_channel_id = UserChannelId(63);
+
+		payment_store
+			.insert(crate::payment::prepared_circular_payment_details(
+				"mismatch-test-invoice".to_string(),
+				payment_hash,
+				payment_preimage,
+				payment_secret,
+				20_000_000,
+				crate::payment::CircularPaymentContext {
+					operation_id,
+					outbound_payment_id,
+					first_hop_user_channel_id,
+					last_hop_user_channel_id: inbound_last_hop_user_channel_id,
+					max_routing_fee_msat: 50_000,
+				},
+			))
+			.unwrap();
+		payment_store
+			.insert(PaymentDetails::new(
+				outbound_payment_id,
+				PaymentKind::Bolt11 {
+					hash: payment_hash,
+					preimage: None,
+					secret: Some(payment_secret),
+					bolt11_invoice: Some("mismatch-test-invoice".to_string()),
+					required_receiving_channel_id: Some(outbound_last_hop_user_channel_id),
+					required_sending_channel_id: Some(first_hop_user_channel_id),
+					circular_operation_id: Some(operation_id),
+					circular_outbound_payment_id: Some(outbound_payment_id),
+					circular_max_routing_fee_msat: Some(50_000),
+				},
+				Some(20_000_000),
+				None,
+				PaymentDirection::Outbound,
+				PaymentStatus::Pending,
+			))
+			.unwrap();
+
+		assert_eq!(
+			fail_circular_or_outbound_payment_records(
+				&payment_store,
+				outbound_payment_id,
+				Some(payment_hash),
+			),
+			Ok(Some(Error::InvalidPaymentId))
+		);
+		assert_eq!(payment_store.get(&inbound_payment_id).unwrap().status, PaymentStatus::Pending);
+		assert_eq!(payment_store.get(&outbound_payment_id).unwrap().status, PaymentStatus::Failed);
+	}
+
+	#[test]
+	fn pending_prepared_operation_and_channel_manager_state_survive_restart() {
+		let chanmon_cfgs = create_chanmon_cfgs(3);
+		let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+		let persister;
+		let new_chain_monitor;
+		let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
+		let node_1_deserialized;
+		let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+		let (_, _, first_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 1, 0, 100_000, 0);
+		let (_, _, last_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 2, 1, 100_000, 0);
+		let (_, _, middle_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 0, 2, 100_000, 0);
+
+		let channels = nodes[1].node.list_channels();
+		let first_channel =
+			channels.iter().find(|channel| channel.channel_id == first_channel_id).unwrap();
+		let last_channel =
+			channels.iter().find(|channel| channel.channel_id == last_channel_id).unwrap();
+		let first_hop_user_channel_id = UserChannelId(first_channel.user_channel_id);
+		let last_hop_user_channel_id = UserChannelId(last_channel.user_channel_id);
+		assert_ne!(first_hop_user_channel_id, last_hop_user_channel_id);
+
+		let amount_msat = 5_000_000;
+		let max_routing_fee_msat = 1_000_000;
+		let invoice = nodes[1]
+			.node
+			.create_bolt11_invoice(Bolt11InvoiceParameters {
+				amount_msats: Some(amount_msat),
+				..Default::default()
+			})
+			.unwrap();
+		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
+		let payment_secret = *invoice.payment_secret();
+		let payment_preimage =
+			nodes[1].node.get_payment_preimage(payment_hash, payment_secret).unwrap();
+		let payment_id = PaymentId(payment_hash.0);
+		let operation_id = PaymentId([7u8; 32]);
+		let outbound_payment_id = crate::payment::derive_circular_outbound_payment_id(operation_id);
+
+		let kv_store: Arc<DynStore> = Arc::new(InMemoryStore::new());
+		let logger = Arc::new(Logger::new_log_facade());
+		let payment_store = PaymentStore::new(
+			Vec::new(),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			Arc::clone(&kv_store),
+			Arc::clone(&logger),
+		);
+		let payment = crate::payment::prepared_circular_payment_details(
+			invoice.to_string(),
+			payment_hash,
+			payment_preimage,
+			payment_secret,
+			amount_msat,
+			crate::payment::CircularPaymentContext {
+				operation_id,
+				outbound_payment_id,
+				first_hop_user_channel_id,
+				last_hop_user_channel_id,
+				max_routing_fee_msat,
+			},
+		);
+		payment_store.insert(payment.clone()).unwrap();
+		assert!(nodes[1].node.list_recent_payments().is_empty());
+
+		let middle_channel = nodes[0]
+			.node
+			.list_channels()
+			.into_iter()
+			.find(|channel| channel.channel_id == middle_channel_id)
+			.unwrap();
+		let first_hop_scid = first_channel.get_outbound_payment_scid().unwrap();
+		let middle_hop_scid = middle_channel.get_outbound_payment_scid().unwrap();
+		let last_hop_scid = last_channel.get_inbound_payment_scid().unwrap();
+		let route = lightning::routing::router::Route {
+			paths: vec![lightning::routing::router::Path {
+				hops: vec![
+					lightning::routing::router::RouteHop {
+						pubkey: first_channel.counterparty.node_id,
+						node_features: lightning::types::features::NodeFeatures::empty(),
+						short_channel_id: first_hop_scid,
+						channel_features: lightning::types::features::ChannelFeatures::empty(),
+						fee_msat: 1_000,
+						cltv_expiry_delta: 48,
+						maybe_announced_channel: true,
+					},
+					lightning::routing::router::RouteHop {
+						pubkey: last_channel.counterparty.node_id,
+						node_features: lightning::types::features::NodeFeatures::empty(),
+						short_channel_id: middle_hop_scid,
+						channel_features: lightning::types::features::ChannelFeatures::empty(),
+						fee_msat: 1_000,
+						cltv_expiry_delta: 48,
+						maybe_announced_channel: true,
+					},
+					lightning::routing::router::RouteHop {
+						pubkey: nodes[1].node.get_our_node_id(),
+						node_features: lightning::types::features::NodeFeatures::empty(),
+						short_channel_id: last_hop_scid,
+						channel_features: lightning::types::features::ChannelFeatures::empty(),
+						fee_msat: amount_msat,
+						cltv_expiry_delta: TEST_FINAL_CLTV as u32,
+						maybe_announced_channel: true,
+					},
+				],
+				blinded_tail: None,
+			}],
+			route_params: None,
+		};
+		let quote = crate::CircularRouteQuote {
+			amount_msat,
+			total_routing_fee_msat: 2_000,
+			first_hop_user_channel_id,
+			first_hop_short_channel_id: first_hop_scid,
+			last_hop_user_channel_id,
+			last_hop_short_channel_id: last_hop_scid,
+			paths: vec![crate::CircularRoutePath {
+				hops: route.paths[0]
+					.hops
+					.iter()
+					.map(|hop| crate::CircularRouteHop {
+						node_id: hop.pubkey,
+						short_channel_id: hop.short_channel_id,
+						fee_msat: hop.fee_msat,
+						cltv_expiry_delta: hop.cltv_expiry_delta,
+					})
+					.collect(),
+				amount_msat,
+				fee_msat: 2_000,
+			}],
+			route_bytes: route.encode(),
+		};
+		let execution = crate::payment::build_prepared_circular_execution(
+			&payment_store,
+			operation_id,
+			&quote,
+			first_channel.counterparty.node_id,
+			first_hop_scid,
+			first_channel.outbound_capacity_msat,
+			last_channel.counterparty.node_id,
+			last_hop_scid,
+			last_channel.inbound_capacity_msat,
+			nodes[1].node.get_our_node_id(),
+		)
+		.unwrap();
+		assert_eq!(execution.route, route);
+		assert_eq!(execution.payment_hash, payment_hash);
+		assert_eq!(execution.outbound_payment_id, outbound_payment_id);
+		assert_eq!(execution.outbound_payment.direction, PaymentDirection::Outbound);
+		assert_eq!(execution.outbound_payment.status, PaymentStatus::Pending);
+		assert_eq!(
+			crate::payment::build_prepared_circular_execution(
+				&payment_store,
+				operation_id,
+				&quote,
+				first_channel.counterparty.node_id,
+				first_hop_scid,
+				1,
+				last_channel.counterparty.node_id,
+				last_hop_scid,
+				last_channel.inbound_capacity_msat,
+				nodes[1].node.get_our_node_id(),
+			)
+			.err(),
+			Some(Error::InsufficientFunds)
+		);
+
+		let mut wrong_last_source_route = route.clone();
+		wrong_last_source_route.paths[0].hops[1].pubkey = first_channel.counterparty.node_id;
+		let mut wrong_last_source_quote = quote.clone();
+		wrong_last_source_quote.paths[0].hops[1].node_id = first_channel.counterparty.node_id;
+		wrong_last_source_quote.route_bytes = wrong_last_source_route.encode();
+		assert_eq!(
+			crate::payment::build_prepared_circular_execution(
+				&payment_store,
+				operation_id,
+				&wrong_last_source_quote,
+				first_channel.counterparty.node_id,
+				first_hop_scid,
+				first_channel.outbound_capacity_msat,
+				last_channel.counterparty.node_id,
+				last_hop_scid,
+				last_channel.inbound_capacity_msat,
+				nodes[1].node.get_our_node_id(),
+			)
+			.err(),
+			Some(Error::PaymentSendingFailed)
+		);
+
+		let mut over_fee_route = route.clone();
+		over_fee_route.paths[0].hops[0].fee_msat = max_routing_fee_msat + 1;
+		let mut over_fee_quote = quote.clone();
+		let over_fee_total_msat = max_routing_fee_msat + 1_001;
+		over_fee_quote.total_routing_fee_msat = over_fee_total_msat;
+		over_fee_quote.paths[0].fee_msat = over_fee_total_msat;
+		over_fee_quote.paths[0].hops[0].fee_msat = max_routing_fee_msat + 1;
+		over_fee_quote.route_bytes = over_fee_route.encode();
+		assert_eq!(
+			crate::payment::build_prepared_circular_execution(
+				&payment_store,
+				operation_id,
+				&over_fee_quote,
+				first_channel.counterparty.node_id,
+				first_hop_scid,
+				first_channel.outbound_capacity_msat,
+				last_channel.counterparty.node_id,
+				last_hop_scid,
+				last_channel.inbound_capacity_msat,
+				nodes[1].node.get_our_node_id(),
+			)
+			.err(),
+			Some(Error::InvalidPaymentId)
+		);
+
+		let expired_invoice = nodes[1]
+			.node
+			.create_bolt11_invoice(Bolt11InvoiceParameters {
+				amount_msats: Some(amount_msat),
+				invoice_expiry_delta_secs: Some(0),
+				..Default::default()
+			})
+			.unwrap();
+		assert!(expired_invoice.is_expired());
+		let expired_hash = PaymentHash(expired_invoice.payment_hash().to_byte_array());
+		let expired_secret = *expired_invoice.payment_secret();
+		let expired_preimage =
+			nodes[1].node.get_payment_preimage(expired_hash, expired_secret).unwrap();
+		let expired_operation_id = PaymentId([9u8; 32]);
+		let expired_outbound_payment_id =
+			crate::payment::derive_circular_outbound_payment_id(expired_operation_id);
+		let expired_store = PaymentStore::new(
+			Vec::new(),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			Arc::new(InMemoryStore::new()),
+			Arc::clone(&logger),
+		);
+		expired_store
+			.insert(crate::payment::prepared_circular_payment_details(
+				expired_invoice.to_string(),
+				expired_hash,
+				expired_preimage,
+				expired_secret,
+				amount_msat,
+				crate::payment::CircularPaymentContext {
+					operation_id: expired_operation_id,
+					outbound_payment_id: expired_outbound_payment_id,
+					first_hop_user_channel_id,
+					last_hop_user_channel_id,
+					max_routing_fee_msat,
+				},
+			))
+			.unwrap();
+		assert_eq!(
+			crate::payment::build_prepared_circular_execution(
+				&expired_store,
+				expired_operation_id,
+				&quote,
+				first_channel.counterparty.node_id,
+				first_hop_scid,
+				first_channel.outbound_capacity_msat,
+				last_channel.counterparty.node_id,
+				last_hop_scid,
+				last_channel.inbound_capacity_msat,
+				nodes[1].node.get_our_node_id(),
+			)
+			.err(),
+			Some(Error::InvalidInvoice)
+		);
+
+		let channel_manager_bytes = nodes[1].node.encode();
+		let first_monitor_bytes = lightning::get_monitor!(nodes[1], first_channel_id).encode();
+		let last_monitor_bytes = lightning::get_monitor!(nodes[1], last_channel_id).encode();
+		reload_node!(
+			nodes[1],
+			channel_manager_bytes,
+			&[&first_monitor_bytes, &last_monitor_bytes],
+			persister,
+			new_chain_monitor,
+			node_1_deserialized
+		);
+
+		assert_eq!(
+			nodes[1].node.get_payment_preimage(payment_hash, payment_secret).unwrap(),
+			payment_preimage
+		);
+		let reloaded_channels = nodes[1].node.list_channels();
+		let reloaded_first_channel = reloaded_channels
+			.iter()
+			.find(|channel| channel.channel_id == first_channel_id)
+			.unwrap();
+		assert_eq!(reloaded_first_channel.user_channel_id, first_hop_user_channel_id.0);
+		assert!(!reloaded_first_channel.is_usable);
+		let reloaded_last_channel =
+			reloaded_channels.iter().find(|channel| channel.channel_id == last_channel_id).unwrap();
+		assert_eq!(reloaded_last_channel.user_channel_id, last_hop_user_channel_id.0);
+		assert!(!reloaded_last_channel.is_usable);
+		assert!(nodes[1].node.list_recent_payments().is_empty());
+
+		let reloaded_payments =
+			crate::io::utils::read_payments(Arc::clone(&kv_store), Arc::clone(&logger)).unwrap();
+		assert_eq!(reloaded_payments, vec![payment.clone()]);
+		let reloaded_payment_store = PaymentStore::new(
+			reloaded_payments,
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			kv_store,
+			logger,
+		);
+		assert!(crate::payment::circular_operation_is_prepared(
+			&reloaded_payment_store,
+			operation_id,
+		));
+		assert_eq!(reloaded_payment_store.get(&payment_id), Some(payment));
+		let recovered_preparation = crate::payment::recover_prepared_circular_payment(
+			&reloaded_payment_store,
+			operation_id,
+			amount_msat,
+			first_hop_user_channel_id,
+			first_hop_scid,
+			last_hop_user_channel_id,
+			last_hop_scid,
+			max_routing_fee_msat,
+		)
+		.unwrap()
+		.unwrap();
+		assert_eq!(recovered_preparation.bolt11_invoice, invoice.to_string());
+		assert_eq!(recovered_preparation.payment_hash, payment_hash);
+		assert_eq!(recovered_preparation.operation_id, operation_id);
+		assert_eq!(recovered_preparation.outbound_payment_id, outbound_payment_id);
+		assert_eq!(recovered_preparation.first_hop_short_channel_id, first_hop_scid);
+		assert_eq!(recovered_preparation.last_hop_short_channel_id, last_hop_scid);
+		assert_eq!(
+			crate::payment::recover_prepared_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				amount_msat + 1,
+				first_hop_user_channel_id,
+				first_hop_scid,
+				last_hop_user_channel_id,
+				last_hop_scid,
+				max_routing_fee_msat,
+			),
+			Err(Error::InvalidPaymentId)
+		);
+		assert_eq!(
+			crate::payment::recover_prepared_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				amount_msat,
+				first_hop_user_channel_id,
+				first_hop_scid,
+				last_hop_user_channel_id,
+				last_hop_scid,
+				max_routing_fee_msat + 1,
+			),
+			Err(Error::InvalidPaymentId)
+		);
+		assert!(crate::payment::recover_prepared_circular_payment(
+			&expired_store,
+			expired_operation_id,
+			amount_msat,
+			first_hop_user_channel_id,
+			first_hop_scid,
+			last_hop_user_channel_id,
+			last_hop_scid,
+			max_routing_fee_msat,
+		)
+		.unwrap()
+		.is_some());
+
+		let send_count = AtomicU16::new(0);
+		let duplicate_execution = execution.clone();
+		let failed_execution = execution.clone();
+		let recovered_duplicate_execution = execution.clone();
+		assert_eq!(
+			crate::payment::submit_prepared_circular_execution(
+				&reloaded_payment_store,
+				execution,
+				|submitted_route, submitted_hash, _, submitted_id| {
+					send_count.fetch_add(1, Ordering::AcqRel);
+					assert_eq!(submitted_route, route);
+					assert_eq!(submitted_hash, payment_hash);
+					assert_eq!(submitted_id, outbound_payment_id);
+					assert_eq!(
+						reloaded_payment_store.get(&submitted_id).unwrap().status,
+						PaymentStatus::Pending
+					);
+					Ok(())
+				},
+			),
+			Ok(outbound_payment_id)
+		);
+		assert_eq!(send_count.load(Ordering::Acquire), 1);
+		assert_eq!(
+			crate::payment::recover_existing_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				&quote,
+				&[],
+			),
+			Ok(None)
+		);
+		assert_eq!(
+			crate::payment::recover_existing_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				&quote,
+				&[RecentPaymentDetails::Pending {
+					payment_id: outbound_payment_id,
+					payment_hash,
+					total_msat: amount_msat,
+				}],
+			),
+			Ok(Some(outbound_payment_id))
+		);
+		assert_eq!(
+			crate::payment::recover_existing_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				&quote,
+				&[RecentPaymentDetails::Pending {
+					payment_id: outbound_payment_id,
+					payment_hash: PaymentHash([11u8; 32]),
+					total_msat: amount_msat,
+				}],
+			),
+			Err(Error::InvalidPaymentId)
+		);
+		assert_eq!(
+			crate::payment::recover_existing_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				&quote,
+				&[RecentPaymentDetails::Pending {
+					payment_id: outbound_payment_id,
+					payment_hash,
+					total_msat: amount_msat + 1,
+				}],
+			),
+			Err(Error::InvalidPaymentId)
+		);
+		reloaded_payment_store
+			.update(&PaymentDetailsUpdate {
+				status: Some(PaymentStatus::Failed),
+				..PaymentDetailsUpdate::new(payment_id)
+			})
+			.unwrap();
+		assert_eq!(
+			crate::payment::recover_existing_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				&quote,
+				&[],
+			),
+			Err(Error::InvalidPaymentId)
+		);
+		reloaded_payment_store
+			.update(&PaymentDetailsUpdate {
+				status: Some(PaymentStatus::Pending),
+				..PaymentDetailsUpdate::new(payment_id)
+			})
+			.unwrap();
+		assert_eq!(
+			crate::payment::submit_prepared_circular_execution(
+				&reloaded_payment_store,
+				duplicate_execution,
+				|_, _, _, _| {
+					send_count.fetch_add(1, Ordering::AcqRel);
+					Err(lightning::ln::channelmanager::RetryableSendFailure::DuplicatePayment)
+				},
+			),
+			Ok(outbound_payment_id)
+		);
+		assert_eq!(send_count.load(Ordering::Acquire), 2);
+		reloaded_payment_store
+			.update(&PaymentDetailsUpdate {
+				status: Some(PaymentStatus::Succeeded),
+				..PaymentDetailsUpdate::new(outbound_payment_id)
+			})
+			.unwrap();
+		assert_eq!(
+			crate::payment::recover_existing_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				&quote,
+				&[],
+			),
+			Ok(Some(outbound_payment_id))
+		);
+		reloaded_payment_store
+			.update(&PaymentDetailsUpdate {
+				status: Some(PaymentStatus::Failed),
+				..PaymentDetailsUpdate::new(outbound_payment_id)
+			})
+			.unwrap();
+		assert_eq!(
+			crate::payment::recover_existing_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				&quote,
+				&[],
+			),
+			Err(Error::PaymentSendingFailed)
+		);
+
+		reloaded_payment_store.remove(&outbound_payment_id).unwrap();
+		assert_eq!(
+			crate::payment::submit_prepared_circular_execution(
+				&reloaded_payment_store,
+				failed_execution,
+				|_, _, _, _| {
+					send_count.fetch_add(1, Ordering::AcqRel);
+					Err(lightning::ln::channelmanager::RetryableSendFailure::RouteNotFound)
+				},
+			),
+			Err(Error::PaymentSendingFailed)
+		);
+		assert_eq!(send_count.load(Ordering::Acquire), 3);
+		assert_eq!(reloaded_payment_store.get(&payment_id).unwrap().status, PaymentStatus::Failed);
+		assert_eq!(
+			reloaded_payment_store.get(&outbound_payment_id).unwrap().status,
+			PaymentStatus::Failed
+		);
+
+		reloaded_payment_store.remove(&outbound_payment_id).unwrap();
+		reloaded_payment_store
+			.update(&PaymentDetailsUpdate {
+				status: Some(PaymentStatus::Pending),
+				..PaymentDetailsUpdate::new(payment_id)
+			})
+			.unwrap();
+		assert_eq!(
+			crate::payment::submit_prepared_circular_execution(
+				&reloaded_payment_store,
+				recovered_duplicate_execution,
+				|_, _, _, _| {
+					send_count.fetch_add(1, Ordering::AcqRel);
+					Err(lightning::ln::channelmanager::RetryableSendFailure::DuplicatePayment)
+				},
+			),
+			Ok(outbound_payment_id)
+		);
+		assert_eq!(send_count.load(Ordering::Acquire), 4);
+		assert_eq!(reloaded_payment_store.get(&payment_id).unwrap().status, PaymentStatus::Pending);
+		assert_eq!(
+			reloaded_payment_store.get(&outbound_payment_id).unwrap().status,
+			PaymentStatus::Pending
+		);
+	}
+
+	#[test]
+	fn real_htlc_wrong_channel_fails_and_exact_channel_claims() {
+		let chanmon_cfgs = create_chanmon_cfgs(2);
+		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+		create_announced_chan_between_nodes(&nodes, 0, 1);
+
+		let amount_msat = 5_000_000;
+		let path = &[&nodes[1]][..];
+
+		let (wrong_route, wrong_hash, wrong_preimage, wrong_secret) =
+			lightning::get_route_and_payment_hash!(nodes[0], nodes[1], amount_msat);
+		nodes[0]
+			.node
+			.send_payment_with_route(
+				wrong_route,
+				wrong_hash,
+				RecipientOnionFields::secret_only(wrong_secret),
+				PaymentId(wrong_hash.0),
+			)
+			.unwrap();
+		lightning::check_added_monitors!(nodes[0], 1);
+		let mut wrong_messages = nodes[0].node.get_and_clear_pending_msg_events();
+		let wrong_event = pass_along_path(
+			&nodes[0],
+			path,
+			amount_msat,
+			wrong_hash,
+			Some(wrong_secret),
+			remove_first_msg_event_to_node(&nodes[1].node.get_our_node_id(), &mut wrong_messages),
+			true,
+			None,
+		)
+		.unwrap();
+		let wrong_receiving_channels = match wrong_event {
+			LdkEvent::PaymentClaimable { receiving_channel_ids, .. } => receiving_channel_ids,
+			_ => panic!("expected PaymentClaimable"),
+		};
+		let actual_user_channel_id =
+			wrong_receiving_channels[0].1.expect("test channel has a user channel ID");
+		let wrong_required_channel_id = UserChannelId(actual_user_channel_id.wrapping_add(1));
+		let wrong_kind =
+			test_circular_payment_kind(wrong_hash, wrong_preimage, wrong_required_channel_id);
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&wrong_kind,
+				&wrong_hash,
+				PaymentStatus::Pending,
+				Some(amount_msat),
+				amount_msat,
+				&wrong_receiving_channels,
+			),
+			ChannelConstrainedClaimDecision::Fail(
+				CircularPaymentFailureReason::ReceivingChannelMismatch,
+			)
+		);
+		fail_payment_along_route(&nodes[0], &[path], false, wrong_hash);
+
+		let (exact_route, exact_hash, exact_preimage, exact_secret) =
+			lightning::get_route_and_payment_hash!(nodes[0], nodes[1], amount_msat);
+		nodes[0]
+			.node
+			.send_payment_with_route(
+				exact_route,
+				exact_hash,
+				RecipientOnionFields::secret_only(exact_secret),
+				PaymentId(exact_hash.0),
+			)
+			.unwrap();
+		lightning::check_added_monitors!(nodes[0], 1);
+		let mut exact_messages = nodes[0].node.get_and_clear_pending_msg_events();
+		let exact_event = pass_along_path(
+			&nodes[0],
+			path,
+			amount_msat,
+			exact_hash,
+			Some(exact_secret),
+			remove_first_msg_event_to_node(&nodes[1].node.get_our_node_id(), &mut exact_messages),
+			true,
+			None,
+		)
+		.unwrap();
+		let exact_receiving_channels = match exact_event {
+			LdkEvent::PaymentClaimable { receiving_channel_ids, .. } => receiving_channel_ids,
+			_ => panic!("expected PaymentClaimable"),
+		};
+		let exact_required_channel_id = UserChannelId(
+			exact_receiving_channels[0].1.expect("test channel has a user channel ID"),
+		);
+		let exact_kind =
+			test_circular_payment_kind(exact_hash, exact_preimage, exact_required_channel_id);
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&exact_kind,
+				&exact_hash,
+				PaymentStatus::Pending,
+				Some(amount_msat),
+				amount_msat,
+				&exact_receiving_channels,
+			),
+			ChannelConstrainedClaimDecision::Claim(exact_preimage)
+		);
+		claim_payment_along_route(ClaimAlongRouteArgs::new(&nodes[0], &[path], exact_preimage));
+	}
+
+	#[test]
+	fn real_mpp_split_across_mixed_incoming_channels_fails() {
+		let chanmon_cfgs = create_chanmon_cfgs(4);
+		let node_cfgs = create_node_cfgs(4, &chanmon_cfgs);
+		let node_chanmgrs = create_node_chanmgrs(4, &node_cfgs, &[None, None, None, None]);
+		let nodes = create_network(4, &node_cfgs, &node_chanmgrs);
+		create_announced_chan_between_nodes(&nodes, 0, 1);
+		create_announced_chan_between_nodes(&nodes, 0, 2);
+		create_announced_chan_between_nodes(&nodes, 1, 3);
+		create_announced_chan_between_nodes(&nodes, 2, 3);
+
+		let amount_msat = 15_000_000;
+		let path_a = &[&nodes[1], &nodes[3]][..];
+		let path_b = &[&nodes[2], &nodes[3]][..];
+		let (route, payment_hash, payment_preimage, payment_secret) =
+			lightning::get_route_and_payment_hash!(nodes[0], nodes[3], amount_msat);
+		assert_eq!(route.paths.len(), 2);
+		nodes[0]
+			.node
+			.send_payment_with_route(
+				route,
+				payment_hash,
+				RecipientOnionFields::secret_only(payment_secret),
+				PaymentId(payment_hash.0),
+			)
+			.unwrap();
+		lightning::check_added_monitors!(nodes[0], 2);
+		let mut messages = nodes[0].node.get_and_clear_pending_msg_events();
+		assert_eq!(messages.len(), 2);
+
+		let first_message =
+			remove_first_msg_event_to_node(&path_a[0].node.get_our_node_id(), &mut messages);
+		assert!(pass_along_path(
+			&nodes[0],
+			path_a,
+			amount_msat,
+			payment_hash,
+			Some(payment_secret),
+			first_message,
+			false,
+			None,
+		)
+		.is_none());
+		let second_message =
+			remove_first_msg_event_to_node(&path_b[0].node.get_our_node_id(), &mut messages);
+		let claimable_event = pass_along_path(
+			&nodes[0],
+			path_b,
+			amount_msat,
+			payment_hash,
+			Some(payment_secret),
+			second_message,
+			true,
+			None,
+		)
+		.unwrap();
+		let receiving_channels = match claimable_event {
+			LdkEvent::PaymentClaimable { receiving_channel_ids, .. } => receiving_channel_ids,
+			_ => panic!("expected PaymentClaimable"),
+		};
+		assert_eq!(receiving_channels.len(), 2);
+		let first_user_channel_id =
+			receiving_channels[0].1.expect("first MPP part has a user channel ID");
+		let second_user_channel_id =
+			receiving_channels[1].1.expect("second MPP part has a user channel ID");
+		assert_ne!(first_user_channel_id, second_user_channel_id);
+
+		let kind = test_circular_payment_kind(
+			payment_hash,
+			payment_preimage,
+			UserChannelId(first_user_channel_id),
+		);
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&kind,
+				&payment_hash,
+				PaymentStatus::Pending,
+				Some(amount_msat),
+				amount_msat,
+				&receiving_channels,
+			),
+			ChannelConstrainedClaimDecision::Fail(
+				CircularPaymentFailureReason::ReceivingChannelMismatch,
+			)
+		);
+		fail_payment_along_route(&nodes[0], &[path_a, path_b], false, payment_hash);
+	}
+
+	#[test]
+	fn real_prepared_circular_payment_recovers_in_flight_on_exact_channels() {
+		let chanmon_cfgs = create_chanmon_cfgs(3);
+		let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+		let persister;
+		let new_chain_monitor;
+		let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
+		let node_0_deserialized;
+		let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+		let (_, _, first_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100_000, 0);
+		let (_, _, middle_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 1, 2, 100_000, 0);
+		let (_, _, last_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 2, 0, 100_000, 0);
+
+		let local_channels = nodes[0].node.list_channels();
+		let first_channel =
+			local_channels.iter().find(|channel| channel.channel_id == first_channel_id).unwrap();
+		let last_channel =
+			local_channels.iter().find(|channel| channel.channel_id == last_channel_id).unwrap();
+		let middle_channel = nodes[1]
+			.node
+			.list_channels()
+			.into_iter()
+			.find(|channel| channel.channel_id == middle_channel_id)
+			.unwrap();
+		let first_hop_user_channel_id = UserChannelId(first_channel.user_channel_id);
+		let last_hop_user_channel_id = UserChannelId(last_channel.user_channel_id);
+		let first_hop_scid = first_channel.get_outbound_payment_scid().unwrap();
+		let middle_hop_scid = middle_channel.get_outbound_payment_scid().unwrap();
+		let last_hop_scid = last_channel.get_inbound_payment_scid().unwrap();
+
+		let amount_msat = 5_000_000;
+		let max_routing_fee_msat = 10_000;
+		let invoice = nodes[0]
+			.node
+			.create_bolt11_invoice(Bolt11InvoiceParameters {
+				amount_msats: Some(amount_msat),
+				..Default::default()
+			})
+			.unwrap();
+		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
+		let payment_secret = *invoice.payment_secret();
+		let payment_preimage =
+			nodes[0].node.get_payment_preimage(payment_hash, payment_secret).unwrap();
+		let operation_id = PaymentId([8u8; 32]);
+		let outbound_payment_id = crate::payment::derive_circular_outbound_payment_id(operation_id);
+
+		let kv_store: Arc<DynStore> = Arc::new(InMemoryStore::new());
+		let logger = Arc::new(Logger::new_log_facade());
+		let payment_store = PaymentStore::new(
+			Vec::new(),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			Arc::clone(&kv_store),
+			Arc::clone(&logger),
+		);
+		payment_store
+			.insert(crate::payment::prepared_circular_payment_details(
+				invoice.to_string(),
+				payment_hash,
+				payment_preimage,
+				payment_secret,
+				amount_msat,
+				crate::payment::CircularPaymentContext {
+					operation_id,
+					outbound_payment_id,
+					first_hop_user_channel_id,
+					last_hop_user_channel_id,
+					max_routing_fee_msat,
+				},
+			))
+			.unwrap();
+
+		let route = lightning::routing::router::Route {
+			paths: vec![lightning::routing::router::Path {
+				hops: vec![
+					lightning::routing::router::RouteHop {
+						pubkey: nodes[1].node.get_our_node_id(),
+						node_features: lightning::types::features::NodeFeatures::empty(),
+						short_channel_id: first_hop_scid,
+						channel_features: lightning::types::features::ChannelFeatures::empty(),
+						fee_msat: 1_000,
+						cltv_expiry_delta: 48,
+						maybe_announced_channel: true,
+					},
+					lightning::routing::router::RouteHop {
+						pubkey: nodes[2].node.get_our_node_id(),
+						node_features: lightning::types::features::NodeFeatures::empty(),
+						short_channel_id: middle_hop_scid,
+						channel_features: lightning::types::features::ChannelFeatures::empty(),
+						fee_msat: 1_000,
+						cltv_expiry_delta: 48,
+						maybe_announced_channel: true,
+					},
+					lightning::routing::router::RouteHop {
+						pubkey: nodes[0].node.get_our_node_id(),
+						node_features: lightning::types::features::NodeFeatures::empty(),
+						short_channel_id: last_hop_scid,
+						channel_features: lightning::types::features::ChannelFeatures::empty(),
+						fee_msat: amount_msat,
+						cltv_expiry_delta: TEST_FINAL_CLTV as u32,
+						maybe_announced_channel: true,
+					},
+				],
+				blinded_tail: None,
+			}],
+			route_params: None,
+		};
+		let quote = crate::CircularRouteQuote {
+			amount_msat,
+			total_routing_fee_msat: 2_000,
+			first_hop_user_channel_id,
+			first_hop_short_channel_id: first_hop_scid,
+			last_hop_user_channel_id,
+			last_hop_short_channel_id: last_hop_scid,
+			paths: vec![crate::CircularRoutePath {
+				hops: route.paths[0]
+					.hops
+					.iter()
+					.map(|hop| crate::CircularRouteHop {
+						node_id: hop.pubkey,
+						short_channel_id: hop.short_channel_id,
+						fee_msat: hop.fee_msat,
+						cltv_expiry_delta: hop.cltv_expiry_delta,
+					})
+					.collect(),
+				amount_msat,
+				fee_msat: 2_000,
+			}],
+			route_bytes: route.encode(),
+		};
+		let execution = crate::payment::build_prepared_circular_execution(
+			&payment_store,
+			operation_id,
+			&quote,
+			nodes[1].node.get_our_node_id(),
+			first_hop_scid,
+			first_channel.outbound_capacity_msat,
+			nodes[2].node.get_our_node_id(),
+			last_hop_scid,
+			last_channel.inbound_capacity_msat,
+			nodes[0].node.get_our_node_id(),
+		)
+		.unwrap();
+		let duplicate_execution = execution.clone();
+		let send_count = AtomicU16::new(0);
+		assert_eq!(
+			crate::payment::submit_prepared_circular_execution(
+				&payment_store,
+				execution,
+				|route, hash, onion, id| {
+					send_count.fetch_add(1, Ordering::AcqRel);
+					nodes[0].node.send_payment_with_route(route, hash, onion, id)
+				},
+			),
+			Ok(outbound_payment_id)
+		);
+		assert_eq!(send_count.load(Ordering::Acquire), 1);
+		lightning::check_added_monitors!(nodes[0], 1);
+
+		let channel_manager_bytes = nodes[0].node.encode();
+		let first_monitor_bytes = lightning::get_monitor!(nodes[0], first_channel_id).encode();
+		let last_monitor_bytes = lightning::get_monitor!(nodes[0], last_channel_id).encode();
+		nodes[1].node.peer_disconnected(nodes[0].node.get_our_node_id());
+		nodes[2].node.peer_disconnected(nodes[0].node.get_our_node_id());
+		reload_node!(
+			nodes[0],
+			channel_manager_bytes,
+			&[&first_monitor_bytes, &last_monitor_bytes],
+			persister,
+			new_chain_monitor,
+			node_0_deserialized
+		);
+		assert!(nodes[0].node.list_channels().iter().all(|channel| !channel.is_usable));
+		let reloaded_payments =
+			crate::io::utils::read_payments(Arc::clone(&kv_store), Arc::clone(&logger)).unwrap();
+		let reloaded_payment_store = PaymentStore::new(
+			reloaded_payments,
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			kv_store,
+			logger,
+		);
+		assert_eq!(
+			reloaded_payment_store.get(&PaymentId(payment_hash.0)).unwrap().status,
+			PaymentStatus::Pending
+		);
+		assert_eq!(
+			reloaded_payment_store.get(&outbound_payment_id).unwrap().status,
+			PaymentStatus::Pending
+		);
+		let recent_payments = nodes[0].node.list_recent_payments();
+		assert!(recent_payments.iter().any(|payment| matches!(
+			payment,
+			RecentPaymentDetails::Pending {
+				payment_id,
+				payment_hash: tracked_hash,
+				total_msat,
+			} if *payment_id == outbound_payment_id
+				&& *tracked_hash == payment_hash
+				&& *total_msat == amount_msat
+		)));
+		assert_eq!(
+			crate::payment::recover_existing_circular_payment(
+				&reloaded_payment_store,
+				operation_id,
+				&quote,
+				&recent_payments,
+			),
+			Ok(Some(outbound_payment_id))
+		);
+		assert_eq!(
+			crate::payment::submit_prepared_circular_execution(
+				&reloaded_payment_store,
+				duplicate_execution,
+				|route, hash, onion, id| {
+					send_count.fetch_add(1, Ordering::AcqRel);
+					nodes[0].node.send_payment_with_route(route, hash, onion, id)
+				},
+			),
+			Ok(outbound_payment_id)
+		);
+		assert_eq!(send_count.load(Ordering::Acquire), 2);
+		lightning::check_added_monitors!(nodes[0], 0);
+
+		let mut reconnect_destination = ReconnectArgs::new(&nodes[0], &nodes[2]);
+		reconnect_destination.send_channel_ready = (true, true);
+		reconnect_destination.send_announcement_sigs = (true, true);
+		reconnect_nodes(reconnect_destination);
+		let mut reconnect_source = ReconnectArgs::new(&nodes[0], &nodes[1]);
+		reconnect_source.send_channel_ready = (true, true);
+		reconnect_source.send_announcement_sigs = (true, true);
+		reconnect_source.pending_htlc_adds = (0, 1);
+		reconnect_nodes(reconnect_source);
+		nodes[1].node.process_pending_htlc_forwards();
+		lightning::check_added_monitors!(nodes[1], 1);
+
+		let path = &[&nodes[1], &nodes[2], &nodes[0]][..];
+		let mut messages = nodes[1].node.get_and_clear_pending_msg_events();
+		let claimable_event = pass_along_path(
+			&nodes[1],
+			&path[1..],
+			amount_msat,
+			payment_hash,
+			Some(payment_secret),
+			remove_first_msg_event_to_node(&nodes[2].node.get_our_node_id(), &mut messages),
+			true,
+			Some(payment_preimage),
+		)
+		.unwrap();
+		let receiving_channels = match claimable_event {
+			LdkEvent::PaymentClaimable { receiving_channel_ids, .. } => receiving_channel_ids,
+			_ => panic!("expected PaymentClaimable"),
+		};
+		assert_eq!(receiving_channels.len(), 1);
+		assert_eq!(receiving_channels[0].1, Some(last_hop_user_channel_id.0));
+		let prepared = payment_store.get(&PaymentId(payment_hash.0)).unwrap();
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&prepared.kind,
+				&payment_hash,
+				prepared.status,
+				prepared.amount_msat,
+				amount_msat,
+				&receiving_channels,
+			),
+			ChannelConstrainedClaimDecision::Claim(payment_preimage)
+		);
+		let paid_fee_msat = do_claim_payment_along_route(ClaimAlongRouteArgs::new(
+			&nodes[0],
+			&[path],
+			payment_preimage,
+		));
+		assert_eq!(paid_fee_msat, 2_000);
+		let settlement_events = nodes[0].node.get_and_clear_pending_events();
+		lightning::check_added_monitors!(nodes[0], 1);
+		assert_eq!(settlement_events.len(), 2, "{settlement_events:?}");
+		match &settlement_events[0] {
+			LdkEvent::PaymentSent {
+				payment_id,
+				payment_preimage: settled_preimage,
+				payment_hash: settled_hash,
+				amount_msat: settled_amount_msat,
+				fee_paid_msat,
+				..
+			} => {
+				assert_eq!(*payment_id, Some(outbound_payment_id));
+				assert_eq!(*settled_preimage, payment_preimage);
+				assert_eq!(*settled_hash, payment_hash);
+				assert_eq!(*settled_amount_msat, Some(amount_msat));
+				assert_eq!(*fee_paid_msat, Some(2_000));
+			},
+			other => panic!("expected PaymentSent, got {other:?}"),
+		}
+		match &settlement_events[1] {
+			LdkEvent::PaymentPathSuccessful {
+				payment_id, payment_hash: path_hash, path, ..
+			} => {
+				assert_eq!(*payment_id, outbound_payment_id);
+				assert_eq!(*path_hash, Some(payment_hash));
+				assert_eq!(path.hops.first().unwrap().short_channel_id, first_hop_scid);
+				assert_eq!(path.hops.last().unwrap().short_channel_id, last_hop_scid);
+			},
+			other => panic!("expected PaymentPathSuccessful, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn real_prepared_circular_mpp_keeps_both_exact_local_channels() {
+		let chanmon_cfgs = create_chanmon_cfgs(5);
+		let node_cfgs = create_node_cfgs(5, &chanmon_cfgs);
+		let node_chanmgrs = create_node_chanmgrs(5, &node_cfgs, &[None, None, None, None, None]);
+		let nodes = create_network(5, &node_cfgs, &node_chanmgrs);
+		let (_, _, first_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100_000, 0);
+		let (_, _, branch_a_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 1, 2, 100_000, 0);
+		let (_, _, branch_b_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 1, 3, 100_000, 0);
+		let (_, _, converge_a_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 2, 4, 100_000, 0);
+		let (_, _, converge_b_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 3, 4, 100_000, 0);
+		let (_, _, last_channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 4, 0, 100_000, 0);
+
+		let local_channels = nodes[0].node.list_channels();
+		let first_channel =
+			local_channels.iter().find(|channel| channel.channel_id == first_channel_id).unwrap();
+		let last_channel =
+			local_channels.iter().find(|channel| channel.channel_id == last_channel_id).unwrap();
+		let first_hop_user_channel_id = UserChannelId(first_channel.user_channel_id);
+		let last_hop_user_channel_id = UserChannelId(last_channel.user_channel_id);
+		let first_hop_scid = first_channel.get_outbound_payment_scid().unwrap();
+		let branch_a_scid = nodes[1]
+			.node
+			.list_channels()
+			.into_iter()
+			.find(|channel| channel.channel_id == branch_a_channel_id)
+			.unwrap()
+			.get_outbound_payment_scid()
+			.unwrap();
+		let branch_b_scid = nodes[1]
+			.node
+			.list_channels()
+			.into_iter()
+			.find(|channel| channel.channel_id == branch_b_channel_id)
+			.unwrap()
+			.get_outbound_payment_scid()
+			.unwrap();
+		let converge_a_scid = nodes[2]
+			.node
+			.list_channels()
+			.into_iter()
+			.find(|channel| channel.channel_id == converge_a_channel_id)
+			.unwrap()
+			.get_outbound_payment_scid()
+			.unwrap();
+		let converge_b_scid = nodes[3]
+			.node
+			.list_channels()
+			.into_iter()
+			.find(|channel| channel.channel_id == converge_b_channel_id)
+			.unwrap()
+			.get_outbound_payment_scid()
+			.unwrap();
+		let last_hop_scid = last_channel.get_inbound_payment_scid().unwrap();
+
+		let amount_msat = 5_000_000;
+		let path_a_amount_msat = 3_000_000;
+		let path_b_amount_msat = 2_000_000;
+		let total_routing_fee_msat = 6_000;
+		let max_routing_fee_msat = 10_000;
+		let invoice = nodes[0]
+			.node
+			.create_bolt11_invoice(Bolt11InvoiceParameters {
+				amount_msats: Some(amount_msat),
+				..Default::default()
+			})
+			.unwrap();
+		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
+		let payment_secret = *invoice.payment_secret();
+		let payment_preimage =
+			nodes[0].node.get_payment_preimage(payment_hash, payment_secret).unwrap();
+		let operation_id = PaymentId([10u8; 32]);
+		let outbound_payment_id = crate::payment::derive_circular_outbound_payment_id(operation_id);
+
+		let kv_store: Arc<DynStore> = Arc::new(InMemoryStore::new());
+		let logger = Arc::new(Logger::new_log_facade());
+		let payment_store = PaymentStore::new(
+			Vec::new(),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			kv_store,
+			logger,
+		);
+		payment_store
+			.insert(crate::payment::prepared_circular_payment_details(
+				invoice.to_string(),
+				payment_hash,
+				payment_preimage,
+				payment_secret,
+				amount_msat,
+				crate::payment::CircularPaymentContext {
+					operation_id,
+					outbound_payment_id,
+					first_hop_user_channel_id,
+					last_hop_user_channel_id,
+					max_routing_fee_msat,
+				},
+			))
+			.unwrap();
+
+		let make_hop = |pubkey, short_channel_id, fee_msat| lightning::routing::router::RouteHop {
+			pubkey,
+			node_features: lightning::types::features::NodeFeatures::empty(),
+			short_channel_id,
+			channel_features: lightning::types::features::ChannelFeatures::empty(),
+			fee_msat,
+			cltv_expiry_delta: if pubkey == nodes[0].node.get_our_node_id() {
+				TEST_FINAL_CLTV as u32
+			} else {
+				48
+			},
+			maybe_announced_channel: true,
+		};
+		let route = lightning::routing::router::Route {
+			paths: vec![
+				lightning::routing::router::Path {
+					hops: vec![
+						make_hop(nodes[1].node.get_our_node_id(), first_hop_scid, 1_000),
+						make_hop(nodes[2].node.get_our_node_id(), branch_a_scid, 1_000),
+						make_hop(nodes[4].node.get_our_node_id(), converge_a_scid, 1_000),
+						make_hop(
+							nodes[0].node.get_our_node_id(),
+							last_hop_scid,
+							path_a_amount_msat,
+						),
+					],
+					blinded_tail: None,
+				},
+				lightning::routing::router::Path {
+					hops: vec![
+						make_hop(nodes[1].node.get_our_node_id(), first_hop_scid, 1_000),
+						make_hop(nodes[3].node.get_our_node_id(), branch_b_scid, 1_000),
+						make_hop(nodes[4].node.get_our_node_id(), converge_b_scid, 1_000),
+						make_hop(
+							nodes[0].node.get_our_node_id(),
+							last_hop_scid,
+							path_b_amount_msat,
+						),
+					],
+					blinded_tail: None,
+				},
+			],
+			route_params: None,
+		};
+		let quote_paths = route
+			.paths
+			.iter()
+			.map(|path| crate::CircularRoutePath {
+				hops: path
+					.hops
+					.iter()
+					.map(|hop| crate::CircularRouteHop {
+						node_id: hop.pubkey,
+						short_channel_id: hop.short_channel_id,
+						fee_msat: hop.fee_msat,
+						cltv_expiry_delta: hop.cltv_expiry_delta,
+					})
+					.collect(),
+				amount_msat: path.final_value_msat(),
+				fee_msat: path.fee_msat(),
+			})
+			.collect();
+		let quote = crate::CircularRouteQuote {
+			amount_msat,
+			total_routing_fee_msat,
+			first_hop_user_channel_id,
+			first_hop_short_channel_id: first_hop_scid,
+			last_hop_user_channel_id,
+			last_hop_short_channel_id: last_hop_scid,
+			paths: quote_paths,
+			route_bytes: route.encode(),
+		};
+		let execution = crate::payment::build_prepared_circular_execution(
+			&payment_store,
+			operation_id,
+			&quote,
+			nodes[1].node.get_our_node_id(),
+			first_hop_scid,
+			first_channel.outbound_capacity_msat,
+			nodes[4].node.get_our_node_id(),
+			last_hop_scid,
+			last_channel.inbound_capacity_msat,
+			nodes[0].node.get_our_node_id(),
+		)
+		.unwrap();
+		assert_eq!(
+			crate::payment::submit_prepared_circular_execution(
+				&payment_store,
+				execution,
+				|route, hash, onion, id| {
+					nodes[0].node.send_payment_with_route(route, hash, onion, id)
+				},
+			),
+			Ok(outbound_payment_id)
+		);
+		lightning::check_added_monitors!(nodes[0], 1);
+
+		let path_a = &[&nodes[1], &nodes[2], &nodes[4], &nodes[0]][..];
+		let path_b = &[&nodes[1], &nodes[3], &nodes[4], &nodes[0]][..];
+		let mut messages = nodes[0].node.get_and_clear_pending_msg_events();
+		assert_eq!(messages.len(), 1);
+		let first_part =
+			remove_first_msg_event_to_node(&nodes[1].node.get_our_node_id(), &mut messages);
+		let first_part = SendEvent::from_event(first_part);
+		assert_eq!(first_part.msgs.len(), 1);
+		nodes[1].node.handle_update_add_htlc(nodes[0].node.get_our_node_id(), &first_part.msgs[0]);
+		lightning::check_added_monitors!(nodes[1], 0);
+		nodes[1].node.handle_commitment_signed_batch_test(
+			nodes[0].node.get_our_node_id(),
+			&first_part.commitment_msg,
+		);
+		lightning::check_added_monitors!(nodes[1], 1);
+		let (first_revoke_and_ack, first_commitment_signed) =
+			lightning::get_revoke_commit_msgs!(nodes[1], nodes[0].node.get_our_node_id());
+		nodes[0].node.handle_revoke_and_ack(nodes[1].node.get_our_node_id(), &first_revoke_and_ack);
+		lightning::check_added_monitors!(nodes[0], 1);
+		let mut messages = nodes[0].node.get_and_clear_pending_msg_events();
+		assert_eq!(messages.len(), 1);
+		let second_part =
+			remove_first_msg_event_to_node(&nodes[1].node.get_our_node_id(), &mut messages);
+		nodes[0].node.handle_commitment_signed_batch_test(
+			nodes[1].node.get_our_node_id(),
+			&first_commitment_signed,
+		);
+		lightning::check_added_monitors!(nodes[0], 1);
+		let final_revoke_and_ack = lightning::get_event_msg!(
+			nodes[0],
+			MessageSendEvent::SendRevokeAndACK,
+			nodes[1].node.get_our_node_id()
+		);
+		nodes[1].node.handle_revoke_and_ack(nodes[0].node.get_our_node_id(), &final_revoke_and_ack);
+		lightning::check_added_monitors!(nodes[1], 1);
+		nodes[1].node.process_pending_htlc_forwards();
+		lightning::check_added_monitors!(nodes[1], 1);
+		let mut first_forward_messages = nodes[1].node.get_and_clear_pending_msg_events();
+		let first_forward = remove_first_msg_event_to_node(
+			&nodes[2].node.get_our_node_id(),
+			&mut first_forward_messages,
+		);
+		assert!(pass_along_path(
+			&nodes[1],
+			&path_a[1..],
+			path_a_amount_msat,
+			payment_hash,
+			Some(payment_secret),
+			first_forward,
+			false,
+			Some(payment_preimage),
+		)
+		.is_none());
+		let claimable_event = pass_along_path(
+			&nodes[0],
+			path_b,
+			amount_msat,
+			payment_hash,
+			Some(payment_secret),
+			second_part,
+			true,
+			Some(payment_preimage),
+		)
+		.unwrap();
+		let receiving_channels = match claimable_event {
+			LdkEvent::PaymentClaimable { receiving_channel_ids, .. } => receiving_channel_ids,
+			_ => panic!("expected PaymentClaimable"),
+		};
+		assert_eq!(receiving_channels.len(), 2);
+		assert!(receiving_channels
+			.iter()
+			.all(|(_, user_channel_id)| *user_channel_id == Some(last_hop_user_channel_id.0)));
+		let prepared = payment_store.get(&PaymentId(payment_hash.0)).unwrap();
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&prepared.kind,
+				&payment_hash,
+				prepared.status,
+				prepared.amount_msat,
+				amount_msat,
+				&receiving_channels,
+			),
+			ChannelConstrainedClaimDecision::Claim(payment_preimage)
+		);
+
+		nodes[0].node.claim_funds(payment_preimage);
+		let claimed_events = nodes[0].node.get_and_clear_pending_events();
+		assert_eq!(claimed_events.len(), 1, "{claimed_events:?}");
+		match &claimed_events[0] {
+			LdkEvent::PaymentClaimed {
+				payment_hash: claimed_hash,
+				amount_msat: claimed_amount_msat,
+				htlcs,
+				..
+			} => {
+				assert_eq!(*claimed_hash, payment_hash);
+				assert_eq!(*claimed_amount_msat, amount_msat);
+				assert_eq!(htlcs.len(), 2);
+				assert!(htlcs.iter().all(|htlc| {
+					htlc.user_channel_id == last_hop_user_channel_id.0
+						&& htlc.channel_id == last_channel_id
+				}));
+			},
+			other => panic!("expected PaymentClaimed, got {other:?}"),
+		}
+		lightning::check_added_monitors!(nodes[0], 2);
+
+		let parse_single_fulfill = |event| match event {
+			MessageSendEvent::UpdateHTLCs { node_id, updates, .. } => {
+				assert!(updates.update_add_htlcs.is_empty());
+				assert_eq!(updates.update_fulfill_htlcs.len(), 1);
+				assert!(updates.update_fail_htlcs.is_empty());
+				assert!(updates.update_fail_malformed_htlcs.is_empty());
+				assert!(updates.update_fee.is_none());
+				((updates.update_fulfill_htlcs[0].clone(), updates.commitment_signed), node_id)
+			},
+			other => panic!("expected a single fulfill update, got {other:?}"),
+		};
+		macro_rules! pass_fulfill_through_common_inbound_peer {
+			($settlement_event:expr, $next_node:expr, $expect_held_fulfill:expr) => {{
+				let ((fulfill, commitment_signed), target_node_id) =
+					parse_single_fulfill($settlement_event);
+				assert_eq!(target_node_id, nodes[4].node.get_our_node_id());
+				nodes[4].node.handle_update_fulfill_htlc(nodes[0].node.get_our_node_id(), fulfill);
+				lightning::check_added_monitors!(nodes[4], 1);
+				let forwarded_events = nodes[4].node.get_and_clear_pending_events();
+				assert_eq!(forwarded_events.len(), 1, "{forwarded_events:?}");
+				assert_eq!(
+					lightning::ln::functional_test_utils::expect_payment_forwarded(
+						forwarded_events.into_iter().next().unwrap(),
+						&nodes[4],
+						&$next_node,
+						&nodes[0],
+						Some(1_000),
+						None,
+						false,
+						false,
+						false,
+					),
+					Some(1_000)
+				);
+				let mut forward_messages = nodes[4].node.get_and_clear_pending_msg_events();
+				let forward = remove_first_msg_event_to_node(
+					&$next_node.node.get_our_node_id(),
+					&mut forward_messages,
+				);
+				assert!(forward_messages.is_empty());
+
+				nodes[4].node.handle_commitment_signed_batch_test(
+					nodes[0].node.get_our_node_id(),
+					&commitment_signed,
+				);
+				lightning::check_added_monitors!(nodes[4], 1);
+				let (revoke_and_ack, counterparty_commitment_signed) =
+					lightning::get_revoke_commit_msgs!(nodes[4], nodes[0].node.get_our_node_id());
+				nodes[0]
+					.node
+					.handle_revoke_and_ack(nodes[4].node.get_our_node_id(), &revoke_and_ack);
+				lightning::check_added_monitors!(nodes[0], 1);
+				let mut held_messages = nodes[0].node.get_and_clear_pending_msg_events();
+				let held_fulfill = if $expect_held_fulfill {
+					assert_eq!(held_messages.len(), 1);
+					Some(remove_first_msg_event_to_node(
+						&nodes[4].node.get_our_node_id(),
+						&mut held_messages,
+					))
+				} else {
+					assert!(held_messages.is_empty());
+					None
+				};
+				nodes[0].node.handle_commitment_signed_batch_test(
+					nodes[4].node.get_our_node_id(),
+					&counterparty_commitment_signed,
+				);
+				lightning::check_added_monitors!(nodes[0], 1);
+				let final_revoke_and_ack = lightning::get_event_msg!(
+					nodes[0],
+					MessageSendEvent::SendRevokeAndACK,
+					nodes[4].node.get_our_node_id()
+				);
+				nodes[4]
+					.node
+					.handle_revoke_and_ack(nodes[0].node.get_our_node_id(), &final_revoke_and_ack);
+				lightning::check_added_monitors!(nodes[4], 1);
+				(forward, held_fulfill)
+			}};
+		}
+
+		let mut settlement_messages = nodes[0].node.get_and_clear_pending_msg_events();
+		assert_eq!(settlement_messages.len(), 1);
+		let first_settlement_part = remove_first_msg_event_to_node(
+			&nodes[4].node.get_our_node_id(),
+			&mut settlement_messages,
+		);
+		let (first_forward, second_settlement_part) =
+			pass_fulfill_through_common_inbound_peer!(first_settlement_part, nodes[2], true);
+		let (second_forward, no_more_settlement_parts) = pass_fulfill_through_common_inbound_peer!(
+			second_settlement_part.unwrap(),
+			nodes[3],
+			false
+		);
+		assert!(no_more_settlement_parts.is_none());
+
+		let first_forward = parse_single_fulfill(first_forward);
+		let second_forward = parse_single_fulfill(second_forward);
+		let path_a_after_inbound_peer = &[&nodes[1], &nodes[2], &nodes[4]][..];
+		let path_b_after_inbound_peer = &[&nodes[1], &nodes[3], &nodes[4]][..];
+		let first_remaining_fee_msat =
+			lightning::ln::functional_test_utils::pass_claimed_payment_along_route_from_ev(
+				path_a_amount_msat,
+				vec![first_forward],
+				ClaimAlongRouteArgs::new(&nodes[0], &[path_a_after_inbound_peer], payment_preimage),
+			);
+		let mut settlement_events = nodes[0].node.get_and_clear_pending_events();
+		lightning::check_added_monitors!(nodes[0], 1);
+		let second_remaining_fee_msat =
+			lightning::ln::functional_test_utils::pass_claimed_payment_along_route_from_ev(
+				path_b_amount_msat,
+				vec![second_forward],
+				ClaimAlongRouteArgs::new(&nodes[0], &[path_b_after_inbound_peer], payment_preimage),
+			);
+		settlement_events.extend(nodes[0].node.get_and_clear_pending_events());
+		lightning::check_added_monitors!(nodes[0], 0);
+		assert_eq!(
+			first_remaining_fee_msat + second_remaining_fee_msat + 2_000,
+			total_routing_fee_msat
+		);
+		assert_eq!(settlement_events.len(), 3, "{settlement_events:?}");
+		match &settlement_events[0] {
+			LdkEvent::PaymentSent {
+				payment_id,
+				payment_preimage: settled_preimage,
+				payment_hash: settled_hash,
+				amount_msat: settled_amount_msat,
+				fee_paid_msat,
+				..
+			} => {
+				assert_eq!(*payment_id, Some(outbound_payment_id));
+				assert_eq!(*settled_preimage, payment_preimage);
+				assert_eq!(*settled_hash, payment_hash);
+				assert_eq!(*settled_amount_msat, Some(amount_msat));
+				assert_eq!(*fee_paid_msat, Some(total_routing_fee_msat));
+			},
+			other => panic!("expected PaymentSent, got {other:?}"),
+		}
+		for event in &settlement_events[1..] {
+			match event {
+				LdkEvent::PaymentPathSuccessful {
+					payment_id,
+					payment_hash: path_hash,
+					path,
+					..
+				} => {
+					assert_eq!(*payment_id, outbound_payment_id);
+					assert_eq!(*path_hash, Some(payment_hash));
+					assert_eq!(path.hops.first().unwrap().short_channel_id, first_hop_scid);
+					assert_eq!(path.hops.last().unwrap().short_channel_id, last_hop_scid);
+				},
+				other => panic!("expected PaymentPathSuccessful, got {other:?}"),
+			}
+		}
+	}
+
+	fn test_circular_payment_kind(
+		hash: PaymentHash, preimage: PaymentPreimage, required_channel_id: UserChannelId,
+	) -> PaymentKind {
+		PaymentKind::Bolt11 {
+			hash,
+			preimage: Some(preimage),
+			secret: None,
+			bolt11_invoice: None,
+			required_receiving_channel_id: Some(required_channel_id),
+			required_sending_channel_id: Some(UserChannelId(required_channel_id.0.wrapping_add(2))),
+			circular_operation_id: Some(PaymentId([4u8; 32])),
+			circular_outbound_payment_id: Some(PaymentId([5u8; 32])),
+			circular_max_routing_fee_msat: Some(1_000_000),
+		}
 	}
 
 	#[tokio::test]
