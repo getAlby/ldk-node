@@ -178,10 +178,9 @@ mod tests {
 	use std::future::Future;
 	use std::pin::Pin;
 
-	use lightning::impl_writeable_tlv_based;
-	use lightning::io;
 	use lightning::util::persist::KVStore;
 	use lightning::util::test_utils::TestLogger;
+	use lightning::{impl_writeable_tlv_based, io};
 
 	use super::*;
 	use crate::hex_utils;
@@ -329,7 +328,8 @@ mod tests {
 
 		fn list(
 			&self, _primary_namespace: &str, _secondary_namespace: &str,
-		) -> Pin<Box<dyn Future<Output = Result<Vec<String>, io::Error>> + 'static + Send>> {
+		) -> Pin<Box<dyn Future<Output = Result<Vec<String>, io::Error>> + 'static + Send>>
+		{
 			Box::pin(async { Err(io::Error::new(io::ErrorKind::Other, "list failed")) })
 		}
 	}
