@@ -124,7 +124,7 @@ use config::{
 use connection::ConnectionManager;
 pub use error::Error as NodeError;
 use error::Error;
-pub use event::Event;
+pub use event::{Event, ReceivingChannel};
 use event::{EventHandler, EventQueue};
 use fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
 #[cfg(feature = "uniffi")]
@@ -150,6 +150,8 @@ use liquidity::{LSPS1Liquidity, LSPS2Liquidity, LiquiditySource};
 use logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use payment::asynchronous::static_invoice_store::StaticInvoiceStore;
+#[cfg(feature = "uniffi")]
+use payment::CircularPaymentFailureReason;
 use payment::{
 	Bolt11Payment, Bolt12Payment, OnchainPayment, PaymentDetails, SpontaneousPayment,
 	UnifiedQrPayment,
@@ -163,7 +165,8 @@ use types::{
 	OnionMessenger, PaymentStore, PeerManager, Router, Scorer, Sweeper, Wallet,
 };
 pub use types::{
-	ChannelDetails, ChannelMonitorSizeInfo, CustomTlvRecord, DynStore, KeyValue, PeerDetails,
+	ChannelDetails, ChannelMonitorSizeInfo, CircularRouteHop, CircularRoutePath,
+	CircularRouteQuote, CustomTlvRecord, DynStore, KeyValue, PeerDetails, PreparedCircularPayment,
 	SyncAndAsyncKVStore, UserChannelId, WordCount,
 };
 pub use {
@@ -209,6 +212,7 @@ pub struct Node {
 	peer_store: Arc<PeerStore<Arc<Logger>>>,
 	payment_store: Arc<PaymentStore>,
 	is_running: Arc<RwLock<bool>>,
+	circular_payment_lock: Arc<Mutex<()>>,
 	node_metrics: Arc<RwLock<NodeMetrics>>,
 	om_mailbox: Option<Arc<OnionMessageMailbox>>,
 	async_payments_role: Option<AsyncPaymentsRole>,
@@ -877,12 +881,14 @@ impl Node {
 		Bolt11Payment::new(
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
+			Arc::clone(&self._router),
 			Arc::clone(&self.connection_manager),
 			self.liquidity_source.clone(),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.config),
 			Arc::clone(&self.is_running),
+			Arc::clone(&self.circular_payment_lock),
 			Arc::clone(&self.logger),
 		)
 	}
@@ -895,12 +901,14 @@ impl Node {
 		Arc::new(Bolt11Payment::new(
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
+			Arc::clone(&self._router),
 			Arc::clone(&self.connection_manager),
 			self.liquidity_source.clone(),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.config),
 			Arc::clone(&self.is_running),
+			Arc::clone(&self.circular_payment_lock),
 			Arc::clone(&self.logger),
 		))
 	}

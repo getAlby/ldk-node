@@ -113,6 +113,7 @@ impl UnifiedQrPayment {
 			expiry_sec,
 			None,
 			None,
+			None,
 		) {
 			Ok(invoice) => Some(invoice),
 			Err(e) => {
