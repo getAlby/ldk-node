@@ -26,6 +26,8 @@ use common::{
 	setup_node, setup_node_for_async_payments, setup_two_nodes, wait_for_tx, TestChainSource,
 	TestSyncStore,
 };
+use electrsd::corepc_node::Node as BitcoinD;
+use electrsd::ElectrsD;
 use electrum_client::ElectrumApi;
 use ldk_node::config::{AsyncPaymentsRole, EsploraSyncConfig};
 use ldk_node::liquidity::LSPS2ServiceConfig;
@@ -570,6 +572,61 @@ async fn onchain_send_receive() {
 	let node_b_payments =
 		node_b.list_payments_with_filter(|p| matches!(p.kind, PaymentKind::Onchain { .. }));
 	assert_eq!(node_b_payments.len(), 5);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn onchain_next_unused_address_esplora() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+	do_onchain_next_unused_address(&bitcoind, &electrsd, &chain_source).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn onchain_next_unused_address_bitcoind_rpc_sync() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::BitcoindRpcSync(&bitcoind);
+	do_onchain_next_unused_address(&bitcoind, &electrsd, &chain_source).await;
+}
+
+async fn do_onchain_next_unused_address(
+	bitcoind: &BitcoinD, electrsd: &ElectrsD, chain_source: &TestChainSource<'_>,
+) {
+	let node = setup_node(chain_source, random_config(true), None);
+	premine_blocks(&bitcoind.client, &electrsd.client).await;
+	node.sync_wallets().unwrap();
+
+	// The same address is returned until it receives funds.
+	let addr_1 = node.onchain_payment().next_unused_address().unwrap();
+	assert_eq!(node.onchain_payment().next_unused_address().unwrap(), addr_1);
+
+	// An unconfirmed transaction is enough to mark the address as used.
+	let amount = Amount::from_sat(100_000);
+	distribute_funds_unconfirmed(&bitcoind.client, &electrsd.client, vec![addr_1.clone()], amount)
+		.await;
+	node.sync_wallets().unwrap();
+
+	let addr_2 = node.onchain_payment().next_unused_address().unwrap();
+	assert_ne!(addr_2, addr_1);
+	assert_eq!(node.onchain_payment().next_unused_address().unwrap(), addr_2);
+
+	// Addresses handed out by `new_address` that are still unused are returned before a new one
+	// is derived.
+	let addr_3 = node.onchain_payment().new_address().unwrap();
+	assert_ne!(addr_3, addr_2);
+	assert_eq!(node.onchain_payment().next_unused_address().unwrap(), addr_2);
+
+	distribute_funds_unconfirmed(&bitcoind.client, &electrsd.client, vec![addr_2.clone()], amount)
+		.await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+	node.sync_wallets().unwrap();
+	assert_eq!(node.onchain_payment().next_unused_address().unwrap(), addr_3);
+
+	// The used addresses stay used across a restart.
+	node.stop().unwrap();
+	node.start().unwrap();
+	assert_eq!(node.onchain_payment().next_unused_address().unwrap(), addr_3);
+
+	node.stop().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
