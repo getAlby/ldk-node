@@ -1062,7 +1062,7 @@ where
 					preimage: Some(Some(payment_preimage)),
 					fee_paid_msat: Some(fee_paid_msat),
 					status: Some(PaymentStatus::Succeeded),
-					//fee_msat: Some(fee_paid_msat),
+					// fee_msat: Some(fee_paid_msat),
 					..PaymentDetailsUpdate::new(payment_id)
 				};
 

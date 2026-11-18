@@ -178,10 +178,9 @@ mod tests {
 	use std::future::Future;
 	use std::pin::Pin;
 
-	use lightning::impl_writeable_tlv_based;
-	use lightning::io;
 	use lightning::util::persist::KVStore;
 	use lightning::util::test_utils::TestLogger;
+	use lightning::{impl_writeable_tlv_based, io};
 
 	use super::*;
 	use crate::hex_utils;

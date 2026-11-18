@@ -109,6 +109,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
+pub use bip39;
+pub use bitcoin;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Address, Amount};
 #[cfg(feature = "uniffi")]
@@ -134,6 +136,7 @@ use graph::NetworkGraph;
 pub use io::utils::generate_entropy_mnemonic;
 // Alby: export LSPS2 opening fee computation for local fee estimation in Hub.
 use io::utils::write_node_metrics;
+pub use lightning;
 use lightning::chain::BestBlock;
 use lightning::events::bump_transaction::{Input, Wallet as LdkWallet};
 use lightning::impl_writeable_tlv_based;
@@ -145,6 +148,9 @@ use lightning::ln::msgs::SocketAddress;
 use lightning::routing::gossip::NodeAlias;
 use lightning::util::persist::KVStoreSync;
 use lightning_background_processor::process_events_async;
+pub use lightning_invoice;
+pub use lightning_liquidity;
+pub use lightning_types;
 pub use liquidity::lsps2_compute_opening_fee_msat;
 use liquidity::{LSPS1Liquidity, LSPS2Liquidity, LiquiditySource};
 use logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
@@ -155,9 +161,9 @@ use payment::{
 	UnifiedQrPayment,
 };
 use peer_store::{PeerInfo, PeerStore};
-
 use rand::Rng;
 use runtime::Runtime;
+pub use tokio;
 use types::{
 	Broadcaster, BumpTransactionEventHandler, ChainMonitor, ChannelManager, Graph, KeysManager,
 	OnionMessenger, PaymentStore, PeerManager, Router, Scorer, Sweeper, Wallet,
@@ -166,13 +172,9 @@ pub use types::{
 	ChannelDetails, ChannelMonitorSizeInfo, CustomTlvRecord, DynStore, KeyValue, PeerDetails,
 	SyncAndAsyncKVStore, UserChannelId, WordCount,
 };
-pub use {
-	bip39, bitcoin, lightning, lightning_invoice, lightning_liquidity, lightning_types, tokio,
-	vss_client,
-};
+pub use vss_client;
 
 use crate::scoring::setup_background_pathfinding_scores_sync;
-
 pub use crate::types::{MigrateStorage, ResetState, TlvEntry};
 
 #[cfg(feature = "uniffi")]
@@ -1084,8 +1086,9 @@ impl Node {
 	/// we use this to be able to notify users when their channel monitors are getting too large
 	/// (a risk that reading/writing to VSS could start taking too long)
 	pub fn list_channel_monitor_sizes(&self) -> Vec<ChannelMonitorSizeInfo> {
-		use lightning::util::ser::Writeable;
 		use std::ops::Deref;
+
+		use lightning::util::ser::Writeable;
 
 		let mut channel_sizes = Vec::new();
 
