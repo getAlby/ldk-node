@@ -268,6 +268,8 @@ interface OnchainPayment {
 	[Throws=NodeError]
 	Address new_address();
 	[Throws=NodeError]
+	Address next_unused_address();
+	[Throws=NodeError]
 	Txid send_to_address([ByRef]Address address, u64 amount_sats, FeeRate? fee_rate);
 	[Throws=NodeError]
 	Txid send_all_to_address([ByRef]Address address, boolean retain_reserve, FeeRate? fee_rate);

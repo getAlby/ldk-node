@@ -63,6 +63,22 @@ impl OnchainPayment {
 		Ok(funding_address)
 	}
 
+	/// Retrieve the next unused on-chain/funding address.
+	///
+	/// Returns the first previously retrieved address that has not received any funds yet, and
+	/// only derives a new address if all of them have. In contrast to [`new_address`], calling
+	/// this repeatedly returns the same address until it receives a transaction.
+	///
+	/// Whether an address is used is based on the transactions the on-chain wallet knows about,
+	/// i.e., it is only as current as the last wallet sync.
+	///
+	/// [`new_address`]: Self::new_address
+	pub fn next_unused_address(&self) -> Result<Address, Error> {
+		let funding_address = self.wallet.get_next_unused_address()?;
+		log_info!(self.logger, "Retrieved next unused funding address: {}", funding_address);
+		Ok(funding_address)
+	}
+
 	/// Send an on-chain payment to the given address.
 	///
 	/// This will respect any on-chain reserve we need to keep, i.e., won't allow to cut into
